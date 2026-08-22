@@ -14,6 +14,8 @@
 
 import torch
 import triton
+import triton.language as tl
+from triton.runtime import heuristics
 
 from flag_blas import runtime
 from flag_blas.ops.level3.sgemm import CUBLAS_OP_N, CUBLAS_OP_T, ScalarType
@@ -28,12 +30,127 @@ from flag_blas.utils import libentry, libtuner
 
 _SGEMM_KEY = ["m", "n", "k", "BETA_IS_ZERO"]
 
+
+@triton.jit
+def _sgemm_nn_opt_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * lda + offs_k[None, :])
+    b_ptrs = b_ptr + (offs_k[:, None] * ldb + offs_bn[None, :])
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    if EVEN_M:
+        mask_m = None
+    else:
+        mask_m = offs_am < m
+    if EVEN_N:
+        mask_n = None
+    else:
+        mask_n = offs_bn < n
+
+    if EVEN_K:
+        for i in range(k // BLOCK_K):
+            if EVEN_M:
+                a = tl.load(a_ptrs)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs)
+            else:
+                b = tl.load(b_ptrs, mask=mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * ldb
+    else:
+        k_full_iters = k // BLOCK_K
+        k_remainder = k % BLOCK_K
+        for i in range(k_full_iters):
+            if EVEN_M:
+                a = tl.load(a_ptrs)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs)
+            else:
+                b = tl.load(b_ptrs, mask=mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * ldb
+        if k_remainder > 0:
+            mask_k = offs_k < k_remainder
+            if EVEN_M:
+                a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+            else:
+                b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+
+    if EVEN_M and EVEN_N:
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc)
+        else:
+            c_vals = tl.load(c_ptrs)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals)
+    else:
+        cm = offs_cm < m
+        cn = offs_cn < n
+        c_mask = cm[:, None] & cn[None, :]
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc, mask=c_mask)
+        else:
+            c_vals = tl.load(c_ptrs, mask=c_mask)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
+
 sgemm_nn_hygon_kernel = libentry()(
     libtuner(
-        configs=runtime.get_tuned_config("sgemm_hygon"),
+        configs=runtime.get_tuned_config("sgemm_nn_hygon"),
         key=_SGEMM_KEY,
         restore_value=["c_ptr"],
-    )(common_sgemm_nn_kernel.fn.fn)
+    )(heuristics(runtime.get_heuristic_config("sgemm_nn"))(_sgemm_nn_opt_kernel))
 )
 
 sgemm_tn_hygon_kernel = libentry()(
