@@ -22,6 +22,7 @@ from .hpmv import chpmv, zhpmv
 from .hpr import chpr, zhpr
 from .hpr2 import chpr2, zhpr2
 from .sbmv import dsbmv, ssbmv
+from .sgemm import sgemm
 from .spmv import dspmv, sspmv
 from .spr import sspr
 from .spr2 import dspr2, sspr2
@@ -69,6 +70,7 @@ __all__ = [
     "dtpsv",
     "hgemv",
     "sgbmv",
+    "sgemm",
     "sgemv",
     "zgemv",
     "sger",
