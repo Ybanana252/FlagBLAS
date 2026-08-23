@@ -1,19 +1,20 @@
 # FlagBLAS sgemm_nn（Hygon）性能回归分析报告
 
-> 版本：v1.2
-> 日期：2026-08-22
+> 版本：v1.3
+> 日期：2026-08-23
 > 环境：Hygon gfx936 / DTK 25.04 / py310 venv / flagtree 0.6.1+hcu3.6
 
 ---
 
 ## 1. 摘要
 
-本次变更包含四部分：
+本次变更包含五部分：
 
 1. **Triton fork 升级**：`flagtree 0.6.0+hcu3.6` → `0.6.1+hcu3.6`（新增 tle 编译 passes：`select_encodings`、`insert_local_pointer_barriers`、`optimize_local_pointer_loads/stores`、`process_shared_memory_hint` 等）。
 2. **StaticDispatch 多内核分发**（`_hygon/ops/sgemm.py`）：为不达标 shape 按情况分发不同 kernel —— 大 K shape（`k >= 4*max(m,n)`）走两阶段 split-k（无原子加），其余走现网 opt kernel。
 3. **pre-pad + 全 EVEN 内核**（v1.1 新增）：A 类非对齐 shape 走输入预填充路径（A/B 拷贝到零填充对齐缓冲），主内核全 EVEN 无 mask load、无 k remainder，仅 store 对真实 m/n 打 mask。
 4. **per-kernel ITT（in-thread-transpose）按 shape 分发**（v1.2 新增）：Triton HIPOptions 新增 `use_in_thread_transpose` 编译选项，从 launch kwargs 按 shape 显式控制 ITT pass 开关——大/方 shape 开 ITT（2048³ 0.828→0.903、512x16384x4096 0.825→0.899 等 7 个 shape 显著提升），瘦/小 shape 关 ITT（避免布局损害）。
+5. **per-kernel ITT 注入化（v1.3 变更，commit 733749d）**：编译选项的支持从"手工 patch site-packages `compiler_hcu.py`"改为 **FlagBLAS 运行时注入**（`_hygon/_triton_itt.py`，导入时安装）：动态给 `HIPOptions`（frozen dataclass）加字段 + 包装 `HIPBackend.make_ttgir` 编译时按 options 值临时设 env。site-packages 已恢复原始版本，仓库内不再依赖手工 patch（patch 存档于 `patches/` 作历史兜底）。
 
 **回归判定：无性能回退；C 类 7 个大/方 shape 获得实质性提升。**
 
@@ -82,11 +83,14 @@ _SGEMM_NN_DISPATCH = StaticDispatch([
   - **瘦 shape（输出任一维度 < 512）走 opt**——实测 pad-copy 开销占比大反而更差（4096x64x2048 0.328 vs opt 1.201），同时覆盖 511³、64³。
 - 主内核 config：大输出 shape 用 `(128,256,32,G8,w8,s1)`（实测最优）；小输出（m*n < 4M，如 1023³）用 `(128,128,32,G8,w8,s2)`。
 
-### 3.4 per-kernel ITT（in-thread-transpose）按 shape 分发（v1.2 新增）
+### 3.4 per-kernel ITT（in-thread-transpose）按 shape 分发（v1.2 新增，v1.3 注入化）
 
 背景：ITT pass（`add_in_thread_transpose`）改变 v_mmac 累加器线程布局，gfx942 默认开启、gfx936 默认关闭。全局开启（env `TRITON_HIP_USE_IN_THREAD_TRANSPOSE=1`）全量回归发现**大/方 shape 普遍受益（2048³ +15%、512x16384x4096 +9% 等），但瘦 shape（min(m,n)<=128）与小立方（256³/511³）严重受损（config 不可恢复）**。因此将 ITT 从全局开关改为 per-kernel 编译选项：
 
-- **Triton 侧（`triton/backends/hcu/compiler_hcu.py`）**：`HIPOptions` 新增字段 `use_in_thread_transpose: bool = None`；编译时 `options.use_in_thread_transpose` 优先于 `is_in_thread_transpose_enabled(arch)` 默认逻辑（None 时回落全局默认）。
+- **Triton 侧机制**（不修改 site-packages）：`HIPOptions` 需有字段 `use_in_thread_transpose: bool = None`；编译时 `options.use_in_thread_transpose` 优先于 `is_in_thread_transpose_enabled(arch)` 默认逻辑（None 时回落全局默认）。该字段及编译判断由 **FlagBLAS 运行时注入**（`src/flag_blas/runtime/backend/_hygon/_triton_itt.py`，commit 733749d）提供：
+  - 动态给 `HIPOptions`（frozen dataclass）加字段：更新 `__annotations__` + 类属性默认值 `None` + 删除旧 dataclass 方法后 `dataclasses.dataclass(cls, frozen=True)` 重新生成（保持 frozen 语义与 `__hash__`；`_set_new_attribute` 不覆盖已有方法、非 frozen 会丢 hash）。Triton `parse_options` 按 `__dataclass_fields__` 从 launch kwargs 过滤编译选项，缓存 key（`str(options)` 序列化）自动区分不同 ITT 变体。
+  - 包装 `HIPBackend.make_ttgir`：编译时按 `options.use_in_thread_transpose` 临时设 `TRITON_HIP_USE_IN_THREAD_TRANSPOSE` env（knob `env_opt_bool.get()` 每次动态读 env），finally 恢复。幂等，重复导入安全；非 hcu 环境静默跳过。
+  - **验证**：2048³ 冷缓存 A/B 实测 ITT1 比 ITT0 快 ~7.5%（509→473us）、cache key 区分变体且顺序无关；10 shape dispatch 决策与 patch 版一致。
 - **FlagBLAS 侧（`flag_blas/utils/libentry.py`）**：`LibEntry.run()` 将非 constexpr kwargs `use_in_thread_transpose` 人工追加进 `entry_key`（libentry 缓存 key 不含非 constexpr kwargs，不同 ITT 变体必须区分，否则同 shape 两次 launch 命中同一缓存导致混淆）。
 - **分发决策（`_hygon/ops/sgemm.py`）**：
   ```
@@ -96,6 +100,7 @@ _SGEMM_NN_DISPATCH = StaticDispatch([
   ```
 - **pad / split-k 路径显式 ITT=0**（实测 ITT=1 下 pad 8191³ 0.862→0.823、split-k 0.792→0.493 均退化）。
 - **注意：HIPOptions 加字段改变了 Triton `cache_key`** → config 缓存 DB 表名（`kernel name + md5(cache_key+configs_hash)`）漂移，v1.1 tuned config 表失效。回归中已确认新表在运行时自动重建、config 值与原表一致（37 个核心 shape 逐项核对无差异），无需人工迁移。
+- **历史**：早期版本（commit 163726c）以 patch 形式固化该改动（`patches/flagtree-0.6.1-compiler-hcu-per-kernel-itt.patch`，site-packages 目录 `patch -p1` 应用）；v1.3 起改由 FlagBLAS 运行时注入，site-packages `compiler_hcu.py` 已恢复原始版本，patch 保留为历史/兜底。
 
 ---
 
@@ -305,7 +310,7 @@ _SGEMM_NN_DISPATCH = StaticDispatch([
 ## 8. 结论
 
 1. **v1.2（per-kernel ITT）整体提升**：37-shape 全量回归 median 0.882 → **0.903**，sp≥0.95 12/37 → **13/37**。7 个 C 类大/方 shape 显著提升（+0.057~+0.078），其中 2048x4096x11008 越线达标（0.898→0.976）；ITT=0 的瘦/小 shape 与 v1.1 完全一致（A/B 验证零副作用）。**无性能回退**。
-2. **per-kernel ITT 机制落地（v1.2）**：通过 Triton HIPOptions 扩展（`use_in_thread_transpose` 编译选项）+ libentry entry_key 缓存区分 + StaticDispatch 按 shape 决策，实现 ITT pass 的 per-kernel 开关。大/方 shape 吃满 ITT 收益（gfx936 上 v_mmac 布局优化），瘦/小 shape 规避布局损害。**这是 tle 层首个生效的编译选项级优化**。
+2. **per-kernel ITT 机制落地（v1.2/v1.3）**：通过 Triton HIPOptions 扩展（`use_in_thread_transpose` 编译选项）+ libentry entry_key 缓存区分 + StaticDispatch 按 shape 决策，实现 ITT pass 的 per-kernel 开关。大/方 shape 吃满 ITT 收益（gfx936 上 v_mmac 布局优化），瘦/小 shape 规避布局损害。**这是 tle 层首个生效的编译选项级优化**。v1.3 起该编译选项支持由 **FlagBLAS 运行时注入**提供（`_hygon/_triton_itt.py`，不改 site-packages，部署零 patch 依赖）。
 3. **A 类非对齐 shape 获得实质性提升（v1.1 pre-pad）**：4 个 shape 全部提升（+0.017~+0.130），其中 8191³ 0.732→0.862、4095³ 0.618→0.739、4097x8191x4095 0.705→0.807。A 类不再"无内核级方案"。
 4. **StaticDispatch 机制落地**：Hygon sgemm_nn 具备按 shape 情况分发多内核的能力（大 K → split-k 生效 +1.7%；非对齐大 shape → pre-pad 生效 +0.02~0.13；ITT 感知 → opt 内核 per-shape 编译选项生效 +0.06~0.08）。
 5. **遗留风险**：0.6.1 编译变慢（§6.1）需在部署/CI 中留意；2048x2048x16384 已从 split-k 切回 opt+ITT1，规避间歇波动；剩余 24 个未达标 shape（A 类 4 个 pad 已达上限、B 类 2 个 launch 地板、C 类 18 个 config/调度上限）在 Triton 3.6 + gfx936 上已无内核级优化空间，进一步突破需换算法（专用 fp32 汇编/软件流水）或升级 Triton/ROCm。
