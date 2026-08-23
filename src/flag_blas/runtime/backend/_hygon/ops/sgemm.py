@@ -31,6 +31,16 @@ from flag_blas.runtime import torch_device_fn
 from flag_blas.runtime.dispatch import StaticDispatch
 from flag_blas.utils import libentry, libtuner
 
+# per-kernel ITT 编译选项的运行时注入（不改 site-packages Triton 源码）。
+# 必须在任何 sgemm kernel launch 前执行一次；注入失败仅失去 per-kernel ITT
+# 能力（回落全局默认），不影响其余功能。
+try:
+    from flag_blas.runtime.backend._hygon._triton_itt import install_triton_itt_patch
+
+    install_triton_itt_patch()
+except Exception:  # pragma: no cover - 环境无 Triton HCU 后端时静默跳过
+    pass
+
 _SGEMM_KEY = ["m", "n", "k", "BETA_IS_ZERO"]
 
 
