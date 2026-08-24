@@ -460,6 +460,12 @@ _PAD_BLOCK_N = 256
 _PAD_BLOCK_K = 32
 _PAD_COPY_CM = 128
 _PAD_COPY_CK = 128
+# 小输出 shape 的更高并行度候选: main (32,64) + copy tile (64,64)
+# (1023³ 完整路径 107.5->99.4us, -7.5%; 单独 copy tile 64 -4.6%).
+# 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp,
+# 不满足时由 runner 回退 (128,128) main + (128,128) copy (mp/np 恒为 128 倍数, 安全)。
+_PAD_CFG_SMALL_TILE = (32, 64, 32, 8, 4, 2)
+_PAD_COPY_TILE_SMALL = 64
 # 大输出 shape 用 (128,256,32,G8,w8,s1); 小输出 (m*n 小, 如 1023³) 用 128x128 避免 tile 浪费
 _PAD_CFG_LARGE = (128, 256, 32, 8, 8, 1)
 _PAD_CFG_SMALL = (128, 128, 32, 8, 8, 2)
@@ -543,16 +549,33 @@ def _make_sgemm_nn_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
     if m * n < _PAD_SMALL_OUTPUT:
-        BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL
+        # 小输出: 优先 (32,64) main + (64,64) copy tile 提升并行度 (1023³ -7.5%);
+        # 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp (store 无 mask),
+        # 不满足时回退 (128,128) main + (128,128) copy (mp/np 恒为 128 倍数, 安全)。
+        BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL_TILE
+        mp = triton.cdiv(m, BM) * BM
+        np = triton.cdiv(n, BN) * BN
+        if mp % _PAD_COPY_TILE_SMALL == 0 and np % _PAD_COPY_TILE_SMALL == 0:
+            CCM = CCK = _PAD_COPY_TILE_SMALL
+        else:
+            BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL
+            mp = triton.cdiv(m, BM) * BM
+            np = triton.cdiv(n, BN) * BN
+            CCM = CCK = _PAD_COPY_CM
     else:
         BM, BN, BK, GM, nw, ns = _PAD_CFG_LARGE
-    mp = triton.cdiv(m, BM) * BM
-    np = triton.cdiv(n, BN) * BN
-    kp = triton.cdiv(k, BK) * BK
+        mp = triton.cdiv(m, BM) * BM
+        np = triton.cdiv(n, BN) * BN
+        CCM = CCK = _PAD_COPY_CM
+    # kp 需同时为主内核 BLOCK_K(32) 与 pad-copy tile (64 或 128) 的整数倍:
+    # copy kernel 对 k 维按 CK 分块且 store 无 mask, 若 kp 非 CK 倍数
+    # 末块会写到 kp 之外 (如 512x12800x5210, kp=5216 -> 写到 5247 行, 越界 VMFault)。
+    # 128 是 32/64 的公倍数, 按 _PAD_COPY_CK(128) 对齐可同时满足两者。
+    kp = triton.cdiv(k, _PAD_COPY_CK) * _PAD_COPY_CK
     A_pad, B_pad = _get_pad_buffers(mp, kp, np, A.device)
     grid_pad = (
-        triton.cdiv(mp, _PAD_COPY_CM) * triton.cdiv(kp, _PAD_COPY_CK)
-        + triton.cdiv(kp, _PAD_COPY_CK) * triton.cdiv(np, _PAD_COPY_CM),
+        triton.cdiv(mp, CCM) * triton.cdiv(kp, CCK)
+        + triton.cdiv(kp, CCK) * triton.cdiv(np, CCM),
     )
     grid_main = (triton.cdiv(mp, BM) * triton.cdiv(np, BN),)
 
@@ -570,8 +593,8 @@ def _make_sgemm_nn_pad_runner(
             mp,
             np,
             kp,
-            CM=_PAD_COPY_CM,
-            CK=_PAD_COPY_CK,
+            CM=CCM,
+            CK=CCK,
             use_in_thread_transpose=False,  # pad 路径在 ITT=1 下变差 (8191³ 0.862->0.823)
         )
         _sgemm_nn_pad_kernel[grid_main](
