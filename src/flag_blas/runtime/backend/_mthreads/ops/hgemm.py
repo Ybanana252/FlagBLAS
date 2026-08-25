@@ -41,10 +41,6 @@ import triton.language as tl
 from flag_blas.ops.level3.hgemm import CUBLAS_OP_N, CUBLAS_OP_T, ScalarType
 from flag_blas.runtime import torch_device_fn
 
-# Transposed shapes at or below this product read the operands transposed
-# directly (strided loads stay cache-resident); larger transposed shapes go
-# through the padded-buffer path instead.
-_DIRECT_LIMIT = 512**3
 # Products at or below this size use the small-tile config.
 _SMALL_LIMIT = 512**3
 
@@ -76,10 +72,10 @@ def _pick_config(m, n, k, trans_a=False, trans_b=False):
     the small tile so the padded grid wastes little compute. ``GROUP_M=4`` is
     uniformly faster than 8 for the 256-tile on MTT S5000.
 
-    Transposed variants run through the padded-copy path, which changes the
-    cost profile: the 64x64 tile wins on most transposed shapes, but the big
-    256x256 tile is still needed when one side is very large (>= 8192) and the
-    other is at least 256, or when both sides are >= 2048.
+    Transposed variants change the cost profile: the 64x64 tile wins on most
+    transposed shapes, but the big 256x256 tile is still needed when one side
+    is very large (>= 8192) and the other is at least 256, or when both sides
+    are >= 2048.
     """
     if m * n * k <= _SMALL_LIMIT:  # 512³: launch/occupancy bound, tiny tiles
         return 32, 32, 64, 4, 2, 2
@@ -136,9 +132,10 @@ def _copy_block(dst, src, rows, cols, dst_s0, src_s0, trans=False):
 # ---------------------------------------------------------------------------
 # Single fp16 MMA kernel, mask-free (m/n/k must be padded by the host).
 # With ``TRANS_A``/``TRANS_B`` the corresponding operand is read transposed
-# directly (A'[i, kk] = A[kk, i] at kk * lda + i; B'[kk, j] = B[j, kk] at
-# j * ldb + kk). fp16 inputs accumulate into fp32 and are rounded back to
-# fp16 on store.
+# directly (A is stored ``(k, m)`` row-major, B ``(n, k)`` row-major): the
+# tile is loaded coalesced in the transposed shape and ``tl.trans`` moves it
+# into the MMA operand layout. fp16 inputs accumulate into fp32 and are
+# rounded back to fp16 on store.
 # ---------------------------------------------------------------------------
 @triton.jit(do_not_specialize=["m", "n", "k"])
 def _hgemm_nn_kernel(
@@ -178,11 +175,16 @@ def _hgemm_nn_kernel(
     rbn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
 
     if TRANS_A:
-        a_ptrs = a_ptr + (ram[:, None] + offs_k[None, :] * lda)
+        # A is stored (K, M) row-major (lda = M): load the (BLOCK_K, BLOCK_M)
+        # tile coalesced along the contiguous M dimension and transpose at the
+        # register level; a strided per-element load would be ~2.7x slower.
+        a_ptrs = a_ptr + (offs_k[:, None] * lda + ram[None, :])
     else:
         a_ptrs = a_ptr + (ram[:, None] * lda + offs_k[None, :])
     if TRANS_B:
-        b_ptrs = b_ptr + (offs_k[:, None] + rbn[None, :] * ldb)
+        # B is stored (N, K) row-major (ldb = K): load (BLOCK_N, BLOCK_K)
+        # coalesced along K, then transpose.
+        b_ptrs = b_ptr + (rbn[:, None] * ldb + offs_k[None, :])
     else:
         b_ptrs = b_ptr + (offs_k[:, None] * ldb + rbn[None, :])
 
@@ -190,6 +192,10 @@ def _hgemm_nn_kernel(
     for _ in range(0, k, BLOCK_K):
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
+        if TRANS_A:
+            a = tl.trans(a)
+        if TRANS_B:
+            b = tl.trans(b)
         # Three-operand accumulate form (a*b+acc in one MMA chain) is faster
         # on MTT S5000 than ``acc += tl.dot(a, b)``.
         acc = tl.dot(a, b, acc, out_dtype=tl.float32)
@@ -218,11 +224,12 @@ _hgemm_bufs = {}
 
 
 def _get_buf(device, pm, pn, pk):
-    """Return cached input buffers big enough for the padded shape.
+    """Return cached padded fp16 input buffers big enough for the shape.
 
-    The output buffer is NOT cached: the MThreads compiler substitutes the
+    The output tensor is never cached: the MThreads compiler substitutes the
     row stride of the destination tensor for the explicit ``ldc`` on tile
-    stores, so ``c_out`` must have row stride exactly ``pn``.
+    stores, so a padded output must be a freshly allocated buffer whose row
+    stride is exactly ``pn`` (see ``_hgemm_fast``).
     """
     global _hgemm_bufs
     entry = _hgemm_bufs.get(device)
@@ -233,7 +240,7 @@ def _get_buf(device, pm, pn, pk):
         )
         _hgemm_bufs[device] = (bufs, pm, pn, pk)
     a, b = _hgemm_bufs[device][0]
-    return a, b, torch.empty(pm, pn, dtype=torch.float16, device=device)
+    return a, b
 
 
 def _fill_padded(dst, src, rows, cols, mul_r, mul_c, trans):
@@ -261,39 +268,65 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
 
     With ``trans_a``/``trans_b`` the corresponding operand holds the
     transposed matrix (``A``: logical ``(k, m)`` with leading dim ``lda``;
-    ``B``: logical ``(n, k)`` with leading dim ``ldb``). The transpose is
-    normalised on the host so the MMA kernel always sees the canonical
-    row-major ``(m, k) x (k, n)`` operands.
+    ``B``: logical ``(n, k)`` with leading dim ``ldb``). Tile-divisible
+    shapes run the kernel directly on the operands (transposed operands are
+    read through the kernel's coalesced ``tl.trans`` path); only shapes that
+    need padding are copied into the padded buffers first.
     """
     bm, bn, bk, nw, ns, group_m = _pick_config(m, n, k, trans_a, trans_b)
     device = A.device
 
-    # No padding + tiny product (or no transpose): run the mask-free kernel
-    # directly on the operands, avoiding the padded copies that dominate
-    # tiny-shape latency. The tile must divide the shape so the mask-free
+    # Tile-divisible shapes run the mask-free kernel directly on the operands
+    # (and write straight into C), avoiding the padded copies that dominate
+    # small-shape latency. The tile must divide the shape so the mask-free
     # kernel never reads out of bounds.
-    if (m % bm == 0 and n % bn == 0 and k % bk == 0
-            and (m * n * k <= _DIRECT_LIMIT or (not trans_a and not trans_b))):
+    if m % bm == 0 and n % bn == 0 and k % bk == 0:
         a, b, c_out = A, B, C
         lda_, ldb_, ldc_ = lda, ldb, ldc
         pm, pn, pk = m, n, k
         copyout = None
         trans_a_k, trans_b_k = trans_a, trans_b
     else:
+        # Normalise each operand independently: only operands that actually
+        # need it (transposed, or a non-tile-divisible side) are copied into
+        # the padded buffers; the rest are read in place by the kernel. The k
+        # dimension is shared by both operands, so ``k % bk != 0`` forces both
+        # into the buffers. A tile-divisible output goes straight into ``C``
+        # (whose row stride equals the explicit ``ldc``), skipping the padded
+        # output buffer and the copy-back.
+        kpad = k % bk != 0
+        a_pad = trans_a or kpad or m % bm != 0
+        b_pad = trans_b or kpad or n % bn != 0
+        c_pad = m % bm != 0 or n % bn != 0
         pm, pn, pk = _pad_to(m, bm), _pad_to(n, bn), _pad_to(k, bk)
-        a, b, c_out = _get_buf(device, pm, pn, pk)
-        _fill_padded(a, A, m, k, bm, bk, trans_a)
-        _fill_padded(b, B, k, n, bk, bn, trans_b)
-        if not beta_is_zero:
-            c_out[:m, :n] = C
-        # The cached input buffers may be larger than the current padded
-        # shape, so the MMA addressing must use their *actual* row strides,
-        # not the current pm/pn/pk.
-        lda_, ldb_, ldc_ = a.stride(0), b.stride(0), c_out.stride(0)
-        copyout = C
-        # The padded buffers already hold the canonical row-major layout
-        # (the transpose was folded by _fill_padded), so the kernel must
-        # not transpose them again.
+        a, b = _get_buf(device, pm, pn, pk)
+        lda_, ldb_ = lda, ldb
+        if a_pad:
+            _fill_padded(a, A, m, k, bm, bk, trans_a)
+            # The cached input buffers may be larger than the current padded
+            # shape, so the MMA addressing must use their *actual* row stride.
+            lda_ = a.stride(0)
+        else:
+            a = A
+        if b_pad:
+            _fill_padded(b, B, k, n, bk, bn, trans_b)
+            ldb_ = b.stride(0)
+        else:
+            b = B
+        if c_pad:
+            c_out = torch.empty(pm, pn, dtype=torch.float16, device=device)
+            if not beta_is_zero:
+                c_out[:m, :n] = C
+            ldc_ = c_out.stride(0)
+            copyout = C
+        else:
+            c_out = C
+            ldc_ = ldc
+            copyout = None
+        pm, pn = (m, n) if not c_pad else (pm, pn)
+        # Every operand the kernel reads is now canonical row-major (the
+        # transpose was folded by _fill_padded), so the kernel never
+        # transposes again.
         trans_a_k, trans_b_k = False, False
 
     grid = (triton.cdiv(pm, bm) * triton.cdiv(pn, bn),)
