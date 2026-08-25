@@ -75,13 +75,19 @@ def _pick_config(m, n, k, trans_a=False, trans_b=False):
     Transposed variants change the cost profile: the 64x64 tile wins on most
     transposed shapes, but the big 256x256 tile is still needed when one side
     is very large (>= 8192) and the other is at least 256, or when both sides
-    are >= 2048.
+    are >= 2048. When a 256x256 grid would produce fewer than ~128 output
+    tiles it underfills the 60-SM MTT S5000; there the 128x128 tile (16 warps)
+    is at least as fast as 256x256 and matches the non-transposed heuristic
+    (verified neutral on 2048^3, 2048x2048x16384, 256x8192x2048 and
+    8192x256x2048).
     """
     if m * n * k <= _SMALL_LIMIT:  # 512³: launch/occupancy bound, tiny tiles
         return 32, 32, 64, 4, 2, 2
     if trans_a or trans_b:
-        if min(m, n) >= 2048 or (min(m, n) >= 256 and max(m, n) >= 8192):
+        if min(m, n) >= 256 and triton.cdiv(m, 256) * triton.cdiv(n, 256) >= 128:
             return 256, 256, 64, 16, 2, 4
+        if min(m, n) >= 128 and triton.cdiv(m, 128) * triton.cdiv(n, 128) >= 128:
+            return 128, 128, 64, 16, 2, 8
         return 64, 64, 64, 4, 2, 8
     if min(m, n) >= 256 and triton.cdiv(m, 256) * triton.cdiv(n, 256) >= 128:
         return 256, 256, 64, 16, 2, 4
