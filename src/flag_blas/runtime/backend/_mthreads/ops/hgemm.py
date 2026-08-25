@@ -373,19 +373,22 @@ def _fill_padded(dst, src, rows, cols, mul_r, mul_c, trans):
     _copy_block(dst, src, rows, cols, dst.stride(0), src.stride(0), trans)
 
 
-def _should_split_k(m, n, k, bm, bn, trans_a, trans_b):
-    """Whether the k-deep, non-transposed shape benefits from split-K.
+def _should_split_k(m, n, k):
+    """Whether the k-deep shape benefits from the 256x256 split-K path.
 
-    Split-K only pays off when the m x n output grid is too sparse to fill the
-    60-SM MTT S5000 (~2 waves) while k is long enough to amortise the extra
-    fp32 partial-sum pass. Measured ~9% faster on 2048x4096x11008 with
-    K_SPLITS=2; the transposed variants measured flat (the transposed loads
-    are already the bottleneck), so they are excluded.
+    Split-K with a 256x256 tile wins when the 256^2 output grid underfills the
+    60-SM MTT S5000 (``grid256 < 160``, fewer than ~2.7 waves) while still
+    producing enough tiles after the split to fill the machine
+    (``2 * grid256 >= 30``), and k is long enough that the extra fp32
+    partial-sum pass amortises. Measured 5-20% faster on 2048^2x16384 and
+    2048x4096x11008 across all four transposition variants; neutral on dense
+    grids (4096x8192x28672) and negative on short-k shapes (the reduce pass
+    dominates).
     """
-    if trans_a or trans_b or k % 2:
+    if k % 2 or k < 2 * max(m, n):
         return False
-    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
-    return tiles < 240 and k >= 2 * max(m, n)
+    grid256 = triton.cdiv(m, 256) * triton.cdiv(n, 256)
+    return 2 * grid256 >= 30 and grid256 < 160
 
 
 def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
@@ -402,26 +405,27 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
     bm, bn, bk, nw, ns, group_m = _pick_config(m, n, k, trans_a, trans_b)
     device = A.device
 
+    # k-deep shapes whose 256^2 output grid underfills the machine: the 256x256
+    # tile plus two k-splits beats the direct path by 5-20% (see
+    # ``_should_split_k``). The kernel is mask-free, so m/n/k must be
+    # tile-divisible; ragged shapes fall through to the padded path below.
+    if _should_split_k(m, n, k) and m % 256 == 0 and n % 256 == 0 and k % 64 == 0:
+        p = torch.empty(2, m, n, dtype=torch.float32, device=device)
+        grid = (triton.cdiv(m, 256) * triton.cdiv(n, 256), 2)
+        _hgemm_splitk_kernel[grid](
+            A, B, p, m, n, k, lda, ldb, trans_a, trans_b, 256, 256, 64, 8, 2,
+            num_warps=16, num_stages=2,
+        )
+        _hgemm_splitk_reduce_kernel[(grid[0],)](
+            p, C, m, n, alpha, beta, beta_is_zero, 2, 256, 256, num_warps=16,
+        )
+        return
+
     # Tile-divisible shapes run the mask-free kernel directly on the operands
     # (and write straight into C), avoiding the padded copies that dominate
     # small-shape latency. The tile must divide the shape so the mask-free
     # kernel never reads out of bounds.
     if m % bm == 0 and n % bn == 0 and k % bk == 0:
-        if _should_split_k(m, n, k, bm, bn, trans_a, trans_b):
-            # Split k in two so the sparse m x n grid (~2 waves) gets enough
-            # tiles to fill the machine, then reduce the fp32 partials with a
-            # separate kernel (atomics are too slow on MTT S5000).
-            p = torch.empty(2, m, n, dtype=torch.float32, device=device)
-            grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn), 2)
-            _hgemm_splitk_kernel[grid](
-                A, B, p, m, n, k, lda, ldb, trans_a, trans_b, bm, bn, bk,
-                group_m, 2, num_warps=nw, num_stages=ns,
-            )
-            _hgemm_splitk_reduce_kernel[(grid[0],)](
-                p, C, m, n, alpha, beta, beta_is_zero, 2, bm, bn,
-                num_warps=nw,
-            )
-            return
         a, b, c_out = A, B, C
         lda_, ldb_, ldc_ = lda, ldb, ldc
         pm, pn, pk = m, n, k
