@@ -223,6 +223,111 @@ def _hgemm_nn_kernel(
         tl.store(c_ptrs, (acc + beta * c_vals).to(tl.float16))
 
 
+@triton.jit
+def _hgemm_splitk_kernel(
+    a_ptr,
+    b_ptr,
+    p_ptr,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    TRANS_A: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    K_SPLITS: tl.constexpr,
+):
+    """Split-K GEMM over an (m, n) output tile writing an fp32 partial sum
+    into the plane ``p_ptr + split_k_id * m * n``.
+
+    Only used for k-deep non-transposed shapes whose m x n grid is too sparse
+    to fill the machine (see ``_hgemm_fast``); the epilogue is a separate
+    reduce kernel so the partial sums never go through the slow MUSA atomics.
+    """
+    pid_mn = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    group_id = pid_mn // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid_mn % group_size)
+    pid_n = (pid_mn % width) // group_size
+
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    ram = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_M), BLOCK_M)
+    rbn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
+
+    k_per_split = k // K_SPLITS
+    k_start = pid_k * k_per_split
+    ks = k_start + offs_k
+    if TRANS_A:
+        a_ptrs = a_ptr + (ks[:, None] * lda + ram[None, :])
+        a_step = BLOCK_K * lda
+    else:
+        a_ptrs = a_ptr + (ram[:, None] * lda + ks[None, :])
+        a_step = BLOCK_K
+    if TRANS_B:
+        b_ptrs = b_ptr + (rbn[:, None] * ldb + ks[None, :])
+        b_step = BLOCK_K
+    else:
+        b_ptrs = b_ptr + (ks[:, None] * ldb + rbn[None, :])
+        b_step = BLOCK_K * ldb
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(k_start, k_start + k_per_split, BLOCK_K):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        if TRANS_A:
+            a = tl.trans(a)
+        if TRANS_B:
+            b = tl.trans(b)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+        a_ptrs += a_step
+        b_ptrs += b_step
+
+    p_ptrs = p_ptr + pid_k * (m * n) + offs_am[:, None] * n + offs_bn[None, :]
+    tl.store(p_ptrs, acc)
+
+
+@triton.jit
+def _hgemm_splitk_reduce_kernel(
+    p_ptr,
+    c_ptr,
+    m,
+    n,
+    alpha: tl.float32,
+    beta: tl.float32,
+    BETA_IS_ZERO: tl.constexpr,
+    K_SPLITS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Sum the K_SPLITS fp32 partial planes into C = alpha * sum + beta * C."""
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs = offs_m[:, None] * n + offs_n[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for ks in tl.static_range(K_SPLITS):
+        acc += tl.load(p_ptr + ks * (m * n) + offs).to(tl.float32)
+    if BETA_IS_ZERO:
+        out = alpha * acc
+    else:
+        c = tl.load(c_ptr + offs).to(tl.float32)
+        out = alpha * acc + beta * c
+    tl.store(c_ptr + offs, out.to(tl.float16))
+
+
 # Cached padded fp16 input buffers, keyed by device. The buffers grow
 # monotonically; padding lanes are re-written (zeroed) on every call by
 # ``_fill_padded``.
@@ -268,6 +373,21 @@ def _fill_padded(dst, src, rows, cols, mul_r, mul_c, trans):
     _copy_block(dst, src, rows, cols, dst.stride(0), src.stride(0), trans)
 
 
+def _should_split_k(m, n, k, bm, bn, trans_a, trans_b):
+    """Whether the k-deep, non-transposed shape benefits from split-K.
+
+    Split-K only pays off when the m x n output grid is too sparse to fill the
+    60-SM MTT S5000 (~2 waves) while k is long enough to amortise the extra
+    fp32 partial-sum pass. Measured ~9% faster on 2048x4096x11008 with
+    K_SPLITS=2; the transposed variants measured flat (the transposed loads
+    are already the bottleneck), so they are excluded.
+    """
+    if trans_a or trans_b or k % 2:
+        return False
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+    return tiles < 240 and k >= 2 * max(m, n)
+
+
 def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
                 trans_a=False, trans_b=False):
     """Fast path for every transposition variant.
@@ -287,6 +407,21 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
     # small-shape latency. The tile must divide the shape so the mask-free
     # kernel never reads out of bounds.
     if m % bm == 0 and n % bn == 0 and k % bk == 0:
+        if _should_split_k(m, n, k, bm, bn, trans_a, trans_b):
+            # Split k in two so the sparse m x n grid (~2 waves) gets enough
+            # tiles to fill the machine, then reduce the fp32 partials with a
+            # separate kernel (atomics are too slow on MTT S5000).
+            p = torch.empty(2, m, n, dtype=torch.float32, device=device)
+            grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn), 2)
+            _hgemm_splitk_kernel[grid](
+                A, B, p, m, n, k, lda, ldb, trans_a, trans_b, bm, bn, bk,
+                group_m, 2, num_warps=nw, num_stages=ns,
+            )
+            _hgemm_splitk_reduce_kernel[(grid[0],)](
+                p, C, m, n, alpha, beta, beta_is_zero, 2, bm, bn,
+                num_warps=nw,
+            )
+            return
         a, b, c_out = A, B, C
         lda_, ldb_, ldc_ = lda, ldb, ldc
         pm, pn, pk = m, n, k
