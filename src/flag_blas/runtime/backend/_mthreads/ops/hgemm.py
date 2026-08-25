@@ -54,6 +54,14 @@ _SMALL_LIMIT = 512**3
 _COPY_BLOCK = 1024
 _COPY_KERNEL_MAX = 8192
 
+# ``-mtgpu-opt-level=1`` enables the MUSA backend's ILP scheduling pass. On
+# MTT S5000 it speeds up the big-tile (128x128 / 256x256) MMA kernels by
+# 8-17% and the transposed-A split-K kernels by 8-15%, but regresses the
+# small 64x64 tile (fewer instructions to schedule) and the non-transposed
+# split-K path, so it is applied selectively per launch (the backend accepts
+# ``llc_options`` as a per-launch option with its own cache key).
+_LLC_OPT = "-mtgpu-opt-level=1"
+
 
 def _pad_to(v, mul):
     return ((v + mul - 1) // mul) * mul
@@ -412,9 +420,15 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
     if _should_split_k(m, n, k) and m % 256 == 0 and n % 256 == 0 and k % 64 == 0:
         p = torch.empty(2, m, n, dtype=torch.float32, device=device)
         grid = (triton.cdiv(m, 256) * triton.cdiv(n, 256), 2)
+        kw = {}
+        # The transposed-A split-K kernels (tn/tt, strided loads + tl.trans)
+        # are 8-15% faster with the backend ILP scheduler; the non-transposed
+        # ones (nn/nt) are neutral-to-slightly slower, so keep them default.
+        if trans_a:
+            kw["llc_options"] = _LLC_OPT
         _hgemm_splitk_kernel[grid](
             A, B, p, m, n, k, lda, ldb, trans_a, trans_b, 256, 256, 64, 8, 2,
-            num_warps=16, num_stages=2,
+            num_warps=16, num_stages=2, **kw,
         )
         _hgemm_splitk_reduce_kernel[(grid[0],)](
             p, C, m, n, alpha, beta, beta_is_zero, 2, 256, 256, num_warps=16,
@@ -475,9 +489,16 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
         trans_a_k, trans_b_k = False, False
 
     grid = (triton.cdiv(pm, bm) * triton.cdiv(pn, bn),)
+    kw = {}
+    # The 128x128 / 256x256 MMA kernels are 8-17% faster with the backend ILP
+    # scheduler; the small 64x64 tile regresses (too few instructions for the
+    # scheduler to help), so it keeps the default codegen.
+    if bm >= 128 and bn >= 128:
+        kw["llc_options"] = _LLC_OPT
     _hgemm_nn_kernel[grid](
         a, b, c_out, alpha, beta, pm, pn, pk, lda_, ldb_, ldc_, beta_is_zero,
         trans_a_k, trans_b_k, bm, bn, bk, group_m, num_warps=nw, num_stages=ns,
+        **kw,
     )
     if copyout is not None:
         _copy_block(copyout, c_out, m, n, copyout.stride(0), c_out.stride(0))
