@@ -504,10 +504,15 @@ def _sgemm_nn_is_large_k(m, n, k, **_kw):
 # - ITT=0 (False): 瘦 shape (min(m,n)<=128) 与小立方受 in-thread-transpose 布局损害
 #   (64x512x512 1.054->0.774、256³ 1.103->0.918、511³ 0.854->0.790 等), config 无法恢复
 # - 显式集合覆盖规则例外 (64³ 超小 shape ITT=1 反而 +0.136 至 0.983)
+# v1.6 教训 (2026-08-26): 4 组合 (ITT x buffer) 扫描用手动 launch + DB TunedConfig
+# 表 config, 但生产 libtuner 实际用 benchmark 表 config (二者不一致, 瘦 shape 尤甚)
+# -> 手动 config 下 ITT0 对 16384x512x4096/512x16384x4096 更优 (-2.3%), 但 monkeypatch
+#    生产路径确认 ITT1 才是生产最优 (1465us vs ITT0 1592us, 组合结论被 config 翻转).
+#    唯一保留: 2048x16384x2048 从 _ITT0_SHAPES 移除 -> 生产路径 ITT1+nobuf 2867.6us
+#    优于 ITT0+nobuf 2901us (+1.2%).
 _ITT0_SHAPES = {
     (256, 256, 256),
     (511, 511, 511),
-    (2048, 16384, 2048),
 }
 _ITT1_SHAPES = {
     (64, 64, 64),
