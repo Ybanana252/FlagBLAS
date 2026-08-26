@@ -426,15 +426,14 @@ def _hgemm_fast(A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
     if _should_split_k(m, n, k) and m % 256 == 0 and n % 256 == 0 and k % 64 == 0:
         p = torch.empty(2, m, n, dtype=torch.float32, device=device)
         grid = (triton.cdiv(m, 256) * triton.cdiv(n, 256), 2)
-        kw = {}
-        # The transposed-A split-K kernels (tn/tt, strided loads + tl.trans)
-        # are 8-15% faster with the backend ILP scheduler; the non-transposed
-        # ones (nn/nt) are neutral-to-slightly slower, so keep them default.
-        if trans_a:
-            kw["llc_options"] = _LLC_OPT
+        # GROUP_M=4 plus the backend ILP scheduler is 3-4% faster than the
+        # previous GROUP_M=8 across all transposition variants on k-deep
+        # shapes (interleaved A/B: 2048^2x16384 144.9 vs 140.5 TF,
+        # 2048x4096x11008 169.2 vs 162.6 TF; GROUP_M=8 with the scheduler is
+        # 3-4% slower than without, so both knobs matter together).
         _hgemm_splitk_kernel[grid](
-            A, B, p, m, n, k, lda, ldb, trans_a, trans_b, 256, 256, 64, 8, 2,
-            num_warps=16, num_stages=2, **kw,
+            A, B, p, m, n, k, lda, ldb, trans_a, trans_b, 256, 256, 64, 4, 2,
+            num_warps=16, num_stages=2, llc_options=_LLC_OPT,
         )
         _hgemm_splitk_reduce_kernel[(grid[0],)](
             p, C, m, n, alpha, beta, beta_is_zero, 2, 256, 256, num_warps=16,
