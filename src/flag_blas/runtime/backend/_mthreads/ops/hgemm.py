@@ -100,7 +100,13 @@ def _pick_config(m, n, k, trans_a=False, trans_b=False):
     if min(m, n) >= 256 and triton.cdiv(m, 256) * triton.cdiv(n, 256) >= 128:
         return 256, 256, 64, 16, 2, 4
     if min(m, n) >= 64 and triton.cdiv(m, 128) * triton.cdiv(n, 128) >= 128:
-        return 128, 128, 64, 4, 2, 8
+        # 16 warps 一致快于 4 warps(与转置分支参数对齐;实测 2048^3 +7%,
+        # 512x16384x4096 +18%)。例外:行数 m 极小、网格恰为 128 的 skinny
+        # 形状(GROUP_M 沿 m 分组的 L2 优化失效)仍用 4 warps(实测
+        # 256x8192x2048 / 512x4096x4096 / 256x8192x4096 上 nw4 更快)。
+        if m < 768 and m < n and triton.cdiv(m, 128) * triton.cdiv(n, 128) == 128:
+            return 128, 128, 64, 4, 2, 8
+        return 128, 128, 64, 16, 2, 8
     return 64, 64, 64, 4, 2, 8
 
 
