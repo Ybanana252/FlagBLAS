@@ -731,12 +731,13 @@ class LibEntry(triton.KernelInterface):
                 spec_args.append(val)
                 k_args[p.name] = val
 
-        # use_in_thread_transpose 是 Triton 编译选项 (HIPOptions), 非 kernel 参数,
-        # 不会进入 const_args; 但不同 ITT 变体的编译产物不同, 必须纳入 entry_key,
-        # 否则同 shape 的 ITT on/off 两次 launch 会命中同一缓存导致混淆.
-        itt_opt = kwargs.get("use_in_thread_transpose", None)
-        if itt_opt is not None:
-            const_args = const_args + [("use_in_thread_transpose", itt_opt)]
+        # use_in_thread_transpose / use_buffer_ops 是 Triton 编译选项 (HIPOptions),
+        # 非 kernel 参数, 不会进入 const_args; 但不同变体的编译产物不同, 必须纳入
+        # entry_key, 否则同 shape 的不同变体两次 launch 会命中同一缓存导致混淆.
+        for _opt_name in ("use_in_thread_transpose", "use_buffer_ops"):
+            _opt_val = kwargs.get(_opt_name, None)
+            if _opt_val is not None:
+                const_args = const_args + [(_opt_name, _opt_val)]
 
         entry_key = self.key(spec_args, dns_args, const_args)
         device = torch_device_fn.current_device()

@@ -524,6 +524,24 @@ def _sgemm_nn_use_itt(m, n, k, **_kw):
     return True
 
 
+# use_buffer_ops (AMDGCN_USE_BUFFER_OPS) per-shape 决策: 基于 33 个 opt shape
+# 全量快扫 + 正式协议 (warmup=1000/rep=100) 交错确认 (2026-08-26)
+# - no-buffer (False): 大/中输出 shape (m*n>=2M) 普遍受益 -1~-4%
+#   (4096³ -3.9%、512x16384x4096 -4.0%、2048x11008x4096 -4.1% 等);
+#   非对齐 mask 路径 shape 受益显著 (511³ -10.0%)
+# - buffer (True, 默认): 小输出 shape 保持 (1024³ +3.6%、128x4096x1024 +3.8%
+#   [正式确认] 等 no-buffer 反而变差); (2048,2048,16384) 大 K opt 在 no-buffer 下
+#   严重变差 (+43% 正式确认), 必须保持 buffer
+def _sgemm_nn_use_buffer_ops(m, n, k, **_kw):
+    if (m, n, k) == (2048, 2048, 16384):
+        return True
+    if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
+        return False
+    if m * n >= 2 * 1024 * 1024:
+        return False
+    return True
+
+
 def _sgemm_nn_is_pad_shape(m, n, k, **_kw):
     # 非对齐(相对 pad tile 尺寸)且非小/瘦 shape 才走 pre-pad 路径
     if (
@@ -680,11 +698,17 @@ def _make_sgemm_nn_opt_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
 ):
     use_itt = _sgemm_nn_use_itt(m, n, k)
+    use_buf = _sgemm_nn_use_buffer_ops(m, n, k)
 
     def run():
+        kwargs = dict(use_in_thread_transpose=use_itt)
+        if not use_buf:
+            # no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项 (cache key 区分);
+            # use_buf=True 时不传, 保持全局默认产物, 与未注入前完全一致
+            kwargs["use_buffer_ops"] = False
         sgemm_nn_hygon_kernel[grid](
             A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
-            use_in_thread_transpose=use_itt,
+            **kwargs,
         )
 
     return run
