@@ -458,16 +458,31 @@ _SPLITK_STAGES = 2
 _PAD_BLOCK_M = 128
 _PAD_BLOCK_N = 256
 _PAD_BLOCK_K = 32
-_PAD_COPY_CM = 128
+# v1.8 (2026-08-26): copy tile 由 64x64 改为 32x32 (带宽型 copy, 小 tile 网格更大
+# 负载均衡更好): 8191³ copy 1214->908us (-25%)、1023³ copy 50->20us、4097x8191x4095
+# copy 356us 持平; 完整路径 8191³ -1.6%、1023³ -16%。32 恒整除 mp/np/kp
+# (mp/np 为 BM/BN 倍数, kp 为 128 倍数), 无对齐风险。
+_PAD_COPY_CM = 32
 _PAD_COPY_CK = 128
-# 小输出 shape 的更高并行度候选: main (32,64) + copy tile (64,64)
-# (1023³ 完整路径 107.5->99.4us, -7.5%; 单独 copy tile 64 -4.6%).
+# 小输出 shape 的更高并行度候选: main (32,64) + copy tile 32
+# (1023³ 完整路径 116->92us, -20%; copy 50->20us)。
 # 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp,
-# 不满足时由 runner 回退 (128,128) main + (128,128) copy (mp/np 恒为 128 倍数, 安全)。
+# 不满足时由 runner 回退 (128,128) main (mp/np 恒为 128 倍数, 安全)。
 _PAD_CFG_SMALL_TILE = (32, 64, 32, 8, 4, 2)
-_PAD_COPY_TILE_SMALL = 64
-# 大输出 shape 用 (128,256,32,G8,w8,s1); 小输出 (m*n 小, 如 1023³) 用 128x128 避免 tile 浪费
-_PAD_CFG_LARGE = (128, 256, 32, 8, 8, 1)
+# 大输出 shape 分级 (v1.8 实测, 2026-08-26):
+# - m*n >= 32M (大输出, 如 8191³/4097x8191x4095): (256,256,32,G1,w16,s1) + ITT1 + no-buffer
+#   8191³ 0.862->0.925 达标 (main 与 opt 8192³ 生产 config 同款, 20652us)、
+#   4097x8191x4095 0.806->0.869
+# - 4M <= m*n < 32M (中输出, 如 4095³): (256,128,32,G8,w8,s1) + ITT0 + no-buffer
+#   4095³ 0.738->0.788 ((256,256,w16) 反而 0.734, 因 grid 仅 16x16 时大 tile 低效)
+# - m*n < 4M (小输出, 如 1023³): (32,64) 避免 tile 浪费, 保持 ITT0+buf 默认 (0.625->0.724)
+_PAD_CFG_LARGE = (256, 256, 32, 1, 16, 2)
+# v1.10: MID 由 (256,128,32,G8,w8,s1)+ITT0 改为 (64,64,32,G8,w4,s2)+ITT1
+# (与 opt 4096^3 生产 config 同款)。4095^3 pad main 算全 EVEN 4096^3:
+# (64,64,ITT1) 2927us vs (256,128,ITT0) 3013us (-2.9%), ITT1 必需 (ITT0 3201)。
+# 4095^3 完整路径 0.788 -> ~0.809。mp/np=cdiv(4095,64)=4096 仍满足 copy tile 对齐。
+_PAD_CFG_MID = (64, 64, 32, 8, 4, 2)
+_PAD_LARGE_OUTPUT = 32 * 1024 * 1024
 _PAD_CFG_SMALL = (128, 128, 32, 8, 8, 2)
 _PAD_SMALL_OUTPUT = 4 * 1024 * 1024
 # 排除 511³ (1.3e8) 等小 shape: pad-copy 开销占比大, 实测反而更差
@@ -489,12 +504,21 @@ def _get_pad_buffers(mp, kp, np, device):
 
 
 _LARGE_K_OPT_SHAPES = {(2048, 2048, 16384)}
+# v1.10: SPLIT_K=4 对薄大 K shape 显著更优 (实测):
+#   128x1024x4096 64.2->52.5us (-18.2%)、256x2048x8192 288.5->251.7us (-12.8%);
+#   512x4096x16384 反而 SPK=4 退化 (1700->2825), 保持 SPK=2。
+# 仅当 k 能被 SPLIT_K*BLOCK_K 整除时走 SPK=4 (保证段内全 EVEN, 无 k remainder)。
+_SPLITK4_SHAPES = {(128, 1024, 4096), (256, 2048, 8192)}
 
 
 def _sgemm_nn_is_large_k(m, n, k, **_kw):
     # 大 K shape 走两阶段 split-k; 特例 (2048,2048,16384) 实测 opt+ITT1 (0.852)
     # 优于 split-k+ITT0 (0.792) 与 opt+ITT0 (0.778), 由 _LARGE_K_OPT_SHAPES 排除
     if (m, n, k) in _LARGE_K_OPT_SHAPES:
+        return False
+    # split-k 按 k_per = k // SPLIT_K 均分, k 为奇数时末元素被丢弃 (静默错误),
+    # 且 EVEN_K 需按段内余数判断; 奇数 k 一律回退 opt (其自带 k-remainder 分支)
+    if k % 2 != 0:
         return False
     return k >= 4 * max(m, n)
 
@@ -572,28 +596,38 @@ def _make_sgemm_nn_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
     if m * n < _PAD_SMALL_OUTPUT:
-        # 小输出: 优先 (32,64) main + (64,64) copy tile 提升并行度 (1023³ -7.5%);
-        # 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp (store 无 mask),
-        # 不满足时回退 (128,128) main + (128,128) copy (mp/np 恒为 128 倍数, 安全)。
+        # 小输出: main (32,64) 提升并行度 (1023³ 完整路径 116->92us, -20%);
+        # main BM=32 使 mp 可能非 128 倍数, 不满足时回退 (128,128) main。
+        # copy 统一 32x32 (v1.8: 带宽型 copy 最优, 1023³ copy 50->20us)。
         BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL_TILE
         mp = triton.cdiv(m, BM) * BM
         np = triton.cdiv(n, BN) * BN
-        if mp % _PAD_COPY_TILE_SMALL == 0 and np % _PAD_COPY_TILE_SMALL == 0:
-            CCM = CCK = _PAD_COPY_TILE_SMALL
-        else:
+        if mp % 128 != 0 or np % 128 != 0:
             BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL
             mp = triton.cdiv(m, BM) * BM
             np = triton.cdiv(n, BN) * BN
-            CCM = CCK = _PAD_COPY_CM
-    else:
+        use_buf = True   # 小输出保持 buffer ops 默认 (1023³ buf0 反而略差)
+        use_itt = False
+    elif m * n >= _PAD_LARGE_OUTPUT:
+        # 大输出: (256,256,32,G1,w16,s2) + ITT1 + no-buffer
+        # (s2 比 s1 快 13%: 8191³ 0.795->0.924, 4097x8191x4095 0.755->0.869)
         BM, BN, BK, GM, nw, ns = _PAD_CFG_LARGE
         mp = triton.cdiv(m, BM) * BM
         np = triton.cdiv(n, BN) * BN
-        CCM = CCK = _PAD_COPY_CM
-    # kp 需同时为主内核 BLOCK_K(32) 与 pad-copy tile (64 或 128) 的整数倍:
+        use_buf = False
+        use_itt = True
+    else:
+        # 中输出: (64,64,32,G8,w4,s2) + ITT1 + no-buffer (v1.10, 4095³ 0.809)
+        BM, BN, BK, GM, nw, ns = _PAD_CFG_MID
+        mp = triton.cdiv(m, BM) * BM
+        np = triton.cdiv(n, BN) * BN
+        use_buf = False
+        use_itt = True
+    CCM = CCK = _PAD_COPY_CM
+    # kp 需同时为主内核 BLOCK_K(32) 与 pad-copy tile (32) 的整数倍:
     # copy kernel 对 k 维按 CK 分块且 store 无 mask, 若 kp 非 CK 倍数
     # 末块会写到 kp 之外 (如 512x12800x5210, kp=5216 -> 写到 5247 行, 越界 VMFault)。
-    # 128 是 32/64 的公倍数, 按 _PAD_COPY_CK(128) 对齐可同时满足两者。
+    # 128 是 32 的倍数, 按 _PAD_COPY_CK(128) 对齐可同时满足两者。
     kp = triton.cdiv(k, _PAD_COPY_CK) * _PAD_COPY_CK
     A_pad, B_pad = _get_pad_buffers(mp, kp, np, A.device)
     grid_pad = (
@@ -618,8 +652,23 @@ def _make_sgemm_nn_pad_runner(
             kp,
             CM=CCM,
             CK=CCK,
+            num_warps=8,
             use_in_thread_transpose=False,  # pad 路径在 ITT=1 下变差 (8191³ 0.862->0.823)
         )
+        main_kwargs = dict(
+            BETA_IS_ZERO=beta_is_zero,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            BLOCK_K=BK,
+            GROUP_M=GM,
+            num_warps=nw,
+            num_stages=ns,
+            use_in_thread_transpose=use_itt,  # 大/中输出 ITT1, 小输出 ITT0
+        )
+        if not use_buf:
+            # no-buffer 变体 (大/中输出): 显式传 use_buffer_ops=False 进编译选项;
+            # use_buf=True 时不传, 保持全局默认产物
+            main_kwargs["use_buffer_ops"] = False
         _sgemm_nn_pad_kernel[grid_main](
             A_pad,
             B_pad,
@@ -632,14 +681,7 @@ def _make_sgemm_nn_pad_runner(
             np,
             kp,
             ldc,
-            BETA_IS_ZERO=beta_is_zero,
-            BLOCK_M=BM,
-            BLOCK_N=BN,
-            BLOCK_K=BK,
-            GROUP_M=GM,
-            num_warps=nw,
-            num_stages=ns,
-            use_in_thread_transpose=False,
+            **main_kwargs,
         )
 
     return run
@@ -648,12 +690,21 @@ def _make_sgemm_nn_pad_runner(
 def _make_sgemm_nn_splitk_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
-    scratch = torch.zeros(2, m, n, dtype=torch.float32, device=C.device)
+    # per-shape SPLIT_K: 薄大 K shape (128x1024x4096/256x2048x8192) 实测 SPK=4
+    # 显著更优 (-18.2%/-12.8%); 512x4096x16384 等 SPK=4 严重退化, 保持 SPK=2。
+    # SPK=4 仅在 k 能被 SPLIT_K*BLOCK_K 整除时采用 (保证段内全 EVEN, 无 k remainder)。
+    if (m, n, k) in _SPLITK4_SHAPES and k % (_SPLITK_BLOCK_K * 4) == 0:
+        spk = 4
+    else:
+        spk = 2
+    scratch = torch.zeros(spk, m, n, dtype=torch.float32, device=C.device)
     ev_m = m % _SPLITK_BLOCK_M == 0
     ev_n = n % _SPLITK_BLOCK_N == 0
-    ev_k = k % _SPLITK_BLOCK_K == 0
+    # EVEN_K 按段内余数判断: k_per = k // SPLIT_K, 段内全 EVEN 等价于 k_per % BK == 0
+    # (原 k % BK == 0 未考虑 split-k 均分, 例如 k=96/SPK=2 -> k_per=48 %32 != 0)
+    ev_k = (k // spk) % _SPLITK_BLOCK_K == 0
     grid_mn = triton.cdiv(m, _SPLITK_BLOCK_M) * triton.cdiv(n, _SPLITK_BLOCK_N)
-    grid_main = (grid_mn * 2,)
+    grid_main = (grid_mn * spk,)
     grid_reduce = (grid_mn,)
 
     def run():
@@ -666,7 +717,7 @@ def _make_sgemm_nn_splitk_runner(
             k,
             lda,
             ldb,
-            SPLIT_K=2,
+            SPLIT_K=spk,
             EVEN_M=ev_m,
             EVEN_N=ev_n,
             EVEN_K=ev_k,
@@ -685,7 +736,7 @@ def _make_sgemm_nn_splitk_runner(
             n,
             alpha,
             beta,
-            SPLIT_K=2,
+            SPLIT_K=spk,
             BETA_IS_ZERO=beta_is_zero,
             EVEN_M=ev_m,
             EVEN_N=ev_n,
