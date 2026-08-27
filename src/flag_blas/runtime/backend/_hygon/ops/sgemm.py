@@ -652,7 +652,7 @@ def _make_sgemm_nn_pad_runner(
             kp,
             CM=CCM,
             CK=CCK,
-            num_warps=8,
+            num_warps=4,  # tile32 下 nw4 优于 nw8: 8191³ copy 948->908, 4095³ 229->223, 4097 359->345
             use_in_thread_transpose=False,  # pad 路径在 ITT=1 下变差 (8191³ 0.862->0.823)
         )
         main_kwargs = dict(
