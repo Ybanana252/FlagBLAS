@@ -2131,6 +2131,10 @@ sgemm_nn_hygon:
   - META: {BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 4
     num_stages: 2
+  # v1.12: 4096^3 实测较 (64,64,w4,s2) 快 3.6% (2796.6 vs 2900.9us, 3轮正式协议)
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
 sgemm_hygon:
   - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
     num_warps: 4
