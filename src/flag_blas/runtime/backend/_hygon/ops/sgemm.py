@@ -1391,6 +1391,271 @@ sgemm_tt_hygon_kernel = libentry()(
 )
 
 
+# ---- nt 瘦 shape 专用: 两阶段 split-k (v2.13, 2026-08-31) ----
+# nt 直连内核 (64,64) tile 下 blocks 仅 8-32, 并行度不足 (gfx936 数十 CU)。
+# split-k 把 k 均分给 SPLIT_K 段并行 (内核1 写 scratch(SPLIT_K,n,m) C^T 布局,
+# 内核2 reduce 到 C), blocks 倍乘 SPLIT_K。官方口径 do_bench(warmup=1000,
+# rep=100, median) 实测 (kpack=2, DB 生产 config):
+#   (64,512,512) SP4 20.6->15.7us (+31%)、(512,64,512) SP4 19.7->15.0 (+31%)、
+#   (64,2048,1024) SP4 31.0->25.8 (+20%)、(2048,64,1024) SP4 31.0->25.8 (+20%)、
+#   (64,1024,512) SP4 18.4->16.3 (+13%)、(1024,64,512) SP4 18.6->16.6 (+12%)、
+#   (64,4096,2048) SP2 57.3->53.9 (+6%)。
+# 已 64+ blocks 的 shape (4096x128x1024/128x4096x1024) 反而 SP 变差 (0.59-0.90),
+# 以及 (2048,2048,16384) SP 0.92, 均不进白名单。k 必须整除 SPLIT_K*BLOCK_K,
+# 白名单 shape 全为 64 倍数 (全 EVEN, 无 k remainder)。
+_NT_SPLITK_BLOCK_M = 64
+_NT_SPLITK_BLOCK_N = 64
+_NT_SPLITK_BLOCK_K = 32
+_NT_SPLITK_GROUP_M = 8
+_NT_SPLITK_STAGES = 2
+# shape -> (SPLIT_K, num_warps) (num_warps 取 DB 生产直连 config 的 w)
+_NT_SPLITK_SHAPES = {
+    (64, 512, 512): (4, 4),
+    (512, 64, 512): (4, 8),
+    (64, 1024, 512): (4, 8),
+    (1024, 64, 512): (4, 8),
+    (64, 2048, 1024): (4, 8),
+    (2048, 64, 1024): (4, 8),
+    (64, 4096, 2048): (2, 4),
+}
+
+
+def _sgemm_nt_splitk(m, n, k, **_kw):
+    # 返回 SPLIT_K 或 0 (不走 split-k)。仅精确白名单 shape, 避免误伤。
+    cfg = _NT_SPLITK_SHAPES.get((m, n, k))
+    if cfg is None:
+        return 0
+    spk, _ = cfg
+    if k % (spk * _NT_SPLITK_BLOCK_K) != 0:
+        return 0
+    return spk
+
+
+@libentry()
+@triton.jit
+def _sgemm_nt_splitk_kernel(
+    a_ptr,
+    b_ptr,
+    scratch_ptr,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    SPLIT_K: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # 内核1: 每个 block 计算部分 K 段, 写 scratch(SPLIT_K, n, m) (C^T 布局)。
+    pid = tl.program_id(0)
+    pid_k = pid % SPLIT_K
+    pid_mn = pid // SPLIT_K
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid_mn // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid_mn % gs)
+    pid_n = (pid_mn % width) // gs
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+    k_per = k // SPLIT_K
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * k_per + tl.arange(0, BLOCK_K)
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * ldb + offs_k[None, :])  # (BN,BK)
+    a_t_ptrs = a_ptr + (offs_k[:, None] + offs_am[None, :] * lda)  # (BK,BM)
+    if EVEN_M:
+        mask_m = None
+    else:
+        mask_m = offs_am < m
+    if EVEN_N:
+        mask_n = None
+    else:
+        mask_n = offs_bn < n
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for i in range(k_per // BLOCK_K):
+        if EVEN_N:
+            b_t = tl.load(b_t_ptrs)
+        else:
+            b_t = tl.load(b_t_ptrs, mask=mask_n[:, None], other=0.0)
+        if EVEN_M:
+            a_t = tl.load(a_t_ptrs)
+        else:
+            a_t = tl.load(a_t_ptrs, mask=mask_m[None, :], other=0.0)
+        acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+        b_t_ptrs += BLOCK_K
+        a_t_ptrs += BLOCK_K
+    s_ptrs = (
+        scratch_ptr
+        + pid_k.to(tl.int64) * (n.to(tl.int64) * m)
+        + offs_bn[:, None].to(tl.int64) * m
+        + offs_am[None, :].to(tl.int64)
+    )
+    if EVEN_M and EVEN_N:
+        tl.store(s_ptrs, acc_t)
+    else:
+        tl.store(
+            s_ptrs,
+            acc_t,
+            mask=(mask_n[:, None] if not EVEN_N else True)
+            & (mask_m[None, :] if not EVEN_M else True),
+        )
+
+
+@libentry()
+@triton.jit
+def _sgemm_nt_splitk_reduce_kernel(
+    scratch_ptr,
+    c_ptr,
+    m,
+    n,
+    ldc,
+    alpha: tl.float32,
+    beta: tl.float32,
+    SPLIT_K: tl.constexpr,
+    BETA_IS_ZERO: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # 内核2: reduce SPLIT_K 段 -> C (m,n) row-major。
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid % gs)
+    pid_n = (pid % width) // gs
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        s_ptrs = (
+            scratch_ptr
+            + s * (n.to(tl.int64) * m)
+            + offs_bn[:, None].to(tl.int64) * m
+            + offs_am[None, :].to(tl.int64)
+        )
+        acc_t += tl.load(s_ptrs)
+    acc = tl.trans(acc_t)
+    mask_m = offs_am < m
+    mask_n = offs_bn < n
+    c_ptrs = c_ptr + (offs_am[:, None].to(tl.int64) * ldc + offs_bn[None, :].to(tl.int64))
+    if EVEN_M and EVEN_N:
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc)
+        else:
+            c_vals = tl.load(c_ptrs)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals)
+    else:
+        c_mask = mask_m[:, None] & mask_n[None, :]
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc, mask=c_mask)
+        else:
+            c_vals = tl.load(c_ptrs, mask=c_mask)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
+
+_nt_splitk_scratch_cache = {}
+
+
+def _get_nt_splitk_scratch(sp, n, m, device):
+    key = (sp, n, m, str(device))
+    buf = _nt_splitk_scratch_cache.get(key)
+    if buf is None:
+        buf = torch.zeros(sp, n, m, dtype=torch.float32, device=device)
+        _nt_splitk_scratch_cache[key] = buf
+    return buf
+
+
+def _make_sgemm_nt_splitk_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, SPLIT_K, num_warps, **_kw
+):
+    # 白名单 shape 全为 (64,64) tile 对齐 (m/n 64 倍数) 且 k 整除 SPLIT_K*BK,
+    # 内核可静态全 EVEN; 转置内核不参与, 无 config 表依赖。
+    BM, BN, BK, GM = (
+        _NT_SPLITK_BLOCK_M,
+        _NT_SPLITK_BLOCK_N,
+        _NT_SPLITK_BLOCK_K,
+        _NT_SPLITK_GROUP_M,
+    )
+    scratch = _get_nt_splitk_scratch(SPLIT_K, n, m, A.device)
+    grid1 = (triton.cdiv(m, BM) * triton.cdiv(n, BN) * SPLIT_K,)
+    grid2 = (triton.cdiv(m, BM) * triton.cdiv(n, BN),)
+    itt = _sgemm_xt_use_itt(m, n, k)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_nt_splitk_kernel[grid1](
+            A, B, scratch, m, n, k, lda, ldb,
+            SPLIT_K, True, True, True, BM, BN, BK, GM,
+            num_warps=num_warps,
+            num_stages=_NT_SPLITK_STAGES,
+            use_in_thread_transpose=itt,
+            kpack=2,
+            **nobuf_kw,
+        )
+        _sgemm_nt_splitk_reduce_kernel[grid2](
+            scratch, C, m, n, ldc, alpha, beta, SPLIT_K, beta_is_zero,
+            True, True, BM, BN, GM,
+            num_warps=num_warps,
+            use_in_thread_transpose=itt,
+            kpack=2,
+            **nobuf_kw,
+        )
+
+    return run
+
+
+# ---- nt 直连 config override (v2.13, 2026-08-31) ----
+# libtuner 从共享 config 池为直连内核选 config, 个别非对齐小 shape 上生产 config
+# (num_warps 等) 不是最优。官方口径 raw 扫描实测 511³ (64,64) tile w16 比生产
+# w4 快 20% (29.4->23.7us, ratio 0.745->0.93), itt0+kp1 最优; 1023³ (128,64) w8
+# kp2 比生产 (64,128) w8 快 ~2% (边际, 不落地)。runner 固定手动 launch raw 内核。
+_NT_DIRECT_OVERRIDES = {
+    (511, 511, 511): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=16,
+        num_stages=2, use_in_thread_transpose=False, kpack=1,
+    ),
+}
+
+
+def _make_sgemm_nt_direct_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, ov, **_kw
+):
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov.get("BLOCK_K", 32)
+    GM = ov["GROUP_M"]
+    ev = (m % BM == 0, n % BN == 0, k % BK == 0)
+    grid = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_nt_even_kernel[grid](
+            A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+            ev[0], ev[1], ev[2], BM, BN, BK, GM,
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", False),
+            kpack=ov.get("kpack", 1),
+            **nobuf_kw,
+        )
+
+    return run
+
+
 # ---- StaticDispatch: 按 shape 情况分发不同 sgemm_nn kernel ----
 # 大 K shape (k >= 4*max(m,n)): 两阶段 split-k, 实测 2048x2048x16384 有效
 # 非对齐且非小 shape: pre-pad + 全 EVEN 内核 (消除 mask/k remainder 开销)
@@ -2106,7 +2371,58 @@ def sgemm(
                     **(_XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}),
                 )
         elif transa == CUBLAS_OP_N and transb == CUBLAS_OP_T:
-            if _sgemm_nt_use_composite(m, n, k):
+            _nt_spk = _sgemm_nt_splitk(m, n, k)
+            if _nt_spk:
+                # 瘦 shape split-k (v2.13): blocks 仅 8-32 时按 k 分段并行,
+                # (64,512,512) 等 7 shape 官方口径快 6-31%。白名单精确覆盖。
+                _nt_spk_w = _NT_SPLITK_SHAPES[(m, n, k)][1]
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_nt_splitk_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            SPLIT_K=_nt_spk,
+                            num_warps=_nt_spk_w,
+                        ),
+                    )
+                runner()
+            elif (m, n, k) in _NT_DIRECT_OVERRIDES:
+                # 直连 config override (v2.13): 511³ 等生产 config 非最优, 固定手动
+                # launch raw 内核 (w16/itt0/kp1, 官方口径 0.745->0.93)。
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_nt_direct_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            ov=_NT_DIRECT_OVERRIDES[(m, n, k)],
+                        ),
+                    )
+                runner()
+            elif _sgemm_nt_use_composite(m, n, k):
                 # 对齐大 shape: A^T 转置 + tt 内核 (v2.8), 避开直连 a_t 的 stride-lda
                 # 碎片读 (16384^3 nt 直连 0.884 -> 复合 0.914 等, 见 _make_sgemm_nt_composite_runner)
                 runner = _sgemm_runner_cache.get(key)
