@@ -1628,6 +1628,23 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
     ),
+    # v2.14 (2026-08-31): 官方口径 A/B 交替实测 (同进程各 3 次 do_bench)
+    # (256,256,256) 生产 (64,64)w4 13.44us -> (64,64)w8 kp1 13.28us (+1.2%, 稳定)
+    # (128,4096,1024)/(4096,128,1024) 换 config 无收益或更慢, 不落地
+    (256, 256, 256): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=1,
+    ),
+    # v2.14b: (512,16384,4096) w4->w8 kp2 1356->1343us ratio 0.9495->0.9587 达标
+    #         (8192,256,2048) w4->w8 kp2 205.6->199.7us ratio 0.922->0.949 (+2.9%)
+    (512, 16384, 4096): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    (8192, 256, 2048): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
 }
 
 
