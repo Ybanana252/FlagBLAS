@@ -349,11 +349,14 @@ def _sgemm_nn_pad_copy_kernel(
         tl.store(a_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
     else:
         # B tile: 真实 k x n -> pad (kp x np), 越界补零
+        # 注意: B 的网格按 (kp/CM) x (np/CK) 划分, offs_i 是 k 维(CM 行)、
+        # offs_j 是 n 维(CK 列), 使 tile/mask 恒为 (CM,CK), 与 A 分支一致,
+        # 从而支持 CM != CK 的非方形 tile (原实现 CM==CK 时两者才吻合)。
         q = pid - nblk_a
         bi = q // tl.cdiv(np, CK)
         bj = q % tl.cdiv(np, CK)
-        offs_i = bi * CK + tl.arange(0, CK)
-        offs_j = bj * CM + tl.arange(0, CM)
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
         mask = (offs_i[:, None] < k) & (offs_j[None, :] < n)
         vals = tl.load(
             b_ptr + offs_i[:, None] * ldb + offs_j[None, :],
@@ -417,28 +420,974 @@ def _sgemm_nn_pad_kernel(
         tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
 
 
+# ---- tn/nt/tt per-shape 编译选项决策 (v2.2, 2026-08-30) ----
+# ITT: 三种 trans 的 dot 布局为 MFMA 友好布局时 ITT=1 全面受益 (9 shape 全选 ITT1,
+# 4096^3 -4~-6%、8192^3 -14~-18% 等), 统一取 True。
+# buffer: 对齐大/中输出 (m*n>=2M) 与 32 非对齐 shape 用 no-buffer (-1~-7% 实测);
+# (2048,2048,16384) 大 K opt 在 no-buffer 下严重变差 (+43% nn 正式确认), 保持默认。
+def _sgemm_xt_use_itt(m, n, k, **_kw):
+    return True
+
+
+def _sgemm_xt_use_buffer_ops(m, n, k, **_kw):
+    if (m, n, k) == (2048, 2048, 16384):
+        return True
+    if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
+        return False
+    if m * n >= 2 * 1024 * 1024:
+        return False
+    return True
+
+
+# no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项 (cache key 区分);
+# buffer=True 时不传, 保持全局默认产物 (与 nn 路径同款约定)。
+_XT_NOBUF_KWARGS = {"use_buffer_ops": False}
+
+
+# ---- tn (C = A^T B) 内核: common tn + EVEN_M/N/K constexpr (v2.2) ----
+# A(k,m) lda=m, B(k,n) ldb=n; a(BM,BK) 为 A^T 片 (last-dim stride lda, ITT 转置),
+# b(BK,BN) 连续。EVEN 分支消除对齐 shape 的 mask 开销 (4096^3 实测 -5~-10%)。
+@triton.jit
+def _sgemm_tn_even_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + (offs_am[:, None] + offs_k[None, :] * lda)  # (BM,BK)
+    b_ptrs = b_ptr + (offs_k[:, None] * ldb + offs_bn[None, :])  # (BK,BN)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if EVEN_M:
+        mask_m = None
+    else:
+        mask_m = offs_am < m
+    if EVEN_N:
+        mask_n = None
+    else:
+        mask_n = offs_bn < n
+    if EVEN_K:
+        for i in range(k // BLOCK_K):
+            if EVEN_M:
+                a = tl.load(a_ptrs)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs)
+            else:
+                b = tl.load(b_ptrs, mask=mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+            a_ptrs += BLOCK_K * lda
+            b_ptrs += BLOCK_K * ldb
+    else:
+        k_full_iters = k // BLOCK_K
+        k_remainder = k % BLOCK_K
+        for i in range(k_full_iters):
+            if EVEN_M:
+                a = tl.load(a_ptrs)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs)
+            else:
+                b = tl.load(b_ptrs, mask=mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+            a_ptrs += BLOCK_K * lda
+            b_ptrs += BLOCK_K * ldb
+        if k_remainder > 0:
+            mask_k = offs_k < k_remainder
+            if EVEN_M:
+                a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            else:
+                a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            if EVEN_N:
+                b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+            else:
+                b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+    if EVEN_M and EVEN_N:
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc)
+        else:
+            c_vals = tl.load(c_ptrs)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals)
+    else:
+        c_mask = mask_m[:, None] & mask_n[None, :]
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc, mask=c_mask)
+        else:
+            c_vals = tl.load(c_ptrs, mask=c_mask)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
+
 sgemm_tn_hygon_kernel = libentry()(
     libtuner(
         configs=runtime.get_tuned_config("sgemm_hygon"),
         key=_SGEMM_KEY,
         restore_value=["c_ptr"],
-    )(common_sgemm_tn_kernel.fn.fn)
+    )(heuristics(runtime.get_heuristic_config("sgemm_tn"))(_sgemm_tn_even_kernel))
 )
+
+# ---- tn 复合路径: 预转置 A^T + nn 分发 (v2.3, 2026-08-30) ----
+# 为什么 tn 慢/nt 快: MFMA (v_mmac 16x16x8_f32) 要求 dot LHS 的 k 维内存连续。
+# nt 的 C=A B^T 直接写成 acc_t=B A^T (两操作数均 k 连续) 故快; tn 的 A(k,m)
+# 与 B(k,n) k 维 stride 均为行距 (strided), 任何方向下 LHS 都非 k 连续,
+# Triton 只能逐迭代做布局转换, 这是 tn 的结构性上限。
+# 复合方案参考 nt 的做法: 用带宽型转置内核把 A^T 变成连续 (m,k) 缓冲,
+# 再走 nn 分发 (opt/pad/splitk 全路径), 两操作数均 k 连续。转置内核已达设备
+# 峰值 (~1.1 TB/s, 128MB 120us), 无进一步优化空间。
+# 实测 (37-shape): 非对齐大 shape 4095³ 0.657->0.758、8191³ 0.771->0.860、
+# 4097x8191x4095 0.759->0.842; 对齐 shape 4096³ 0.791->0.849、
+# 512x16384x4096 0.814->0.898、2048x4096x11008 0.826->0.892、
+# 2048x11008x4096 0.846->0.896、2048x16384x2048 0.836->0.857 等。
+_TN_TP_BM = 64
+_TN_TP_BK = 64
+_TN_TP_GM = 4
+# 非对齐 shape 走复合的最小计算量: 1023³(1.1e9)/511³ 等中小 shape 转置成本
+# 占比高, 实测直连更优; 4095³(6.9e10) 起转置只占 4% 且消除 mask 收益显著。
+_TN_COMP_MIN_ELEMS = 10**10
+# 对齐 shape 由实验确认的精确 shape 集合驱动 (共享 config 表下 nn 内核在该批
+# shape 显著优于 tn 直连; 其余对齐 shape 两者几乎持平, 复合仅增加转置成本)。
+# 排除微秒级 shape (64,2048,1024): 复合 = tp+nn 两内核, 测量受 GPU 历史状态
+# 干扰 (32~62us 漂移), 全量 benchmark 实测 62.8us 反而远差于直连 36.3us;
+# (64,4096,2048) 复合 5 次独立测量稳定 57-60us (直连 62-66us), 保留。
+# 排除 (2048,2048,16384): 转置 263us 成本下收益仅 ~1% 且在两次全量复跑中
+# 3418/3485us 波动 (直连 3445us), 正负尾相当, 保持直连更稳。
+# v2.4 (2026-08-30): 37-shape 全量路径扫描 (warmup=200/rep=50) 后扩展的精确集合。
+# - 薄 m shape (64/128/256): A^T 转置成本 m*k 极小, nn 内核显著快于 tn 直连
+#   (128x1024x4096 119->59us -50%、64x1024x2048 63->35us -45% 等), 复合必然更优;
+# - 16384x4096x512 (-3%)、2048x4096x12288 (-7.5%)、2048x2048x16384 (-1%) 等
+#   对齐中大型 shape 实测 compA 也优于直连 (原 min(m,n)>=512 规则仅覆盖非对齐)。
+_TN_COMP_ALIGNED_SHAPES = {
+    (4096, 4096, 4096),
+    (512, 16384, 4096),
+    (2048, 4096, 11008),
+    (2048, 11008, 4096),
+    (2048, 16384, 2048),
+    (64, 4096, 2048),
+    (64, 512, 512),
+    (64, 512, 1024),
+    (64, 1024, 2048),
+    (64, 2048, 4096),
+    (128, 1024, 4096),
+    (256, 2048, 8192),
+    (512, 4096, 16384),
+    (16384, 4096, 512),
+    (2048, 4096, 12288),
+    (2048, 2048, 16384),
+}
+
+
+@triton.jit
+def _sgemm_tn_tp_kernel(
+    src,
+    dst,
+    m,
+    k,
+    lda,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    GM: tl.constexpr,
+):
+    # src(k,m) lda=m -> dst(m,k) 连续 (A^T 转置); 带宽型内核, 64x64 达设备峰值。
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(m, BM)
+    grid_k = tl.cdiv(k, BK)
+    width = GM * grid_k
+    gid = pid // width
+    gs = min(grid_m - gid * GM, GM)
+    pid_m = gid * GM + (pid % gs)
+    pid_k = (pid % width) // gs
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_k = pid_k * BK + tl.arange(0, BK)
+    s = tl.load(src + (offs_m[:, None] + offs_k[None, :] * lda),
+                mask=(offs_k[None, :] < k) & (offs_m[:, None] < m), other=0.0)
+    tl.store(dst + (offs_m[:, None] * k + offs_k[None, :]), s,
+             mask=(offs_m[:, None] < m) & (offs_k[None, :] < k))
+
+
+def _sgemm_tn_use_composite(m, n, k, **_kw):
+    # 非对齐大 shape: 转置等价于 nn pad 路径 (消除 mask/折返开销)。
+    if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
+        return min(m, n) >= 512 and m * n * k >= _TN_COMP_MIN_ELEMS
+    return (m, n, k) in _TN_COMP_ALIGNED_SHAPES
+
+
+def _sgemm_tn_use_composite_y(m, n, k, **_kw):
+    # 变体 Y (v2.3, 2026-08-30): 只转置 B^T (成本 n*k) + tt 内核。
+    # tt 内核 acc_t=dot(b_t,a_t) 天然把 strided 的 A(k,m) 放 dot RHS (MFMA 不要求
+    # RHS k 连续), 只需 B 一次转置; n≪m 时 n*k 远小于方案A的 m*k, 转置成本可忽略。
+    # 实测 (exp_tn_comp_tt 37-shape): (16384,512,4096) 0.815->0.853、
+    # (32768,1024,1024) 0.798->0.816、(16384,2048,2048) 0.828->0.830、
+    # (8192,256,2048) 与直连持平; 中小 shape (m*n*k<1e9) 转置+双内核开销占比高,
+    # 直连更优 (如 (4096,128,1024) Y 0.690 vs 直连 0.738), 故要求计算量下限。
+    return m >= 8 * n and m * n * k >= 10**9
+
+
+# ---- nt (C = A B^T) 直连布局内核 + EVEN_M/N/K (v2.2, 2026-08-30) ----
+# common _sgemm_nt_kernel 每 k 迭代做 tl.trans(a) 再 dot(b, a_t), 显式转置
+# 在 gfx936 上开销极大 (4096^3 6394us)。此内核改为直接加载 a_t (BK,BM) 与
+# b_t (BN,BK) (均为 MFMA 友好 row-major), dot(b_t, a_t) 后仅末尾一次 trans:
+# 4096^3 6394->3026us、8192^3 50740->21478us。EVEN 分支进一步消除 mask。
+@triton.jit
+def _sgemm_nt_even_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # C = A B^T ; A(m,k) lda=k, B(n,k) ldb=k ; acc_t = C^T (N,M) = B A^T
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid % gs)
+    pid_n = (pid % width) // gs
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * ldb + offs_k[None, :])  # (BN,BK) contig
+    a_t_ptrs = a_ptr + (offs_k[:, None] + offs_am[None, :] * lda)  # (BK,BM)
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    if EVEN_M:
+        mask_m = None
+    else:
+        mask_m = offs_am < m
+    if EVEN_N:
+        mask_n = None
+    else:
+        mask_n = offs_bn < n
+    if EVEN_K:
+        for i in range(k // BLOCK_K):
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None], other=0.0)
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_m[None, :], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+            b_t_ptrs += BLOCK_K
+            a_t_ptrs += BLOCK_K
+    else:
+        k_full_iters = k // BLOCK_K
+        k_remainder = k % BLOCK_K
+        for i in range(k_full_iters):
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None], other=0.0)
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_m[None, :], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+            b_t_ptrs += BLOCK_K
+            a_t_ptrs += BLOCK_K
+        if k_remainder > 0:
+            mask_k = offs_k < k_remainder
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs, mask=mask_k[None, :], other=0.0)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs, mask=mask_k[:, None], other=0.0)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_m[None, :] & mask_k[:, None], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+    acc = tl.trans(acc_t)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+    if EVEN_M and EVEN_N:
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc)
+        else:
+            c_vals = tl.load(c_ptrs)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals)
+    else:
+        c_mask = mask_m[:, None] & mask_n[None, :]
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc, mask=c_mask)
+        else:
+            c_vals = tl.load(c_ptrs, mask=c_mask)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
 
 sgemm_nt_hygon_kernel = libentry()(
     libtuner(
         configs=runtime.get_tuned_config("sgemm_hygon"),
         key=_SGEMM_KEY,
         restore_value=["c_ptr"],
-    )(common_sgemm_nt_kernel.fn.fn)
+    )(heuristics(runtime.get_heuristic_config("sgemm_nt"))(_sgemm_nt_even_kernel))
 )
+
+# ---- nt pad 路径 (v2.6, 2026-08-30) ----
+# 非对齐大 shape 直连 kernel 的 mask/k remainder 开销高 (nt 4095³ 0.755/8191³ 0.767/
+# 4097x8191x4095 0.769)。参照 nn pad 思路: A(m,k)/B(n,k) pre-pad 到 (mp,kp)/(np,kp)
+# 对齐缓冲, 主内核全 EVEN (load 无 mask), 仅 store 对真实 m/n 打 mask。
+# 实测 (warmup=100/rep=100, hipBLAS ref): 4095³ 0.755->0.840、8191³ 0.767->0.866、
+# 4097x8191x4095 0.769->0.874 (main 128x128 w8 s2 最优)。
+_nt_pad_cache = {}
+
+
+def _get_nt_pad_buffers(mp, np, kp, device):
+    key = (mp, np, kp, str(device))
+    bufs = _nt_pad_cache.get(key)
+    if bufs is None:
+        a = torch.zeros(mp, kp, dtype=torch.float32, device=device)
+        b = torch.zeros(np, kp, dtype=torch.float32, device=device)
+        bufs = (a, b)
+        _nt_pad_cache[key] = bufs
+    return bufs
+
+
+@triton.jit
+def _sgemm_nt_pad_copy_kernel(
+    a_ptr,
+    b_ptr,
+    a_pad_ptr,
+    b_pad_ptr,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    mp,
+    np,
+    kp,
+    CM: tl.constexpr,
+    CK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nblk_a = tl.cdiv(mp, CM) * tl.cdiv(kp, CK)
+    grid_j = tl.cdiv(kp, CK)
+    if pid < nblk_a:
+        # A(m,k) lda -> A_pad(mp,kp)
+        bi = pid // grid_j
+        bj = pid % grid_j
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
+        mask = (offs_i[:, None] < m) & (offs_j[None, :] < k)
+        vals = tl.load(
+            a_ptr + offs_i[:, None] * lda + offs_j[None, :],
+            mask=mask, other=0.0,
+        )
+        tl.store(a_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
+    else:
+        # B(n,k) ldb -> B_pad(np,kp)
+        q = pid - nblk_a
+        bi = q // grid_j
+        bj = q % grid_j
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
+        mask = (offs_i[:, None] < n) & (offs_j[None, :] < k)
+        vals = tl.load(
+            b_ptr + offs_i[:, None] * ldb + offs_j[None, :],
+            mask=mask, other=0.0,
+        )
+        tl.store(b_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
+
+
+@triton.jit
+def _sgemm_nt_pad_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    mp,
+    np,
+    kp,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # A_pad(mp,kp) lda=kp, B_pad(np,kp) ldb=kp; 全 EVEN load, store 对真实 m/n 打 mask。
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(mp, BLOCK_M)
+    grid_n = tl.cdiv(np, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid % gs)
+    pid_n = (pid % width) // gs
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * kp + offs_k[None, :])  # (BN,BK)
+    a_t_ptrs = a_ptr + (offs_k[:, None] + offs_am[None, :] * kp)  # (BK,BM)
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for i in range(kp // BLOCK_K):
+        b_t = tl.load(b_t_ptrs)
+        a_t = tl.load(a_t_ptrs)
+        acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+        b_t_ptrs += BLOCK_K
+        a_t_ptrs += BLOCK_K
+    acc = tl.trans(acc_t)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+    c_mask = (offs_cm < m)[:, None] & (offs_cn < n)[None, :]
+    if BETA_IS_ZERO:
+        tl.store(c_ptrs, alpha * acc, mask=c_mask)
+    else:
+        c_vals = tl.load(c_ptrs, mask=c_mask)
+        tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
+
+def _sgemm_xt_is_pad_shape(m, n, k, **_kw):
+    # 非对齐且非小/瘦 shape 才走 pre-pad (nt/tt 共用; nn 有独立判定与分级 config)
+    if (
+        m % _PAD_BLOCK_M == 0
+        and n % _PAD_BLOCK_N == 0
+        and k % _PAD_BLOCK_K == 0
+    ):
+        return False
+    if min(m, n) < 512:
+        return False
+    # nt/tt main 只有大 tile config (128x128), 无 nn 的小输出分级; 实测 1023³ (1.07e9)
+    # pad 0.45 vs 直连 1.08, 阈值须显著高于 nn 的 5e8 才只覆盖 4095³ 及以上
+    if m * n * k < _NT_PAD_MIN_ELEMS:
+        return False
+    return True
+
+
+# nt pad 专用: 只有 4095³ (6.9e10) 及以上的大非对齐 shape 走 pre-pad (见 _sgemm_nt_is_pad_shape)
+_NT_PAD_MIN_ELEMS = 2 * 10**10
+
+
+def _make_sgemm_nt_pad_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
+):
+    # 非对齐大 shape: main 128x128 w8 s2 最优 (4095³/8191³/4097x8191x4095 全量扫描)
+    BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
+    mp = triton.cdiv(m, BM) * BM
+    np = triton.cdiv(n, BN) * BN
+    kp = triton.cdiv(k, _PAD_COPY_CK) * _PAD_COPY_CK
+    A_pad, B_pad = _get_nt_pad_buffers(mp, np, kp, A.device)
+    grid_pad = (
+        triton.cdiv(mp, _PAD_COPY_CM) * triton.cdiv(kp, _PAD_COPY_CK)
+        + triton.cdiv(np, _PAD_COPY_CM) * triton.cdiv(kp, _PAD_COPY_CK),
+    )
+    grid_main = (triton.cdiv(mp, BM) * triton.cdiv(np, BN),)
+
+    def run():
+        _sgemm_nt_pad_copy_kernel[grid_pad](
+            A,
+            B,
+            A_pad,
+            B_pad,
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            mp,
+            np,
+            kp,
+            CM=_PAD_COPY_CM,
+            CK=_PAD_COPY_CK,
+            num_warps=4,
+            use_in_thread_transpose=False,
+        )
+        main_kwargs = dict(
+            BETA_IS_ZERO=beta_is_zero,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            BLOCK_K=BK,
+            GROUP_M=GM,
+            num_warps=nw,
+            num_stages=ns,
+            use_in_thread_transpose=True,
+            use_buffer_ops=False,
+        )
+        _sgemm_nt_pad_kernel[grid_main](
+            A_pad,
+            B_pad,
+            C,
+            alpha,
+            beta,
+            m,
+            n,
+            mp,
+            np,
+            kp,
+            ldc,
+            **main_kwargs,
+        )
+
+    return run
+
+
+# ---- tt pad 路径 (v2.7, 2026-08-30) ----
+# tt (C=A^T B^T): A(k,m) lda=m、B(n,k) ldb=k 均行主序。非对齐大 shape 直连内核
+# 走 mask/k remainder 路径开销高 (tt 8191³ 0.883/4097x8191x4095 0.826)。参照 nt pad:
+# A(k,m)->A_pad(kp,mp)、B(n,k)->B_pad(np,kp) pre-pad, 主内核全 EVEN load。
+# 实测 (warmup=100/rep=100, hipBLAS ref): 8191³ 0.883->1.037、4097x8191x4095 0.826->0.940、
+# 4095³ 1.115->1.239 (main 128x128 w8 s2 最优)。
+_tt_pad_cache = {}
+
+
+def _get_tt_pad_buffers(kp, mp, np, device):
+    key = (kp, mp, np, str(device))
+    bufs = _tt_pad_cache.get(key)
+    if bufs is None:
+        a = torch.zeros(kp, mp, dtype=torch.float32, device=device)
+        b = torch.zeros(np, kp, dtype=torch.float32, device=device)
+        bufs = (a, b)
+        _tt_pad_cache[key] = bufs
+    return bufs
+
+
+@triton.jit
+def _sgemm_tt_pad_copy_kernel(
+    a_ptr,
+    b_ptr,
+    a_pad_ptr,
+    b_pad_ptr,
+    k,
+    m,
+    n,
+    lda,
+    ldb,
+    kp,
+    mp,
+    np,
+    CM: tl.constexpr,
+    CK: tl.constexpr,
+):
+    # A(k,m) lda -> A_pad(kp,mp), B(n,k) ldb -> B_pad(np,kp); 两者列数不同,
+    # grid_j 分开计算。
+    pid = tl.program_id(0)
+    nblk_a = tl.cdiv(kp, CM) * tl.cdiv(mp, CK)
+    if pid < nblk_a:
+        bi = pid // tl.cdiv(mp, CK)
+        bj = pid % tl.cdiv(mp, CK)
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
+        mask = (offs_i[:, None] < k) & (offs_j[None, :] < m)
+        vals = tl.load(a_ptr + offs_i[:, None] * lda + offs_j[None, :], mask=mask, other=0.0)
+        tl.store(a_pad_ptr + offs_i[:, None] * mp + offs_j[None, :], vals)
+    else:
+        q = pid - nblk_a
+        bi = q // tl.cdiv(kp, CK)
+        bj = q % tl.cdiv(kp, CK)
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
+        mask = (offs_i[:, None] < n) & (offs_j[None, :] < k)
+        vals = tl.load(b_ptr + offs_i[:, None] * ldb + offs_j[None, :], mask=mask, other=0.0)
+        tl.store(b_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
+
+
+@triton.jit
+def _sgemm_tt_pad_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    mp,
+    np,
+    kp,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # A_pad(kp,mp) lda=mp, B_pad(np,kp) ldb=kp; 全 EVEN load, store 对真实 m/n 打 mask。
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(mp, BLOCK_M)
+    grid_n = tl.cdiv(np, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid % gs)
+    pid_n = (pid % width) // gs
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_t_ptrs = a_ptr + (offs_k[:, None] * mp + offs_am[None, :])  # (BK,BM) 连续
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * kp + offs_k[None, :])  # (BN,BK) 连续
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for i in range(kp // BLOCK_K):
+        a_t = tl.load(a_t_ptrs)
+        b_t = tl.load(b_t_ptrs)
+        acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+        a_t_ptrs += BLOCK_K * mp
+        b_t_ptrs += BLOCK_K
+    acc = tl.trans(acc_t)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+    c_mask = (offs_cm < m)[:, None] & (offs_cn < n)[None, :]
+    if BETA_IS_ZERO:
+        tl.store(c_ptrs, alpha * acc, mask=c_mask)
+    else:
+        c_vals = tl.load(c_ptrs, mask=c_mask)
+        tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
+
+def _make_sgemm_tt_pad_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
+):
+    # 非对齐大 shape: main 128x128 w8 s2 最优 (4095³/8191³/4097x8191x4095 全量扫描)
+    BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
+    mp = triton.cdiv(m, BM) * BM
+    np = triton.cdiv(n, BN) * BN
+    kp = triton.cdiv(k, _TT_PAD_COPY_CK) * _TT_PAD_COPY_CK
+    A_pad, B_pad = _get_tt_pad_buffers(kp, mp, np, A.device)
+    grid_pad = (
+        triton.cdiv(kp, _TT_PAD_COPY_CM) * triton.cdiv(mp, _TT_PAD_COPY_CK)
+        + triton.cdiv(np, _TT_PAD_COPY_CM) * triton.cdiv(kp, _TT_PAD_COPY_CK),
+    )
+    grid_main = (triton.cdiv(mp, BM) * triton.cdiv(np, BN),)
+
+    def run():
+        _sgemm_tt_pad_copy_kernel[grid_pad](
+            A,
+            B,
+            A_pad,
+            B_pad,
+            k,
+            m,
+            n,
+            lda,
+            ldb,
+            kp,
+            mp,
+            np,
+            CM=_TT_PAD_COPY_CM,
+            CK=_TT_PAD_COPY_CK,
+            num_warps=4,
+            use_in_thread_transpose=False,
+        )
+        main_kwargs = dict(
+            BETA_IS_ZERO=beta_is_zero,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            BLOCK_K=BK,
+            GROUP_M=GM,
+            num_warps=nw,
+            num_stages=ns,
+            use_in_thread_transpose=True,
+            use_buffer_ops=False,
+        )
+        _sgemm_tt_pad_kernel[grid_main](
+            A_pad,
+            B_pad,
+            C,
+            alpha,
+            beta,
+            m,
+            n,
+            mp,
+            np,
+            kp,
+            ldc,
+            **main_kwargs,
+        )
+
+    return run
+
+
+# ---- tn pad 路径 (v2.8, 2026-08-30) ----
+# tn (C=A^T B): A(k,m) lda=m 与 tt 的 A 布局一致, 但 B(k,n) ldb=n 是 k 行主序,
+# 直连/复合路径 (A^T->nn pad) 对大非对齐 shape 均落后 (tn 4095³ 0.880/8191³ 0.918/
+# 4097x8191x4095 0.934)。参照 tt pad: A(k,m)->A_pad(kp,mp)、B(k,n) 转置+pad->
+# B_pad(np,kp), 复用 _sgemm_tt_pad_kernel (全 EVEN main)。tt pad 同 shape 已 1.24/
+# 1.01/0.94, tn 复用后预计 4095³~1.0/8191³~0.96/4097x8191x4095~1.0。
+_tn_pad_cache = {}
+
+
+def _get_tn_pad_buffers(kp, mp, np, device):
+    key = (kp, mp, np, str(device))
+    bufs = _tn_pad_cache.get(key)
+    if bufs is None:
+        a = torch.zeros(kp, mp, dtype=torch.float32, device=device)
+        b = torch.zeros(np, kp, dtype=torch.float32, device=device)
+        bufs = (a, b)
+        _tn_pad_cache[key] = bufs
+    return bufs
+
+
+@triton.jit
+def _sgemm_tn_pad_copy_kernel(
+    a_ptr,
+    b_ptr,
+    a_pad_ptr,
+    b_pad_ptr,
+    k,
+    m,
+    n,
+    lda,
+    ldb,
+    kp,
+    mp,
+    np,
+    CM: tl.constexpr,
+    CK: tl.constexpr,
+):
+    # A(k,m) lda -> A_pad(kp,mp) (同 tt); B(k,n) ldb -> B_pad(np,kp) 转置
+    # (b_pad[n,k] = B[k,n])。A/B 的网格划分不同 (A 按 (kp,mp) tile, B 按 (np,kp) tile)。
+    pid = tl.program_id(0)
+    nblk_a = tl.cdiv(kp, CM) * tl.cdiv(mp, CK)
+    if pid < nblk_a:
+        bi = pid // tl.cdiv(mp, CK)
+        bj = pid % tl.cdiv(mp, CK)
+        offs_i = bi * CM + tl.arange(0, CM)
+        offs_j = bj * CK + tl.arange(0, CK)
+        mask = (offs_i[:, None] < k) & (offs_j[None, :] < m)
+        vals = tl.load(a_ptr + offs_i[:, None] * lda + offs_j[None, :], mask=mask, other=0.0)
+        tl.store(a_pad_ptr + offs_i[:, None] * mp + offs_j[None, :], vals)
+    else:
+        q = pid - nblk_a
+        bi = q // tl.cdiv(kp, CK)
+        bj = q % tl.cdiv(kp, CK)
+        offs_i = bi * CM + tl.arange(0, CM)  # n 维
+        offs_j = bj * CK + tl.arange(0, CK)  # k 维
+        mask = (offs_i[:, None] < n) & (offs_j[None, :] < k)
+        vals = tl.load(b_ptr + offs_i[:, None] + offs_j[None, :] * ldb, mask=mask, other=0.0)
+        tl.store(b_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
+
+
+def _make_sgemm_tn_pad_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
+):
+    # main 128x128 w8 s2 同 tt pad (tt 全量扫描最优); A/B 两个 copy 与 tt pad 同体积。
+    BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
+    mp = triton.cdiv(m, BM) * BM
+    np = triton.cdiv(n, BN) * BN
+    kp = triton.cdiv(k, _PAD_COPY_CK) * _PAD_COPY_CK
+    A_pad, B_pad = _get_tn_pad_buffers(kp, mp, np, A.device)
+    grid_pad = (
+        triton.cdiv(kp, _PAD_COPY_CM) * triton.cdiv(mp, _PAD_COPY_CK)
+        + triton.cdiv(np, _PAD_COPY_CM) * triton.cdiv(kp, _PAD_COPY_CK),
+    )
+    grid_main = (triton.cdiv(mp, BM) * triton.cdiv(np, BN),)
+
+    def run():
+        _sgemm_tn_pad_copy_kernel[grid_pad](
+            A,
+            B,
+            A_pad,
+            B_pad,
+            k,
+            m,
+            n,
+            lda,
+            ldb,
+            kp,
+            mp,
+            np,
+            CM=_PAD_COPY_CM,
+            CK=_PAD_COPY_CK,
+            num_warps=4,
+            use_in_thread_transpose=False,
+        )
+        main_kwargs = dict(
+            BETA_IS_ZERO=beta_is_zero,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            BLOCK_K=BK,
+            GROUP_M=GM,
+            num_warps=nw,
+            num_stages=ns,
+            use_in_thread_transpose=True,
+            use_buffer_ops=False,
+        )
+        _sgemm_tt_pad_kernel[grid_main](
+            A_pad,
+            B_pad,
+            C,
+            alpha,
+            beta,
+            m,
+            n,
+            mp,
+            np,
+            kp,
+            ldc,
+            **main_kwargs,
+        )
+
+    return run
+
+
+# ---- tt (C = A^T B^T) 内核: common tt + EVEN_M/N/K (v2.2) ----
+# A(k,m) lda=m, B(n,k) ldb=k; a_t(BK,BM) 与 b_t(BN,BK) 均为连续 row-major,
+# dot(b_t, a_t) 后一次 trans 写 C。天然 MFMA 友好布局, 基线已达 sp~1.0,
+# EVEN 分支在 8192^3 再 -5.5%。
+@triton.jit
+def _sgemm_tt_even_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    alpha: tl.float32,
+    beta: tl.float32,
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    BETA_IS_ZERO: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # C = A^T B^T ; acc_t = C^T (N,M) = B^T A^T
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(m, BLOCK_M)
+    grid_n = tl.cdiv(n, BLOCK_N)
+    width = GROUP_M * grid_n
+    gid = pid // width
+    gs = min(grid_m - gid * GROUP_M, GROUP_M)
+    pid_m = gid * GROUP_M + (pid % gs)
+    pid_n = (pid % width) // gs
+    if pid_m * BLOCK_M >= m or pid_n * BLOCK_N >= n:
+        return
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_t_ptrs = a_ptr + (offs_k[:, None] * lda + offs_am[None, :])  # (BK,BM) contig
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * ldb + offs_k[None, :])  # (BN,BK) contig
+    acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    if EVEN_M:
+        mask_m = None
+    else:
+        mask_m = offs_am < m
+    if EVEN_N:
+        mask_n = None
+    else:
+        mask_n = offs_bn < n
+    if EVEN_K:
+        for i in range(k // BLOCK_K):
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_m[None, :], other=0.0)
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+            a_t_ptrs += BLOCK_K * lda
+            b_t_ptrs += BLOCK_K
+    else:
+        k_full_iters = k // BLOCK_K
+        k_remainder = k % BLOCK_K
+        for i in range(k_full_iters):
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_m[None, :], other=0.0)
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+            a_t_ptrs += BLOCK_K * lda
+            b_t_ptrs += BLOCK_K
+        if k_remainder > 0:
+            mask_k = offs_k < k_remainder
+            if EVEN_M:
+                a_t = tl.load(a_t_ptrs, mask=mask_k[:, None], other=0.0)
+            else:
+                a_t = tl.load(a_t_ptrs, mask=mask_k[:, None] & mask_m[None, :], other=0.0)
+            if EVEN_N:
+                b_t = tl.load(b_t_ptrs, mask=mask_k[None, :], other=0.0)
+            else:
+                b_t = tl.load(b_t_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+            acc_t = tl.dot(b_t, a_t, acc_t, out_dtype=tl.float32, allow_tf32=False)
+    acc = tl.trans(acc_t)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * ldc + offs_cn[None, :])
+    if EVEN_M and EVEN_N:
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc)
+        else:
+            c_vals = tl.load(c_ptrs)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals)
+    else:
+        c_mask = mask_m[:, None] & mask_n[None, :]
+        if BETA_IS_ZERO:
+            tl.store(c_ptrs, alpha * acc, mask=c_mask)
+        else:
+            c_vals = tl.load(c_ptrs, mask=c_mask)
+            tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
+
 
 sgemm_tt_hygon_kernel = libentry()(
     libtuner(
         configs=runtime.get_tuned_config("sgemm_hygon"),
         key=_SGEMM_KEY,
         restore_value=["c_ptr"],
-    )(common_sgemm_tt_kernel.fn.fn)
+    )(heuristics(runtime.get_heuristic_config("sgemm_tt"))(_sgemm_tt_even_kernel))
 )
 
 
@@ -464,10 +1413,16 @@ _PAD_BLOCK_K = 32
 # (mp/np 为 BM/BN 倍数, kp 为 128 倍数), 无对齐风险。
 _PAD_COPY_CM = 32
 _PAD_COPY_CK = 128
+# tt pad-copy 专用 tile (v2.9): 非对齐大 shape 实测小方形 tile (32,32) 远优于
+# (32,128) —— 4097x8191x4095 copy 487us -> 331us (1.08TB/s -> 1.2TB/s),
+# 4095³/8191³ 同构受益。小 tile 程序数翻倍, 更利于延迟隐藏/带宽饱和。
+_TT_PAD_COPY_CM = 32
+_TT_PAD_COPY_CK = 32
 # 小输出 shape 的更高并行度候选: main (32,64) + copy tile 32
 # (1023³ 完整路径 116->92us, -20%; copy 50->20us)。
 # 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp,
 # 不满足时由 runner 回退 (128,128) main (mp/np 恒为 128 倍数, 安全)。
+# v2.9 曾试 (64,32): buf1 下与 (32,64) 持平 (75.4us), 无收益, 维持 (32,64)。
 _PAD_CFG_SMALL_TILE = (32, 64, 32, 8, 4, 2)
 # 大输出 shape 分级 (v1.8 实测, 2026-08-26):
 # - m*n >= 32M (大输出, 如 8191³/4097x8191x4095): (256,256,32,G1,w16,s1) + ITT1 + no-buffer
@@ -632,7 +1587,7 @@ def _make_sgemm_nn_pad_runner(
     A_pad, B_pad = _get_pad_buffers(mp, kp, np, A.device)
     grid_pad = (
         triton.cdiv(mp, CCM) * triton.cdiv(kp, CCK)
-        + triton.cdiv(kp, CCK) * triton.cdiv(np, CCM),
+        + triton.cdiv(kp, CCM) * triton.cdiv(np, CCK),
     )
     grid_main = (triton.cdiv(mp, BM) * triton.cdiv(np, BN),)
 
@@ -779,6 +1734,209 @@ _SGEMM_NN_DISPATCH = StaticDispatch(
 )
 
 
+# ---- tn 复合路径: A^T 缓冲缓存 + runner (v2.3, 2026-08-30) ----
+# 与 _get_pad_buffers 同款约定: 按 (m,k,device) 缓存, 避免每次调用分配大 buffer
+# (8191³ 的 Ac 达 268MB)。转置内核全量覆盖缓冲 (无 padding), torch.empty 即可。
+_tn_ac_cache = {}
+
+
+def _get_tn_ac(m, k, device):
+    key = (m, k, str(device))
+    buf = _tn_ac_cache.get(key)
+    if buf is None:
+        buf = torch.empty(m, k, dtype=torch.float32, device=device)
+        _tn_ac_cache[key] = buf
+    return buf
+
+
+def _make_sgemm_tn_composite_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
+):
+    Ac = _get_tn_ac(m, k, A.device)
+    # 纯 int 算术而非 triton.cdiv: cdiv 的 constexpr 包装单次 ~7.8us, runner 每次
+    # 调用都会重建 (sgemm 入口), 对小 shape 是 ~15us 的纯 Python 开销
+    grid_tp = (
+        (m + _TN_TP_BM - 1) // _TN_TP_BM
+    ) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
+    grid_tp = (grid_tp,)
+    nn_runner = _SGEMM_NN_DISPATCH.lookup_and_build(
+        m,
+        n,
+        k,
+        True,
+        context=dict(
+            A=Ac,
+            lda=k,
+            B=B,
+            ldb=ldb,
+            C=C,
+            ldc=ldc,
+            m=m,
+            n=n,
+            k=k,
+            alpha=alpha,
+            beta=beta,
+            beta_is_zero=beta_is_zero,
+            grid=grid,
+        ),
+    )
+
+    def run():
+        _sgemm_tn_tp_kernel[grid_tp](
+            A, Ac, m, k, lda, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM
+        )
+        nn_runner()
+
+    return run
+
+
+# ---- tn 复合路径变体 Y: B^T 缓冲缓存 + tt 内核 runner (v2.3, 2026-08-30) ----
+# 与 _get_tn_ac 同款约定: 按 (n,k,device) 缓存, 转置内核全量覆盖 (无 padding)。
+_tn_bc_cache = {}
+
+
+def _get_tn_bc(n, k, device):
+    key = (n, k, str(device))
+    buf = _tn_bc_cache.get(key)
+    if buf is None:
+        buf = torch.empty(n, k, dtype=torch.float32, device=device)
+        _tn_bc_cache[key] = buf
+    return buf
+
+
+def _make_sgemm_tn_composite_y_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
+):
+    # 转置 B(k,n) ldb=n -> Bc(n,k) 连续, 再走 tt 内核 (A 保持 (k,m) lda=m,
+    # strided 放 dot RHS, MFMA 不要求 RHS k 连续)。
+    Bc = _get_tn_bc(n, k, B.device)
+    # 同上: cdiv constexpr 包装 ~7.8us/次, runner 每次调用重建, 改纯 int 算术
+    grid_tp = (
+        (n + _TN_TP_BM - 1) // _TN_TP_BM
+    ) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
+    grid_tp = (grid_tp,)
+    itt = _sgemm_xt_use_itt(m, n, k)
+    nobuf = not _sgemm_xt_use_buffer_ops(m, n, k)
+
+    def run():
+        _sgemm_tn_tp_kernel[grid_tp](
+            B, Bc, n, k, ldb, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM
+        )
+        sgemm_tt_hygon_kernel[grid](
+            A, Bc, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero,
+            use_in_thread_transpose=itt,
+            **(_XT_NOBUF_KWARGS if nobuf else {}),
+        )
+
+    return run
+
+
+# ---- nt 复合路径 (At+TT, v2.8, 2026-08-31) ----
+# C = A B^T 的直连内核 a_t 按 (BK,BM) 读 A 列块 (stride-lda 碎片), 是大 shape 的
+# 主要瓶颈 (16384^3 nt 直连 184.2ms vs hipBLAS ref 149.9ms)。方案: 一次转置
+# A(m,k)->At(k,m) (~2ms), 再走 tt 内核 (A 侧变 1KB 连续, B 侧 128B), 与直连同
+# 结构但总时间更低。实测 (生产 tt 入口 + 池内 256x256 G8, warmup=25/rep=25):
+# 16384^3 0.884->0.914、8192^3 0.885->0.907、8192x28672x8192 0.888->0.925、
+# 4096x8192x28672 0.830->0.851; 中/小 shape 转置+双内核开销占比高, 直连更优。
+_nt_at_cache = {}
+
+
+# kpack=2 逐 shape 例外表 (v2.12)。官方口径 do_bench(warmup=1000/rep=100/median)
+# 实测: 这些直连 shape 上 kpack=2 比 kpack=1 慢 >=1% (d 列), 回退到 kpack=1
+# 消除回退; 其余直连 shape kpack=2 净正 (2048x4096x11008 -4.3% 等)。
+#   (64,512,512)  +1.7% | (512,64,512) +2.5% | (512,512,512) +3.1%
+#   (511,511,511) +1.1% | (4096,128,1024) +1.0% | (2048,2048,16384) +1.4%
+_NT_KPACK1_SHAPES = {
+    (64, 512, 512),
+    (512, 64, 512),
+    (512, 512, 512),
+    (511, 511, 511),
+    (4096, 128, 1024),
+    (2048, 2048, 16384),
+}
+
+
+def _sgemm_nt_direct_kpack(m, n, k):
+    return 2 if (m, n, k) not in _NT_KPACK1_SHAPES else 1
+
+
+def _get_nt_at(k, m, device):
+    key = (k, m, str(device))
+    buf = _nt_at_cache.get(key)
+    if buf is None:
+        buf = torch.empty(k, m, dtype=torch.float32, device=device)
+        _nt_at_cache[key] = buf
+    return buf
+
+
+def _sgemm_nt_use_composite(m, n, k, **_kw):
+    # 仅对齐大 shape: 转置内核与 tt 内核均要求 32 对齐; 与 pad 路径互斥
+    # (8191^3 等非对齐 shape 继续走 pre-pad)。阈值 m*n*k>=5e11 且 min(m,n)>=4096
+    # 覆盖 16384^3/8192^3/8192x28672x8192/4096x8192x28672, 排除 4096^3 (直连 0.917
+    # 更优) 与 2048x2048x16384 (min=2048, 转置开销吃掉内核收益)。
+    if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
+        return False
+    if min(m, n) < 4096:
+        return False
+    return m * n * k >= 5 * 10**11
+
+
+def _make_sgemm_nt_composite_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
+):
+    At = _get_nt_at(k, m, A.device)
+    # 转置参数语义: _sgemm_tn_tp_kernel(src, dst, m=dst行数, k=dst列数, lda=src行stride);
+    # A(m,k) lda=k -> At(k,m): (A, At, k, m, lda)。
+    grid_tp = (
+        (k + _TN_TP_BM - 1) // _TN_TP_BM
+    ) * ((m + _TN_TP_BK - 1) // _TN_TP_BK)
+    grid_tp = (grid_tp,)
+    itt = _sgemm_xt_use_itt(m, n, k)
+    nobuf = not _sgemm_xt_use_buffer_ops(m, n, k)
+
+    def run():
+        _sgemm_tn_tp_kernel[grid_tp](
+            A, At, k, m, lda, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM
+        )
+        # kpack=2 (HIPOptions 编译选项, 每指令打包 2 个 k 元素) 实测对全部复合
+        # shape 有效 (v2.11, scan4: 16384^3 0.915->0.925、8192x28672x8192 0.925
+        # ->0.936 等); 该选项经 libentry 透传并纳入 entry_key, 与 TT 路径的
+        # kpack=1 产物互不串用。
+        sgemm_tt_hygon_kernel[grid](
+            At, B, C, alpha, beta, m, n, k, m, ldb, ldc, beta_is_zero,
+            use_in_thread_transpose=itt,
+            kpack=2,
+            **(_XT_NOBUF_KWARGS if nobuf else {}),
+        )
+
+    return run
+
+
+# ---- sgemm 入口级 runner 缓存 (v2.5, 2026-08-30) ----
+# nn 分发 lookup_and_build 与 composite runner 每次调用都会重建 (~7-17us 纯 Python
+# 开销, cdiv constexpr 包装 ~7.8us/次)。对微秒级 shape (64x512x512 等) 开销占比大,
+# 按 (shape, stride, 标量, 张量 data_ptr) 缓存 runner 闭包, 命中时直接复用。
+# data_ptr 参与 key: 不同张量必然重建; 闭包持引用防地址复用误命中。上限防无限增长。
+# v2.10 (2026-08-31): 闭包持 A/B/C 引用, 无差别缓存会长期钉住大 shape 张量 (全量
+# benchmark 37-shape × 4 变体累积后 16384³ 单 runner 12GB 导致 OOM)。启动开销只对
+# 微秒级 shape 有意义, 按钉住总元素数门控: 大 shape 每次调用重建 (~10-20us, 相对
+# 毫秒级内核可忽略), 张量随调用结束即可释放。
+_sgemm_runner_cache = {}
+_sgemm_runner_cache_max = 8192
+# 单 runner 钉住上限 16M 元素 (~64MB fp32): 覆盖 ≤2048³ 的常规小/中 shape。
+_SGEMM_RUNNER_CACHE_MAX_PIN = 16 * 2**20
+
+
+def _cache_sgemm_runner(key, runner):
+    # key = (transa, transb, m, n, k, ...); 按钉住总元素数门控
+    m, n, k = key[2], key[3], key[4]
+    if m * k + n * k + m * n > _SGEMM_RUNNER_CACHE_MAX_PIN:
+        return runner  # 大 shape 不缓存, 避免闭包钉住数百 MB~GB 张量
+    if len(_sgemm_runner_cache) < _sgemm_runner_cache_max:
+        _sgemm_runner_cache[key] = runner
+    return runner
+
+
 def sgemm(
     transa: int,
     transb: int,
@@ -815,46 +1973,230 @@ def sgemm(
         return
 
     beta_is_zero = beta == 0.0
+    # 纯 int 算术 (不用 triton.cdiv): 避免 constexpr 包装开销, grid 每次启动都会求值
     grid = lambda meta: (
-        triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
+        ((m + meta["BLOCK_M"] - 1) // meta["BLOCK_M"])
+        * ((n + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]),
+    )
+
+    # runner 按 (shape, stride, 标量, 张量指针) 缓存: nn 分发/composite runner 每次
+    # 调用重建 (lookup_and_build ~7us + grid_tp 构造), 对微秒级 shape 是显著开销。
+    # data_ptr 参与 key 保证不同张量必然重建, 闭包持有的旧张量不会被释放复用地址。
+    key = (
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        alpha,
+        beta,
+        beta_is_zero,
+        A.data_ptr(),
+        B.data_ptr(),
+        C.data_ptr(),
+        str(A.device),
     )
 
     with torch_device_fn.device(A.device):
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
-            runner = _SGEMM_NN_DISPATCH.lookup_and_build(
-                m,
-                n,
-                k,
-                True,
-                context=dict(
-                    A=A,
-                    lda=lda,
-                    B=B,
-                    ldb=ldb,
-                    C=C,
-                    ldc=ldc,
-                    m=m,
-                    n=n,
-                    k=k,
-                    alpha=alpha,
-                    beta=beta,
-                    beta_is_zero=beta_is_zero,
-                    grid=grid,
-                ),
-            )
+            runner = _sgemm_runner_cache.get(key)
+            if runner is None:
+                runner = _SGEMM_NN_DISPATCH.lookup_and_build(
+                    m,
+                    n,
+                    k,
+                    True,
+                    context=dict(
+                        A=A,
+                        lda=lda,
+                        B=B,
+                        ldb=ldb,
+                        C=C,
+                        ldc=ldc,
+                        m=m,
+                        n=n,
+                        k=k,
+                        alpha=alpha,
+                        beta=beta,
+                        beta_is_zero=beta_is_zero,
+                        grid=grid,
+                    ),
+                )
+                _cache_sgemm_runner(key, runner)
             runner()
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
-            sgemm_tn_hygon_kernel[grid](
-                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
-            )
+            if _sgemm_xt_is_pad_shape(m, n, k):
+                # 非对齐大 shape: A(k,m)->A_pad(kp,mp) + B(k,n) 转置->B_pad(np,kp),
+                # 复用 tt even main (v2.8, 4095³ 0.880->~1.0/8191³ 0.918->~0.96/
+                # 4097x8191x4095 0.934->~1.0)
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tn_pad_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            elif _sgemm_tn_use_composite_y(m, n, k):
+                # 变体 Y: n≪m 时只转置 B^T (成本 n*k) 比方案A (m*k) 便宜, 走 tt 内核
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tn_composite_y_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            elif _sgemm_tn_use_composite(m, n, k):
+                # 复合路径: 转置 A^T -> 连续 (m,k) 缓冲 -> nn 分发
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tn_composite_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            else:
+                sgemm_tn_hygon_kernel[grid](
+                    A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+                    use_in_thread_transpose=_sgemm_xt_use_itt(m, n, k),
+                    **(_XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}),
+                )
         elif transa == CUBLAS_OP_N and transb == CUBLAS_OP_T:
-            sgemm_nt_hygon_kernel[grid](
-                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
-            )
+            if _sgemm_nt_use_composite(m, n, k):
+                # 对齐大 shape: A^T 转置 + tt 内核 (v2.8), 避开直连 a_t 的 stride-lda
+                # 碎片读 (16384^3 nt 直连 0.884 -> 复合 0.914 等, 见 _make_sgemm_nt_composite_runner)
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_nt_composite_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            elif _sgemm_xt_is_pad_shape(m, n, k):
+                # 非对齐大 shape: pre-pad A/B 到对齐缓冲, 主内核全 EVEN load,
+                # 避免 mask/k remainder 开销 (v2.6, 4095³ 0.755->0.840 等)
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_nt_pad_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            else:
+                # kpack=2 实测对多数直连 shape 有效 (v2.11: 2048x4096x11008 0.918
+                # ->0.949-0.970、16384x512x4096 0.908->0.942、512x16384x4096 0.938
+                # ->0.949 等). 个别 shape 上 kpack=2 反而变慢 (官方口径
+                # do_bench(1000/100/median) 实测慢 >=1%), 走 _NT_KPACK1_SHAPES
+                # 例外表回退到 kpack=1, 消除小 shape 回退 (v2.12).
+                sgemm_nt_hygon_kernel[grid](
+                    A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+                    use_in_thread_transpose=_sgemm_xt_use_itt(m, n, k),
+                    kpack=_sgemm_nt_direct_kpack(m, n, k),
+                    **(_XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}),
+                )
         else:
-            sgemm_tt_hygon_kernel[grid](
-                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
-            )
+            if _sgemm_xt_is_pad_shape(m, n, k):
+                # 非对齐大 shape: pre-pad A(k,m)->A_pad(kp,mp)/B(n,k)->B_pad(np,kp),
+                # 全 EVEN main (v2.7, 8191³ 0.883->1.037、4097x8191x4095 0.826->0.940)
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tt_pad_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
+                runner()
+            else:
+                sgemm_tt_hygon_kernel[grid](
+                    A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+                    use_in_thread_transpose=_sgemm_xt_use_itt(m, n, k),
+                    **(_XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}),
+                )
 
 
 __all__ = ["sgemm"]

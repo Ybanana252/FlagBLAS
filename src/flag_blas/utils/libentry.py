@@ -743,7 +743,9 @@ class LibEntry(triton.KernelInterface):
         # (pad 内核 num_stages=1 vs 2 性能差 13%). 若不纳入 entry_key, 同 shape
         # 不同 num_stages 变体会命中同一 entry, 复用"先编译"的产物
         # (v1.9 实证: s2 编译后 launch s1 返回 num_stages=2 的产物).
-        for _opt_name in ("num_warps", "num_stages", "num_ctas"):
+        # kpack (HIPOptions 字段, NT 优化实测 kpack=2 有效) 同样影响编译产物,
+        # 必须纳入 entry_key, 否则同 shape 的 kp1/kp2 两次 launch 会串用编译缓存.
+        for _opt_name in ("num_warps", "num_stages", "num_ctas", "kpack"):
             _opt_val = kwargs.get(_opt_name, None)
             if _opt_val is not None:
                 const_args = const_args + [(_opt_name, _opt_val)]

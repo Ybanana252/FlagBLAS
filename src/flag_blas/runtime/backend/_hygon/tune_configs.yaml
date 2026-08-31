@@ -2136,10 +2136,17 @@ sgemm_nn_hygon:
     num_warps: 8
     num_stages: 2
 sgemm_hygon:
-  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+  # v2.2 (2026-08-30): 池裁剪为 7 个精选 config (tn/nt/tt 37-shape 全量扫描优胜者)。
+  # 大/方 shape (8192^3/16384^3/8192x28672x8192/2048x2048x16384) -> 256x256 w16;
+  # 中 shape (4096^3/1024^3) -> 128x64 w8 或 64x128 w8; tn 方 shape 偏好 128x128 w8 s3;
+  # 瘦/长 N shape (32768x1024x1024/256x8192x2048) -> 128x256 w8 或 64x64 w4。
+  # v2.8 (2026-08-31): 新增 256x256 GROUP_M=8 (原池只有 GROUP_M=1)。GROUP_M 决定
+  # M 方向 tile 的 L2 调度: nt/tt 大 shape 实测 G8 远优于 G1 (16384^3 nt 直连
+  # 198.7->169.5ms、tt 165.2->161.8ms), tuner 按 shape 自行择优, 其余 shape 不变。
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 4
     num_stages: 2
-  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 8
     num_stages: 2
   - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
@@ -2147,4 +2154,16 @@ sgemm_hygon:
     num_stages: 2
   - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
     num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 1}
+    num_warps: 16
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
