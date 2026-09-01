@@ -1621,8 +1621,8 @@ def _make_sgemm_nt_splitk_runner(
 # ---- nt 直连 config override (v2.13, 2026-08-31) ----
 # libtuner 从共享 config 池为直连内核选 config, 个别非对齐小 shape 上生产 config
 # (num_warps 等) 不是最优。官方口径 raw 扫描实测 511³ (64,64) tile w16 比生产
-# w4 快 20% (29.4->23.7us, ratio 0.745->0.93), itt0+kp1 最优; 1023³ (128,64) w8
-# kp2 比生产 (64,128) w8 快 ~2% (边际, 不落地)。runner 固定手动 launch raw 内核。
+# w4 快 20% (29.4->23.7us, ratio 0.745->0.93), itt0+kp1 最优。
+# runner 固定手动 launch raw 内核。
 _NT_DIRECT_OVERRIDES = {
     (511, 511, 511): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=16,
@@ -1658,6 +1658,15 @@ _NT_DIRECT_OVERRIDES = {
     ),
     (8192, 256, 2048): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    # v2.17 (2026-09-01): 1023³ 最弱 (37 shape 画像 0.7051)。直连扫描
+    # (128,128)w16kp2 大 tile 提 A 跨块重读利用; 关键 knob 是 GROUP_M=1
+    # (旧扫描固定 GM8 只找到 128x64w8kp2 边际 -2%)。官方口径 A/B 交替各 3 轮:
+    # 生产 (64,128)w8gm8 91.68us 稳定 -> 88.80us 稳定 (-3.1%, ratio 0.7051->0.7279)。
+    # pad 路径 97.9us (copy 37us 吃掉收益)、composite 被 min<4096 排除, 均不适用。
+    (1023, 1023, 1023): dict(
+        BLOCK_M=128, BLOCK_N=128, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
 }
