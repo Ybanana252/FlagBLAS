@@ -1677,6 +1677,14 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
+    # v2.19 (2026-09-01): 瘦 shape 扫描 (4096,128,1024)/(128,4096,1024) 各 128
+    # config: (4096,128,1024) A/B 无收益 (扫描 45.92us 为噪声, A/B 均 46.56us),
+    # 不落地。(128,4096,1024) 生产 (64,128)w8gm8 46.72us 稳定 -> (64,128)w16gm1
+    # kp2 45.76us 稳定 (-2.1%, ratio 0.8082->0.8252)。
+    (128, 4096, 1024): dict(
+        BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=16,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
 }
 
 
