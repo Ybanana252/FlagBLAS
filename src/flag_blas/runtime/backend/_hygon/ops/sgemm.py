@@ -2267,6 +2267,56 @@ _SGEMM_NN_DISPATCH = StaticDispatch(
 )
 
 
+# ---- nn opt 内核 config override (v2.25, 2026-09-01) ----
+# 生产走 libtuner DB best_config, 但以下 shape 的 DB config 非最优:
+# 全 config 扫描 (26 config x ITT x buffer) + 官方口径 (warmup=1000/rep=100) 确认
+# 手动 launch 以下 config 更快:
+#   (256,256,256):     (32,32,BK64,w4,itt0,buf)   12.64->10.40us r 0.911->1.108
+#   (1024,1024,1024):  (64,128,BK32,w8,itt1,nobuf) 75.20->70.08us r 0.851->0.913
+#   (128,4096,1024):   (64,64,BK16,gm1,w4,itt1,nobuf) 51.04->43.84us r 0.809->0.942
+_NN_OPT_OVERRIDES = {
+    (256, 256, 256): dict(
+        BLOCK_M=32, BLOCK_N=32, BLOCK_K=64, GROUP_M=8, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (1024, 1024, 1024): dict(
+        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=True, use_buffer_ops=False,
+    ),
+    (128, 4096, 1024): dict(
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=16, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=True, use_buffer_ops=False,
+    ),
+}
+
+
+def _make_sgemm_nn_opt_override_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, ov, **_kw
+):
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov["BLOCK_K"]
+    GM = ov["GROUP_M"]
+    ev = (m % BM == 0, n % BN == 0, k % BK == 0)
+    grid = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+
+    def run():
+        kwargs = dict(
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", True),
+        )
+        if not ov.get("use_buffer_ops", True):
+            # no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项
+            kwargs["use_buffer_ops"] = False
+        _sgemm_nn_opt_kernel[grid](
+            A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+            ev[0], ev[1], ev[2], BM, BN, BK, GM, **kwargs,
+        )
+
+    return run
+
+
 # ---- tn 复合路径: A^T 缓冲缓存 + runner (v2.3, 2026-08-30) ----
 # 与 _get_pad_buffers 同款约定: 按 (m,k,device) 缓存, 避免每次调用分配大 buffer
 # (8191³ 的 Ac 达 268MB)。转置内核全量覆盖缓冲 (无 padding), torch.empty 即可。
@@ -2535,31 +2585,57 @@ def sgemm(
 
     with torch_device_fn.device(A.device):
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
-            runner = _sgemm_runner_cache.get(key)
-            if runner is None:
-                runner = _SGEMM_NN_DISPATCH.lookup_and_build(
-                    m,
-                    n,
-                    k,
-                    True,
-                    context=dict(
-                        A=A,
-                        lda=lda,
-                        B=B,
-                        ldb=ldb,
-                        C=C,
-                        ldc=ldc,
-                        m=m,
-                        n=n,
-                        k=k,
-                        alpha=alpha,
-                        beta=beta,
-                        beta_is_zero=beta_is_zero,
-                        grid=grid,
-                    ),
-                )
+            if (m, n, k) in _NN_OPT_OVERRIDES:
+                # nn opt 内核 config override (v2.25): DB best_config 非最优,
+                # 手动 launch 扫描确认的最优 config (官方口径 256³ 1.108/1024³ 0.913/
+                # 128x4096x1024 0.942)。
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_nn_opt_override_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            ov=_NN_OPT_OVERRIDES[(m, n, k)],
+                        ),
+                    )
+                runner()
+            else:
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _SGEMM_NN_DISPATCH.lookup_and_build(
+                        m,
+                        n,
+                        k,
+                        True,
+                        context=dict(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            grid=grid,
+                        ),
+                    )
                 _cache_sgemm_runner(key, runner)
-            runner()
+                runner()
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if (m, n, k) in _TN_DIRECT_OVERRIDES:
                 # tn 直连 config override (v2.22): 小 shape 生产 config 非最优,
