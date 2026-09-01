@@ -1631,9 +1631,18 @@ _NT_DIRECT_OVERRIDES = {
     # v2.14 (2026-08-31): 官方口径 A/B 交替实测 (同进程各 3 次 do_bench)
     # (256,256,256) 生产 (64,64)w4 13.44us -> (64,64)w8 kp1 13.28us (+1.2%, 稳定)
     # (128,4096,1024)/(4096,128,1024) 换 config 无收益或更慢, 不落地
+    # v2.15 (2026-09-01): 小 tile 扫描, (32,32)w4 大胜 (64,64)w8:
+    #   同进程 A/B 各 3 次 do_bench: 生产 14.56us 稳定 -> (32,32)w4 kp1 11.09us
+    #   (MED, min 10.72) 快 24-36%。小 shape 并行度是瓶颈, 32 块 grid 128 程序。
     (256, 256, 256): dict(
-        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=8, num_warps=4,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
+    ),
+    # v2.15b (2026-09-01): 512^3 同 tile 提并行: 生产 (64,64)w4kp1 21.60us ->
+    #   (64,64)w8kp2 20.43us (-5.4%, A/B 交替各 3 次确认, min 20.00us)。
+    (512, 512, 512): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
     # v2.14b: (512,16384,4096) w4->w8 kp2 1356->1343us ratio 0.9495->0.9587 达标
     #         (8192,256,2048) w4->w8 kp2 205.6->199.7us ratio 0.922->0.949 (+2.9%)
