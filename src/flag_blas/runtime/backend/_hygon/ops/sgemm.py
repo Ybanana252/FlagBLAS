@@ -1669,6 +1669,14 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=128, BLOCK_N=128, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
+    # v2.18 (2026-09-01): 1024³ 偶数立方异常值 (0.8160, 2048³/4096³ 均 >0.92)。
+    # 直连扫描 176 config (11 tile x w8/16 x itt0/1 x kp1/2 x gm1/8): 生产
+    # (128,128)w8gm8kp1 73.92us 稳定 -> (64,128)w8gm1kp2 71.84us 稳定 (-2.7%,
+    # ratio 0.8225->0.845)。kp2+GM1 优于生产 tile。
+    (1024, 1024, 1024): dict(
+        BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
 }
 
 
