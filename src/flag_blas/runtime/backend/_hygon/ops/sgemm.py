@@ -1722,6 +1722,69 @@ def _make_sgemm_nt_direct_runner(
     return run
 
 
+# ---- tt 直连 config override (v2.21, 2026-09-01) ----
+# 7 个不达标 shape (core_shape 画像 speedup<0.90) 全是 grid 并行度不足导致:
+# 生产 config 大 tile 下 blocks 少 (64x512x512 (64,64)tile 64 块 -> 16x16 1024 块),
+# 小 tile 提并行度, 官方口径 do_bench(warmup=1000, rep=100, median) A/B 交替验证
+# (扫描 /tmp/sgemm_tt_scan_results.json + A/B /tmp/verify_sgemm_tt_ab.py) 全部
+# 提速 15-46% 达 speedup>=1.0。runner 固定手动 launch raw 内核。
+# 注: tt 布局 A(k,m) lda=m / B(n,k) ldb=k / C(m,n) ldc=n, EVEN 判定按 m,n,k。
+_TT_DIRECT_OVERRIDES = {
+    (64, 512, 512): dict(
+        BLOCK_M=16, BLOCK_N=16, GROUP_M=1, num_warps=2,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (512, 64, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=True,
+    ),
+    (64, 64, 64): dict(
+        BLOCK_M=16, BLOCK_N=16, GROUP_M=1, num_warps=1,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (1024, 64, 512): dict(
+        BLOCK_M=16, BLOCK_N=16, GROUP_M=1, num_warps=2,
+        num_stages=2, use_in_thread_transpose=True,
+    ),
+    (64, 1024, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=8, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (511, 511, 511): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=1, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (256, 256, 256): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+}
+
+
+def _make_sgemm_tt_direct_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, ov, **_kw
+):
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov.get("BLOCK_K", 32)
+    GM = ov["GROUP_M"]
+    ev = (m % BM == 0, n % BN == 0, k % BK == 0)
+    grid = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_tt_even_kernel[grid](
+            A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+            ev[0], ev[1], ev[2], BM, BN, BK, GM,
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", False),
+            **nobuf_kw,
+        )
+
+    return run
+
+
 # ---- StaticDispatch: 按 shape 情况分发不同 sgemm_nn kernel ----
 # 大 K shape (k >= 4*max(m,n)): 两阶段 split-k, 实测 2048x2048x16384 有效
 # 非对齐且非小 shape: pre-pad + 全 EVEN 内核 (消除 mask/k remainder 开销)
@@ -2549,7 +2612,31 @@ def sgemm(
                     **(_XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}),
                 )
         else:
-            if _sgemm_xt_is_pad_shape(m, n, k):
+            if (m, n, k) in _TT_DIRECT_OVERRIDES:
+                # tt 直连 config override (v2.21): 小 shape 生产 config 大 tile 下
+                # grid 并行度不足, 缩小 tile 提并行度 (官方口径 A/B 全部 >=1.0)。
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tt_direct_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            ov=_TT_DIRECT_OVERRIDES[(m, n, k)],
+                        ),
+                    )
+                runner()
+            elif _sgemm_xt_is_pad_shape(m, n, k):
                 # 非对齐大 shape: pre-pad A(k,m)->A_pad(kp,mp)/B(n,k)->B_pad(np,kp),
                 # 全 EVEN main (v2.7, 8191³ 0.883->1.037、4097x8191x4095 0.826->0.940)
                 runner = _sgemm_runner_cache.get(key)
