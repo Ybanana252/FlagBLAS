@@ -1685,6 +1685,15 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
+    # v2.20 (2026-09-01): 64³ 超小 shape launch-bound (生产 (64,64)w4gm8 grid=1)。
+    # 384 config 小 tile 扫描 (8 tile x w1/2/4 x itt x kp x gm x BK16/32): 54 config
+    # 达 8.16us, 远超生产 10.24us (r=0.8125)。官方 A/B 三轮稳定确认
+    # (32,16)w4itt0kp1gm1 8.16/8.00/8.00us (r=0.98-1.0) vs 生产 9.92-10.08us
+    # (r=0.79-0.81)。小 tile 提并行度 (grid 1 -> 8) 是核心收益。
+    (64, 64, 64): dict(
+        BLOCK_M=32, BLOCK_N=16, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False, kpack=1,
+    ),
 }
 
 
