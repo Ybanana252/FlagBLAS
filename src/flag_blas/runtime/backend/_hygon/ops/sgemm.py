@@ -1409,11 +1409,11 @@ _NT_SPLITK_BLOCK_K = 32
 _NT_SPLITK_GROUP_M = 8
 _NT_SPLITK_STAGES = 2
 # shape -> (SPLIT_K, num_warps) (num_warps 取 DB 生产直连 config 的 w)
+# v2.26: 移除 (64,512,512)/(512,64,512)/(1024,64,512) -> 改走 direct override
+# (BK64+kp2 全 config 扫描官方 A/B: 17.28/16.80/17.76us -> 12.80/13.76/12.32us,
+# 显著优于 split-k)。
 _NT_SPLITK_SHAPES = {
-    (64, 512, 512): (4, 4),
-    (512, 64, 512): (4, 8),
     (64, 1024, 512): (4, 8),
-    (1024, 64, 512): (4, 8),
     (64, 2048, 1024): (4, 8),
     (2048, 64, 1024): (4, 8),
     (64, 4096, 2048): (2, 4),
@@ -1693,6 +1693,33 @@ _NT_DIRECT_OVERRIDES = {
     (64, 64, 64): dict(
         BLOCK_M=32, BLOCK_N=16, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
+    ),
+    # v2.26 (2026-09-01): 瘦/小 shape 4 个, 生产 config 非最优 (BK=64+kp2 关键)。
+    # 全 config 扫描 (11 tile x w4/8/16 x itt x kp x gm x BK32/64) + 官方口径 A/B 三轮:
+    #   (64,512,512):   生产 (64,64)w8kp2 17.12us r=0.83 -> (16,32)w4itt1kp2gm8
+    #                   BK64 12.80/12.80/11.36us r=1.11-1.25。小 tile 提并行度
+    #                   (grid 8 -> 64 块)。
+    #   (1024,64,512):  生产 17.76us r=0.85 -> (32,32)w4itt1kp2gm1 BK64
+    #                   13.44/13.60/13.60us r=1.11。grid 16 -> 32 块。
+    #   (512,64,512):   生产 15.68-16.80us r=0.79-0.85 -> (16,16)w4itt0kp2gm1
+    #                   BK64 13.76us 稳定 r=0.97。grid 16 -> 128 块。
+    #   (4096,64,2048): 生产 54.24-54.40us r=0.87 -> (64,64)w16itt0kp2gm1
+    #                   BK64 48.32-48.48us r=0.98。grid 64 -> 64 块 w16 提 ILP。
+    (64, 512, 512): dict(
+        BLOCK_M=16, BLOCK_N=32, BLOCK_K=64, GROUP_M=8, num_warps=4,
+        num_stages=2, use_in_thread_transpose=True, kpack=2,
+    ),
+    (1024, 64, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, BLOCK_K=64, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=True, kpack=2,
+    ),
+    (512, 64, 512): dict(
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=64, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    (4096, 64, 2048): dict(
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
 }
 
