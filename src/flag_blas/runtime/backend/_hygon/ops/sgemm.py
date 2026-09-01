@@ -1644,6 +1644,12 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
+    # v2.16 (2026-09-01): (256,8192,2048) 同 (512,16384,4096) 模式 w4->w8 kp2:
+    #   生产 211.33us -> 201.12us (-4.8%, A/B 各 3 次全稳定), ratio 0.889->0.941。
+    (256, 8192, 2048): dict(
+        BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
     # v2.14b: (512,16384,4096) w4->w8 kp2 1356->1343us ratio 0.9495->0.9587 达标
     #         (8192,256,2048) w4->w8 kp2 205.6->199.7us ratio 0.922->0.949 (+2.9%)
     (512, 16384, 4096): dict(
