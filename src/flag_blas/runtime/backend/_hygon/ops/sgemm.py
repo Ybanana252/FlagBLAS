@@ -1722,6 +1722,145 @@ def _make_sgemm_nt_direct_runner(
     return run
 
 
+# ---- tn 直连 config override (v2.22, 2026-09-01) ----
+# 5 个不达标 shape (core_shape 画像 speedup<0.90) 均因生产 config 并行度/效率不足:
+# 小 shape 缩小 tile 提并行度 (与 tt 同策略), 官方口径 do_bench(1000/100/median)
+# 扫描 (扫描 /tmp/sgemm_tn_scan_results.json + /tmp/sgemm_tn_scan2_results.json)
+# 全部达 speedup>=1.0。runner 固定手动 launch raw 内核。
+# 注: tn 布局 A(k,m) lda=m / B(k,n) ldb=n / C(m,n) ldc=n。
+_TN_DIRECT_OVERRIDES = {
+    (256, 256, 256): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (64, 512, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (64, 1024, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (512, 64, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+    (1024, 64, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
+}
+
+
+def _make_sgemm_tn_direct_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, ov, **_kw
+):
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov.get("BLOCK_K", 32)
+    GM = ov["GROUP_M"]
+    ev = (m % BM == 0, n % BN == 0, k % BK == 0)
+    grid = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_tn_even_kernel[grid](
+            A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+            ev[0], ev[1], ev[2], BM, BN, BK, GM,
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", False),
+            **nobuf_kw,
+        )
+
+    return run
+
+
+# ---- tn 复合路径 nn 内核 config override (v2.23, 2026-09-01) ----
+# comp 路径 = tp(A^T) + nn 内核。生产走 _SGEMM_NN_DISPATCH tuner config0
+# (64,64,w4,gm8,BK32,s2) 对 4096³ 非最优: 实验扫描 (warmup=200/rep=30, 362+ config)
+# 发现 (64,128,w8,itt1,gm1,BK32,s2,nobuf) 更快 (prod 2912->2898us, r 0.886->0.890)。
+# tp 内核已到带宽峰值 (~1.1TB/s, 120us), 直连/compY 结构均更差, 此为结构下限。
+_TN_COMP_OVERRIDES = {
+    (4096, 4096, 4096): dict(
+        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, GROUP_M=1, num_warps=8,
+        num_stages=2, use_in_thread_transpose=True,
+    ),
+}
+
+
+def _make_sgemm_tn_comp_override_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, ov, **_kw
+):
+    Ac = _get_tn_ac(m, k, A.device)
+    grid_tp = ((m + _TN_TP_BM - 1) // _TN_TP_BM) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
+    grid_tp = (grid_tp,)
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov.get("BLOCK_K", 32)
+    GM = ov["GROUP_M"]
+    grid_nn = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_tn_tp_kernel[grid_tp](A, Ac, m, k, lda, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM)
+        _sgemm_nn_opt_kernel[grid_nn](
+            Ac, B, C, alpha, beta, m, n, k, k, ldb, ldc, beta_is_zero,
+            m % BM == 0, n % BN == 0, k % BK == 0, BM, BN, BK, GM,
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", False),
+            **nobuf_kw,
+        )
+
+    return run
+
+
+# ---- tn 复合路径 Y (compY) tt 内核 config override (v2.24, 2026-09-01) ----
+# compY = tp(B^T) + tt even 内核。生产走 tuner config 对这 2 个大 shape 非最优:
+# 官方口径 do_bench(1000/100/median) 验证 (32768,1024,1024) 1556->1540us
+# (r 0.892->0.901), (16384,2048,2048) 2953->2921us (r 0.880->0.890, 结构上限
+# 未达 0.90)。runner 固定手动 launch raw 内核。
+_TN_COMPY_OVERRIDES = {
+    (32768, 1024, 1024): dict(
+        BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, GROUP_M=1, num_warps=8,
+        num_stages=2, kpack=2, use_in_thread_transpose=True,
+    ),
+    (16384, 2048, 2048): dict(
+        BLOCK_M=256, BLOCK_N=128, BLOCK_K=32, GROUP_M=4, num_warps=16,
+        num_stages=2, kpack=1, use_in_thread_transpose=True,
+    ),
+}
+
+
+def _make_sgemm_tn_compy_override_runner(
+    A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, ov, **_kw
+):
+    Bc = _get_tn_bc(n, k, B.device)
+    grid_tp = ((n + _TN_TP_BM - 1) // _TN_TP_BM) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
+    grid_tp = (grid_tp,)
+    BM = ov["BLOCK_M"]
+    BN = ov["BLOCK_N"]
+    BK = ov.get("BLOCK_K", 32)
+    GM = ov["GROUP_M"]
+    grid_tt = (((m + BM - 1) // BM) * ((n + BN - 1) // BN),)
+    nobuf_kw = _XT_NOBUF_KWARGS if not _sgemm_xt_use_buffer_ops(m, n, k) else {}
+
+    def run():
+        _sgemm_tn_tp_kernel[grid_tp](B, Bc, n, k, ldb, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM)
+        _sgemm_tt_even_kernel[grid_tt](
+            A, Bc, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero,
+            m % BM == 0, n % BN == 0, k % BK == 0, BM, BN, BK, GM,
+            num_warps=ov["num_warps"],
+            num_stages=ov.get("num_stages", 2),
+            kpack=ov.get("kpack", 1),
+            use_in_thread_transpose=ov.get("use_in_thread_transpose", False),
+            **nobuf_kw,
+        )
+
+    return run
+
+
 # ---- tt 直连 config override (v2.21, 2026-09-01) ----
 # 7 个不达标 shape (core_shape 画像 speedup<0.90) 全是 grid 并行度不足导致:
 # 生产 config 大 tile 下 blocks 少 (64x512x512 (64,64)tile 64 块 -> 16x16 1024 块),
@@ -2422,7 +2561,31 @@ def sgemm(
                 _cache_sgemm_runner(key, runner)
             runner()
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
-            if _sgemm_xt_is_pad_shape(m, n, k):
+            if (m, n, k) in _TN_DIRECT_OVERRIDES:
+                # tn 直连 config override (v2.22): 小 shape 生产 config 非最优,
+                # 缩小 tile 提并行度 (官方口径 A/B 全部 >=1.0)。
+                runner = _sgemm_runner_cache.get(key)
+                if runner is None:
+                    runner = _cache_sgemm_runner(
+                        key,
+                        _make_sgemm_tn_direct_runner(
+                            A=A,
+                            lda=lda,
+                            B=B,
+                            ldb=ldb,
+                            C=C,
+                            ldc=ldc,
+                            m=m,
+                            n=n,
+                            k=k,
+                            alpha=alpha,
+                            beta=beta,
+                            beta_is_zero=beta_is_zero,
+                            ov=_TN_DIRECT_OVERRIDES[(m, n, k)],
+                        ),
+                    )
+                runner()
+            elif _sgemm_xt_is_pad_shape(m, n, k):
                 # 非对齐大 shape: A(k,m)->A_pad(kp,mp) + B(k,n) 转置->B_pad(np,kp),
                 # 复用 tt even main (v2.8, 4095³ 0.880->~1.0/8191³ 0.918->~0.96/
                 # 4097x8191x4095 0.934->~1.0)
@@ -2448,51 +2611,102 @@ def sgemm(
                     )
                 runner()
             elif _sgemm_tn_use_composite_y(m, n, k):
-                # 变体 Y: n≪m 时只转置 B^T (成本 n*k) 比方案A (m*k) 便宜, 走 tt 内核
-                runner = _sgemm_runner_cache.get(key)
-                if runner is None:
-                    runner = _cache_sgemm_runner(
-                        key,
-                        _make_sgemm_tn_composite_y_runner(
-                            A=A,
-                            lda=lda,
-                            B=B,
-                            ldb=ldb,
-                            C=C,
-                            ldc=ldc,
-                            m=m,
-                            n=n,
-                            k=k,
-                            alpha=alpha,
-                            beta=beta,
-                            beta_is_zero=beta_is_zero,
-                            grid=grid,
-                        ),
-                    )
-                runner()
+                if (m, n, k) in _TN_COMPY_OVERRIDES:
+                    # compY tt 内核 config override (v2.24): 大 shape 手动 launch
+                    runner = _sgemm_runner_cache.get(key)
+                    if runner is None:
+                        runner = _cache_sgemm_runner(
+                            key,
+                            _make_sgemm_tn_compy_override_runner(
+                                A=A,
+                                lda=lda,
+                                B=B,
+                                ldb=ldb,
+                                C=C,
+                                ldc=ldc,
+                                m=m,
+                                n=n,
+                                k=k,
+                                alpha=alpha,
+                                beta=beta,
+                                beta_is_zero=beta_is_zero,
+                                grid=grid,
+                                ov=_TN_COMPY_OVERRIDES[(m, n, k)],
+                            ),
+                        )
+                    runner()
+                else:
+                    # 变体 Y: n≪m 时只转置 B^T (成本 n*k) 比方案A (m*k) 便宜, 走 tt 内核
+                    runner = _sgemm_runner_cache.get(key)
+                    if runner is None:
+                        runner = _cache_sgemm_runner(
+                            key,
+                            _make_sgemm_tn_composite_y_runner(
+                                A=A,
+                                lda=lda,
+                                B=B,
+                                ldb=ldb,
+                                C=C,
+                                ldc=ldc,
+                                m=m,
+                                n=n,
+                                k=k,
+                                alpha=alpha,
+                                beta=beta,
+                                beta_is_zero=beta_is_zero,
+                                grid=grid,
+                            ),
+                        )
+                    runner()
             elif _sgemm_tn_use_composite(m, n, k):
-                # 复合路径: 转置 A^T -> 连续 (m,k) 缓冲 -> nn 分发
-                runner = _sgemm_runner_cache.get(key)
-                if runner is None:
-                    runner = _cache_sgemm_runner(
-                        key,
-                        _make_sgemm_tn_composite_runner(
-                            A=A,
-                            lda=lda,
-                            B=B,
-                            ldb=ldb,
-                            C=C,
-                            ldc=ldc,
-                            m=m,
-                            n=n,
-                            k=k,
-                            alpha=alpha,
-                            beta=beta,
-                            beta_is_zero=beta_is_zero,
-                            grid=grid,
-                        ),
-                    )
-                runner()
+                if (m, n, k) in _TN_COMP_OVERRIDES:
+                    # comp 路径 nn 内核 config override (v2.23): 4096³ 用扫描最优
+                    # (64,128,w8,itt1,gm1,BK32,s2,nobuf) 替换 tuner config0
+                    runner = _sgemm_runner_cache.get(key)
+                    if runner is None:
+                        runner = _cache_sgemm_runner(
+                            key,
+                            _make_sgemm_tn_comp_override_runner(
+                                A=A,
+                                lda=lda,
+                                B=B,
+                                ldb=ldb,
+                                C=C,
+                                ldc=ldc,
+                                m=m,
+                                n=n,
+                                k=k,
+                                alpha=alpha,
+                                beta=beta,
+                                beta_is_zero=beta_is_zero,
+                                grid=grid,
+                                ov=_TN_COMP_OVERRIDES[(m, n, k)],
+                            ),
+                        )
+                    runner()
+                else:
+                    # 复合路径: 转置 A^T -> 连续 (m,k) 缓冲 -> nn 分发
+                    runner = _sgemm_runner_cache.get(key)
+                    if runner is None:
+                        runner = _cache_sgemm_runner(
+                            key,
+                            _make_sgemm_tn_composite_runner(
+                                A=A,
+                                lda=lda,
+                                B=B,
+                                ldb=ldb,
+                                C=C,
+                                ldc=ldc,
+                                m=m,
+                                n=n,
+                                k=k,
+                                alpha=alpha,
+                                beta=beta,
+                                beta_is_zero=beta_is_zero,
+                                grid=grid,
+                            ),
+                        )
+                    runner()
             else:
                 sgemm_tn_hygon_kernel[grid](
                     A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
