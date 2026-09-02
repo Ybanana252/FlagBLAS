@@ -1750,6 +1750,15 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
+    # v2.28 (2026-09-02): (4096,128,1024) NT 最大异常值 (r=0.767)。BK64 全 config
+    # 扫描 (12 tile x w4/8/16 x itt x kp x gm): 生产 (64,64)w16 46.56us 稳定 ->
+    # (64,64)BK64w16itt1kp2gm1 42.40us 稳定。官方口径 A/B 交替 3 轮:
+    # 45.92-46.40us (r=0.755-0.763) -> 42.88-43.04us (r=0.814-0.817, -7.4%)。
+    # 同 (128,4096,1024) v2.26b pattern (BK64+w16+kp2)。仍 <0.90 但明显改善。
+    (4096, 128, 1024): dict(
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
+        num_stages=2, use_in_thread_transpose=True, kpack=2,
+    ),
 }
 
 
