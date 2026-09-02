@@ -1412,12 +1412,10 @@ _NT_SPLITK_STAGES = 2
 # v2.26: 移除 (64,512,512)/(512,64,512)/(1024,64,512) -> 改走 direct override
 # (BK64+kp2 全 config 扫描官方 A/B: 17.28/16.80/17.76us -> 12.80/13.76/12.32us,
 # 显著优于 split-k)。
-_NT_SPLITK_SHAPES = {
-    (64, 1024, 512): (4, 8),
-    (64, 2048, 1024): (4, 8),
-    (2048, 64, 1024): (4, 8),
-    (64, 4096, 2048): (2, 4),
-}
+# v2.27: 移除剩余 4 个 (64,1024,512)/(64,2048,1024)/(2048,64,1024)/
+# (64,4096,2048) -> 改走 direct override (BK64+kp2 全 config 扫描 + 官方 A/B 三轮
+# 全稳定, 详见 _NT_DIRECT_OVERRIDES)。白名单清空, split-k 机制保留备用。
+_NT_SPLITK_SHAPES = {}
 
 
 def _sgemm_nt_splitk(m, n, k, **_kw):
@@ -1721,6 +1719,35 @@ _NT_DIRECT_OVERRIDES = {
     ),
     (4096, 64, 2048): dict(
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    # v2.27 (2026-09-02): 原 split-k 白名单 4 个, BK64+kp2 全 config 扫描 +
+    # 官方口径 A/B 交替 3 轮 (全部稳定, 详见 /tmp/nt_v227_ab.py):
+    #   (64,1024,512):  split-k 生产 17.60/16.16/17.60us r=0.82-0.89 ->
+    #                   (32,32)w4itt0kp2gm1BK64 12.16-13.28us r=1.08-1.18。
+    #                   grid 4 -> 64 块提并行度。
+    #   (64,2048,1024): split-k 生产 24.80-25.92us r=0.88-0.92 ->
+    #                   (32,64)w8itt0kp2gm8BK64 21.12-21.76us r=1.04-1.08。
+    #                   grid 8 -> 64 块。
+    #   (2048,64,1024): split-k 生产 24.16-25.60us r=0.93-0.98 ->
+    #                   (32,64)w8itt0kp2gm8BK64 20.96-22.08us r=1.07-1.13。
+    #                   grid 8 -> 64 块。
+    #   (64,4096,2048): split-k 生产 53.92us r=0.89 -> (64,64)w16itt0kp2gm8BK64
+    #                   48.32us r=1.00 稳定 (-10.4%)。
+    (64, 1024, 512): dict(
+        BLOCK_M=32, BLOCK_N=32, BLOCK_K=64, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    (64, 2048, 1024): dict(
+        BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    (2048, 64, 1024): dict(
+        BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=8,
+        num_stages=2, use_in_thread_transpose=False, kpack=2,
+    ),
+    (64, 4096, 2048): dict(
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
 }
