@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import itertools
+import struct
 from typing import Generator, List, Tuple
 
 import numpy as np
@@ -20,7 +21,7 @@ import torch
 
 import flag_blas
 from benchmark.performance_utils import Benchmark
-from flag_blas.ops import CUBLAS_OP_N
+from flag_blas.ops import CUBLAS_OP_N, CUBLAS_OP_T
 from flag_blas.utils import shape_utils
 
 CUDA_R_32F = 0
@@ -80,6 +81,35 @@ if IS_HYGON:
                 ctypes.c_int,
             ]
             library.hipblasSgemm.restype = ctypes.c_int
+            # hipblasHgemm (fp16 in/out, fp32 accumulate) shares the same
+            # (handle, transa, transb, m, n, k, alpha, A, lda, B, ldb,
+            # beta, C, ldc) signature as hipblasSgemm.
+            library.hipblasHgemm.argtypes = library.hipblasSgemm.argtypes
+            library.hipblasHgemm.restype = ctypes.c_int
+            # hipblasGemmEx_v2: like cuBLAS gemmEx, alpha/beta are scalars in
+            # the compute type and the A/B/C types are selected via hipDataType.
+            library.hipblasGemmEx_v2.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            library.hipblasGemmEx_v2.restype = ctypes.c_int
             _HIPBLAS_LIBRARY = library
         return _HIPBLAS_LIBRARY
 
@@ -143,6 +173,92 @@ if IS_HYGON:
                 ldc,
             ),
             "hipblasSgemm",
+        )
+        return C
+
+    def _hipblas_hgemm(
+        handle,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha_ptr,
+        A,
+        lda,
+        B,
+        ldb,
+        beta_ptr,
+        C,
+        ldc,
+    ):
+        library = _load_hipblas()
+        _check_hipblas_status(
+            library.hipblasHgemm(
+                handle,
+                _HIPBLAS_OP_MAP[transa],
+                _HIPBLAS_OP_MAP[transb],
+                m,
+                n,
+                k,
+                alpha_ptr,
+                ctypes.c_void_p(A.data_ptr()),
+                lda,
+                ctypes.c_void_p(B.data_ptr()),
+                ldb,
+                beta_ptr,
+                ctypes.c_void_p(C.data_ptr()),
+                ldc,
+            ),
+            "hipblasHgemm",
+        )
+        return C
+
+    def _hipblas_gemm_ex_v2(
+        handle,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha_ptr,
+        A,
+        a_type,
+        lda,
+        B,
+        b_type,
+        ldb,
+        beta_ptr,
+        C,
+        c_type,
+        ldc,
+        compute_type,
+        algo=0,
+    ):
+        library = _load_hipblas()
+        _check_hipblas_status(
+            library.hipblasGemmEx_v2(
+                handle,
+                _HIPBLAS_OP_MAP[transa],
+                _HIPBLAS_OP_MAP[transb],
+                m,
+                n,
+                k,
+                alpha_ptr,
+                ctypes.c_void_p(A.data_ptr()),
+                a_type,
+                lda,
+                ctypes.c_void_p(B.data_ptr()),
+                b_type,
+                ldb,
+                beta_ptr,
+                ctypes.c_void_p(C.data_ptr()),
+                c_type,
+                ldc,
+                compute_type,
+                algo,
+            ),
+            "hipblasGemmEx_v2",
         )
         return C
 
@@ -345,6 +461,29 @@ def cublas_hgemm(
     alpha_ptr,
     beta_ptr,
 ):
+    if IS_HYGON:
+        # hipblasHgemm is the only DTK hipBLAS entry point that accepts fp16
+        # arrays (hipblasGemmEx/_v2 reject fp16 on this backend). Its alpha and
+        # beta scalars are fp16; get_input_iter packs them accordingly. Note
+        # this entry point is used only as the native latency baseline: it does
+        # not accumulate in fp32, so accuracy is checked against
+        # hgemm_reference() instead.
+        return _hipblas_hgemm(
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col,
+            lda_cublas,
+            B_col,
+            ldb_cublas,
+            beta_ptr,
+            C_col,
+            ldc_cublas,
+        )
     cublas.gemmEx(
         handle,
         transa,
@@ -409,6 +548,76 @@ def gems_hgemm_wrapper(
         ldc_flag,
     )
     return C_row
+
+
+def hgemm_reference(
+    A_col,
+    B_col,
+    C_col,
+    transa,
+    transb,
+    m,
+    n,
+    k,
+    alpha,
+    A_row,
+    B_row,
+    C_row,
+    lda_cublas,
+    ldb_cublas,
+    ldc_cublas,
+    lda_flag,
+    ldb_flag,
+    ldc_flag,
+    beta,
+    handle,
+    alpha_ptr,
+    beta_ptr,
+):
+    """fp32-accumulation accuracy reference for fp16 GEMM.
+
+    FlagBLAS hgemm kernels accumulate in fp32 (same semantics as cuBLAS
+    gemmEx with CUDA_R_16F inputs / CUDA_R_32F compute, used on NVIDIA below).
+    On Hygon/DTK the only hipBLAS fp16 entry point, hipblasHgemm, accumulates in
+    reduced precision and deviates up to ~10% relative to an fp32 accumulator on
+    large K, so it cannot act as the accuracy oracle. Instead the fp16 operands
+    (exactly representable in fp32) are multiplied on-device in fp32.
+    """
+    if IS_HYGON:
+        A = A_row.float()
+        B = B_row.float()
+        if transa == CUBLAS_OP_T:
+            A = A.t()
+        if transb == CUBLAS_OP_T:
+            B = B.t()
+        acc = alpha * torch.matmul(A, B)
+        if beta != 0:
+            acc += beta * C_row.float()
+        return acc.to(torch.float16)
+    return cublas_hgemm(
+        A_col,
+        B_col,
+        C_col,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha,
+        A_row,
+        B_row,
+        C_row,
+        lda_cublas,
+        ldb_cublas,
+        ldc_cublas,
+        lda_flag,
+        ldb_flag,
+        ldc_flag,
+        beta,
+        handle,
+        alpha_ptr,
+        beta_ptr,
+    )
 
 
 def cublas_bfgemm(
@@ -588,8 +797,18 @@ class GemmBenchmark(Benchmark):
     def get_input_iter(self, cur_dtype) -> Generator:
         if IS_HYGON:
             _, handle = _prepare_hipblas(self.device)
-            alpha_np = ctypes.c_float(float(self.alpha))
-            beta_np = ctypes.c_float(float(self.beta))
+            if cur_dtype == torch.float16:
+                # hipblasHgemm reads alpha/beta as fp16 (hipblasHalf) scalars,
+                # so pack the host scalars into IEEE-754 binary16.
+                alpha_np = ctypes.c_ushort(
+                    int.from_bytes(struct.pack("<e", float(self.alpha)), "little")
+                )
+                beta_np = ctypes.c_ushort(
+                    int.from_bytes(struct.pack("<e", float(self.beta)), "little")
+                )
+            else:
+                alpha_np = ctypes.c_float(float(self.alpha))
+                beta_np = ctypes.c_float(float(self.beta))
             alpha_ptr = ctypes.byref(alpha_np)
             beta_ptr = ctypes.byref(beta_np)
         else:
