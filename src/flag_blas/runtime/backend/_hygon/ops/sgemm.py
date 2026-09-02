@@ -1681,9 +1681,11 @@ _NT_DIRECT_OVERRIDES = {
     # config: (4096,128,1024) A/B 无收益 (扫描 45.92us 为噪声, A/B 均 46.56us),
     # 不落地。(128,4096,1024) 生产 (64,128)w8gm8 46.72us 稳定 -> (64,128)w16gm1
     # kp2 45.76us 稳定 (-2.1%, ratio 0.8082->0.8252)。
+    # v2.26b (2026-09-01): BK64 扫描再提升 -4.5%: (64,64)BK64w16gm8kp2itt1
+    # 官方口径 A/B 三轮稳定 43.20us (r 0.83->0.874, 生产 44.96-45.60us)。
     (128, 4096, 1024): dict(
-        BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=16,
-        num_stages=2, use_in_thread_transpose=False, kpack=2,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
+        num_stages=2, use_in_thread_transpose=True, kpack=2,
     ),
     # v2.20 (2026-09-01): 64³ 超小 shape launch-bound (生产 (64,64)w4gm8 grid=1)。
     # 384 config 小 tile 扫描 (8 tile x w1/2/4 x itt x kp x gm x BK16/32): 54 config
