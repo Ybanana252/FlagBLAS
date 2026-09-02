@@ -1823,6 +1823,15 @@ _TN_DIRECT_OVERRIDES = {
         BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False,
     ),
+    # v2.30 (2026-09-02): 64³ 超小 shape launch-bound (grid=1, 生产 10.56us
+    # r=0.788 官方口径)。小 tile 扫描 54 config: w4 各类 tile 均达 8.16us 下限
+    # (r=1.0-1.16)。monkeypatch A/B 三轮交替: prod 10.56us 稳定 -> (32,32)w4gm1
+    # 8.16-9.44us (r=0.87-1.02, 最差轮仍 >=0.8)。与其余 tn 小 shape override 同款
+    # (32,32)w4gm1。小 tile 提并行度 (grid 1 -> 4)。
+    (64, 64, 64): dict(
+        BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
+        num_stages=2, use_in_thread_transpose=False,
+    ),
 }
 
 
