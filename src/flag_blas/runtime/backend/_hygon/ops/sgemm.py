@@ -1759,6 +1759,15 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=True, kpack=2,
     ),
+    # v2.29 (2026-09-02): (2048,2048,16384) 大 K shape (<0.8 异常值)。direct
+    # config + split-k 扫描 (10 direct + 8 split-k): 生产 DB direct (kp1) 3289.3us
+    # (r=0.7855) 稳定 -> (64,64)BK64w16kp2gm8itt1 3190us 稳定 (r=0.809-0.810)。
+    # 官方口径 A/B 交替 3 轮: 3289.3us -> 3189.6-3192.8us (-3.0%)。BK64+w16+kp2
+    # 提 k-loop 吞吐 (k=16384 长循环); split-k 4 段 (128,128) 3201us 略差不取。
+    (2048, 2048, 16384): dict(
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
+        num_stages=2, use_in_thread_transpose=True, kpack=2,
+    ),
 }
 
 
