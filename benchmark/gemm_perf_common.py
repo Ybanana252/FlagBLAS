@@ -644,6 +644,32 @@ def cublas_bfgemm(
     alpha_ptr,
     beta_ptr,
 ):
+    if IS_HYGON:
+        # DTK hipBLAS has no working bf16 gemm entry point: hipblasGemmEx and
+        # hipblasGemmEx_v2 reject every (aType, bType, cType, computeType)
+        # combination tested (status HIPBLAS_STATUS_INVALID_ENUM / NOT_SUPPORTED,
+        # including plain fp32), and there is no legacy hipblasBgemm. torch's
+        # bf16 matmul dispatches to the vendor-tuned rocBLAS bf16 Tensile
+        # kernel (ISA936, fp32 accumulate), which is exactly the kernel a
+        # working hipBLAS bf16 gemmEx would select, so it is used here as the
+        # native latency baseline.
+        A = A_row
+        B = B_row
+        if transa == CUBLAS_OP_T:
+            A = A.t()
+        if transb == CUBLAS_OP_T:
+            B = B.t()
+        if alpha == 1.0 and beta == 0.0:
+            # BLAS reference computes in place: C <- A @ B (no alpha/beta
+            # kernel to launch). Skip the identity alpha multiply that would
+            # otherwise add an extra full-tensor kernel per call.
+            C_row.copy_(torch.matmul(A, B))
+        else:
+            out = alpha * torch.matmul(A, B)
+            if beta != 0:
+                out = out + beta * C_row
+            C_row.copy_(out)
+        return C_row
     cublas.gemmEx(
         handle,
         transa,
@@ -692,6 +718,24 @@ def cublas_bfgemm_reference(
     alpha_ptr,
     beta_ptr,
 ):
+    """fp32-accumulation accuracy reference for bf16 GEMM.
+
+    FlagBLAS bfgemm kernels accumulate in fp32 (the cuBLAS gemmEx semantic
+    used on NVIDIA below). On Hygon/DTK there is no hipBLAS bf16 gemm entry
+    point, so the bf16 operands (exactly representable in fp32) are multiplied
+    on-device in fp32 as the accuracy oracle.
+    """
+    if IS_HYGON:
+        A = A_row.float()
+        B = B_row.float()
+        if transa == CUBLAS_OP_T:
+            A = A.t()
+        if transb == CUBLAS_OP_T:
+            B = B.t()
+        acc = alpha * torch.matmul(A, B)
+        if beta != 0:
+            acc += beta * C_row.float()
+        return acc.to(torch.bfloat16)
     C_fp32 = torch.empty_strided(
         C_col.shape, C_col.stride(), dtype=torch.float32, device=C_col.device
     )
