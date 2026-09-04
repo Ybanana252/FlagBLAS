@@ -2231,3 +2231,40 @@ bfgemm_nn:
   - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 4
     num_stages: 2
+  # --- v2 (2026-09-04): 大/瘦中 shape 全协议实测补池 ---
+  # 结构性结论: 大方形 (8192^3 等) flag 稳定在 ~146TF/s (Triton bf16 上限),
+  # rocBLAS 原生 bf16 可达 ~330TF/s, config 无法弥合; 此处补的 config 针对
+  # NN/NT/TN-composite/TT 的瘦/中/非方形 shape (flag 侧 -5~-33%)。
+  # (32,32,BK64,w4): m 或 n=64 的方/小 shape (64x512x512 16.0->10.7us, 512x64x512 15.4->11.0us)
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (32,64,BK32,w4): 511^3 24.6->22.7us
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (128,256,BK32,w4): 256x8192x2048 95.8->88.2us, 2048x11008x4096 1.431->1.039ms, 4096^3 1.041->0.816ms
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (256,128,BK32,w4): 8192x256x2048 95.2->91.0us (镜像 pair)
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (256,256,BK32,w8): 2048^3 166.1->128.5us (-23%)
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (256,256,BK64,w8): 2048x12288x4096 1.502->1.131ms, 2048x4096x11008 1.492->1.127ms,
+  # 512x16384x4096 0.574->0.455ms
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (128,128,BK32,w8): 4095^3 1.826->1.795ms
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (256,256,BK64,w16): 8192^3 7.53->7.17ms (+5%, 大方形仅存的 config 级增益)
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
