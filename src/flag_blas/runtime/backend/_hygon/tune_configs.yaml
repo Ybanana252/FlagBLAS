@@ -2231,10 +2231,12 @@ bfgemm_nn:
   - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 4
     num_stages: 2
-  # --- v2 (2026-09-04): 大/瘦中 shape 全协议实测补池 ---
-  # 结构性结论: 大方形 (8192^3 等) flag 稳定在 ~146TF/s (Triton bf16 上限),
-  # rocBLAS 原生 bf16 可达 ~330TF/s, config 无法弥合; 此处补的 config 针对
-  # NN/NT/TN-composite/TT 的瘦/中/非方形 shape (flag 侧 -5~-33%)。
+  # --- v2/v3 (2026-09-04): 大/瘦中 shape 全协议实测补池 ---
+  # 补池后 v3 官跑大方形再获一档: 新增的 (256,256,BK64,w8) 使 8192^3 7.53->5.54ms
+  # (~198TF; v2 池最优 (256,256,BK32,w16) 仅 ~146TF), raw 扫描 20+ config 无超
+  # 199TF 者。残余缺口为指令发射层 (Triton bf16 dot = v_mmac_f32_16x16x16_bf16
+  # 16x16x16 mmac, rocBLAS Tensile 更宽 mfma ~333TF/s), config/tile 已到顶;
+  # 其余新增 config 针对 NN/NT/TN-composite/TT 的瘦/中/非方形 shape (flag 侧 -5~-33%)。
   # (32,32,BK64,w4): m 或 n=64 的方/小 shape (64x512x512 16.0->10.7us, 512x64x512 15.4->11.0us)
   - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
     num_warps: 4
@@ -2264,7 +2266,8 @@ bfgemm_nn:
   - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 8
     num_stages: 2
-  # (256,256,BK64,w16): 8192^3 7.53->7.17ms (+5%, 大方形仅存的 config 级增益)
+  # (256,256,BK64,w16): 大方形实测 7.17ms (同 tile 的 w8 上方更优, 5.54ms);
+  # 保留在池内由 autotune 按 shape 自行取舍
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
     num_warps: 16
     num_stages: 2
