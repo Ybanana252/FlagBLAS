@@ -2167,7 +2167,7 @@ sgemm_hygon:
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
     num_warps: 16
     num_stages: 2
-bfgemm_nn:
+bfgemm_nn: &bfgemm_nn_hygon_configs
   # v1: Hygon gfx936 bfgemm NN pool。原 Hygon 无 bfgemm_* 段, 回落 NVIDIA 缺省池
   # (BK=64/128, stages 3-6), 在 gfx936 (<96KB smem) 上大量 shape 只能选到次优小 tile,
   # 2048^3 NN main 仅 ~77TF。此处 = NVIDIA 原 9 config (保 TT 变体不回归, 超集) +
@@ -2271,3 +2271,13 @@ bfgemm_nn:
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
     num_warps: 16
     num_stages: 2
+
+# bfgemm_nt: Hygon gfx936 bfgemm NT 直接内核 pool。此前 hygon 无 bfgemm_nt 段,
+# 回落到 NVIDIA 缺省池 (BK128/s3-6 在 gfx936 smem 上限外大量 shape 只选到次优
+# 小 tile), v4 官跑 NT 大方形仅 8192^3 7.18ms (sp 0.50)、16384^3 55.9ms (sp 0.93)。
+# NT 与 NN 同源通用 level3 内核 (仅 B tile 读法不同: transb=T 时 B 物理 (n,k)),
+# 直接共享 bfgemm_nn 池 (27 configs)。2026-09-05 官方协议 (do_bench w1000/r100/
+# median) 逐 shape 验证: (256,256,BK64,w16,s2) 8192^3 -> 4.10ms (sp 0.87)、
+# 16384^3 -> 32.8ms (sp 1.59)、4096x24576x8192 -> 6.30ms (sp 1.66)、8191^3 -> 9.45ms
+# (sp 0.54) 等, 输出与旧池逐位一致; 小 shape 由 autotune 选小 tile config, 无回退。
+bfgemm_nt: *bfgemm_nn_hygon_configs
