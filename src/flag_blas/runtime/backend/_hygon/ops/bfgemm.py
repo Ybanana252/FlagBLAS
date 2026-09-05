@@ -222,10 +222,10 @@ _PAD_ALIGN_MN = 256  # 池内最大 BLOCK_M/BLOCK_N
 _PAD_ALIGN_K = 128  # 池内最大 BLOCK_K
 _PAD_BLK = 64  # 转置拷贝 tile 宽 BC (src n 向; 实测 odd 最优 64x128/w8)
 _PAD_TRANS_BLK = 128  # 转置拷贝 tile 高 BR (src k 向; k 行主序跨大 stride 读)
-# 小 odd shape (511/1023 级, 2mnk < _PAD_MIN_FLOPS) 不 pad: pad 的拷贝/launch 开销
-# 占比大、获益甚小 (pad 前 0.038ms->0.035ms 级别), 直接路径更快。
+# 小 odd shape (511/1023 级, 2mnk < _PAD_MIN_FLOPS) 不 pad: pad 需 4-5 个额外
+# kernel/拷贝 launch (~25us/次), 小 shape 上启动开销占比远大于 misalign 收益
+# (实验 2026-09-06: 1023^3 pad 后 0.20ms vs direct 0.06ms, 全线回退)。
 _PAD_MIN_FLOPS = 5.0e9  # 启用 pad 的 2*m*n*k 下界
-
 
 def _padded_size(m, n, k, lda, ldb, ldc):
     # 行起始地址 16B 对齐需 ld*2B % 16 == 0 -> ld % 8 == 0。任一不满足即
@@ -356,9 +356,13 @@ def bfgemm(
         ps = _padded_size(m, n, k, lda, ldb, ldc)
         if ps is not None and 2.0 * m * n * k >= _PAD_MIN_FLOPS:
             mp, np, kp = ps
-            Ap = torch.zeros(mp, kp, dtype=A.dtype, device=A.device)
-            Bt = torch.zeros(np, kp, dtype=A.dtype, device=A.device)
-            Cp = torch.zeros(mp, np, dtype=A.dtype, device=A.device)
+            # torch.empty 而非 zeros: 三块大缓冲 fmem (8191^3 级 ~400MB) 每次调用
+            # ~0.8ms, 纯浪费。有效输出 (i<m,j<n) 的 k 方向点积只跨 A/B 的 k-pad
+            # 列, 故仅需把两缓冲的 [:, k:kp] 条带清零 (见下); m-pad 行 / n-pad 行
+            # / Cp 的 pad 区只影响被裁掉的输出, 无需清零。
+            Ap = torch.empty(mp, kp, dtype=A.dtype, device=A.device)
+            Bt = torch.empty(np, kp, dtype=A.dtype, device=A.device)
+            Cp = torch.empty(mp, np, dtype=A.dtype, device=A.device)
             if transa == CUBLAS_OP_N:  # A 物理 (m,k): 同布局 pad
                 Ap[:m, :k].copy_(_row_view(A, lda)[:m, :k])
             else:  # A 物理 (k,m): pad+转置 -> Ap(m,k)
@@ -379,6 +383,9 @@ def bfgemm(
                 )
             else:  # B 物理 (n,k): 同布局 pad
                 Bt[:n, :k].copy_(_row_view(B, ldb)[:n, :k])
+            if kp > k:  # k-pad 条带归零 (转置 kernel 已自带 0, 幂等)
+                Ap[:, k:].zero_()
+                Bt[:, k:].zero_()
             if not beta_is_zero:  # 预置 beta*C 语义: 拷贝 C 到 pad 缓冲左上
                 Cp[:m, :n].copy_(_row_view(C, ldc)[:m, :n])
             _launch_pad_nt(A, Ap, Bt, Cp, alpha, beta, beta_is_zero, mp, np, kp, kp)
