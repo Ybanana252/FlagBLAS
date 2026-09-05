@@ -206,6 +206,108 @@ def _tn_y_tiles(m, n, k):
     return (64, 128) if n <= 128 else (128, 128)
 
 
+# ---- odd / 非对齐布局的 pad 路径 ----
+# core-shape 表中 (m,n,k) 为奇数 (8191/4095/1023/511/4097x8191x4095 等) 时,
+# A/B/C 行起始地址 = row * ld * 2B, ld 奇数使行基址连 4B/8B 对齐都无法保证,
+# Triton 对 2D tile 行向量化 load/store 全面降窄, 大 shape 延迟膨胀 ~1.5-2x
+# (8191^3 NN 11.27ms vs 8192^3 5.54ms); 边界 tile 的 masked k-loop 再扣一档。
+# (诊断: /tmp/diag_kodd.py + diag_padfull.py, 2026-09-05; config 扫 27 项无解,
+# 确认为布局/掩码问题而非 tile 配置问题)
+# 修复: 输入 pad 到 (BLOCK_M/N=256, BLOCK_K=128) 整数倍缓冲 + mask-free 主
+# 内核; NN 顺带把 B(k,n) 转置成 Bt(n,k) 走 NT 主内核 (B 沿 k 列连续读, 同池
+# 实测快 ~25-30%: 8192^3 NN main 5.54ms -> NT main 4.10ms)。输出先写 pad C
+# 缓冲再裁回真实 C, alpha/beta 语义保持。pad 后以 (m_pad,n_pad,k_pad) 调
+# autotuner 内核, 与已调优对齐 shape (8192^3 等) 命中同一 tune 条目。
+_PAD_ALIGN_MN = 256  # 池内最大 BLOCK_M/BLOCK_N
+_PAD_ALIGN_K = 128  # 池内最大 BLOCK_K
+_PAD_BLK = 64  # 转置拷贝 tile 宽 BC (src n 向; 实测 odd 最优 64x128/w8)
+_PAD_TRANS_BLK = 128  # 转置拷贝 tile 高 BR (src k 向; k 行主序跨大 stride 读)
+# 小 odd shape (511/1023 级, 2mnk < _PAD_MIN_FLOPS) 不 pad: pad 的拷贝/launch 开销
+# 占比大、获益甚小 (pad 前 0.038ms->0.035ms 级别), 直接路径更快。
+_PAD_MIN_FLOPS = 5.0e9  # 启用 pad 的 2*m*n*k 下界
+
+
+def _padded_size(m, n, k, lda, ldb, ldc):
+    # 行起始地址 16B 对齐需 ld*2B % 16 == 0 -> ld % 8 == 0。任一不满足即
+    # misalign -> 需要 pad (覆盖全部奇数 shape 与 lda/ldb/ldc 非 8 倍数情形)。
+    if lda % 8 == 0 and ldb % 8 == 0 and ldc % 8 == 0:
+        return None
+    return (
+        triton.cdiv(m, _PAD_ALIGN_MN) * _PAD_ALIGN_MN,
+        triton.cdiv(n, _PAD_ALIGN_MN) * _PAD_ALIGN_MN,
+        triton.cdiv(k, _PAD_ALIGN_K) * _PAD_ALIGN_K,
+    )
+
+
+def _row_view(t, ld):
+    # 物理缓冲 -> (行, ld) 行主序视图 (无拷贝), 供切片拷贝取逻辑 (m,k) 区;
+    # 兼容 2D (行,ld) 与 1D 平铺缓冲。
+    if t.dim() == 2 and t.shape[1] == ld:
+        return t
+    return t.view(-1, ld)
+
+
+@triton.jit
+def _bfgemm_pad_trans_kernel(
+    src,
+    dst,
+    K,
+    N,
+    sr,
+    dr,
+    np,
+    BR: tl.constexpr,
+    BC: tl.constexpr,
+):
+    # src: B(k,n) 行主序 (k 行 stride=sr, n 列连续)
+    # dst: Bt(n_pad,k_pad) 行主序 (n 行 stride=dr, k 列连续); 一次完成 pad+转置,
+    # grid = cdiv(k_pad,BR) x cdiv(n_pad,BC) 全覆盖 -> store 无掩码; 源越界
+    # (k>=K 或 n>=N) 读 0 -> pad 区为 0。
+    pid = tl.program_id(0)
+    ngrid_c = tl.cdiv(np, BC)
+    pr = pid // ngrid_c  # k tiles (k_pad 维)
+    pc = pid % ngrid_c  # n tiles
+    offs_k = pr * BR + tl.arange(0, BR)
+    offs_n = pc * BC + tl.arange(0, BC)
+    msk = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+    v = tl.load(src + offs_k[:, None] * sr + offs_n[None, :], mask=msk, other=0.0)
+    tl.store(dst + offs_n[:, None] * dr + offs_k[None, :], tl.trans(v))
+
+
+def _launch_pad_nt(
+    A,
+    Ap,
+    Bt,
+    Cp,
+    alpha,
+    beta,
+    beta_is_zero,
+    mp,
+    np,
+    kp,
+    lda_p,
+):
+    # NT 主内核 (输入 Ap(m,kp) lda=lda_p, Bt(np,kp) ldb=kp) -> Cp(mp,np);
+    # grid lambda 交给 libtuner 展开。
+    grid = lambda meta: (
+        triton.cdiv(mp, meta["BLOCK_M"]) * triton.cdiv(np, meta["BLOCK_N"]),
+    )
+    _bfgemm_nt_kernel[grid](
+        Ap,
+        Bt,
+        Cp,
+        alpha,
+        beta,
+        mp,
+        np,
+        kp,
+        lda_p,
+        kp,
+        np,
+        beta_is_zero,
+    )
+
+
 def bfgemm(
     transa: int,
     transb: int,
@@ -247,6 +349,41 @@ def bfgemm(
     )
 
     with torch_device_fn.device(A.device):
+        # odd/misalign 布局 (任一 ld%8!=0) + 大 shape: pad 到对齐缓冲统一走 NT 主
+        # 内核, 见上方 pad 路径注释。probe_pad_dispatch2 (2026-09-05, 官跑口径 e2e,
+        # 数值 beta0/β=1.5 全 PASS): NN 8191^3 11.27->6.05ms、NT 9.48->6.23、
+        # TN 11.76->5.89、TT 13.19->6.07; sp 0.75-1.54 (相对同进程 torch)。
+        ps = _padded_size(m, n, k, lda, ldb, ldc)
+        if ps is not None and 2.0 * m * n * k >= _PAD_MIN_FLOPS:
+            mp, np, kp = ps
+            Ap = torch.zeros(mp, kp, dtype=A.dtype, device=A.device)
+            Bt = torch.zeros(np, kp, dtype=A.dtype, device=A.device)
+            Cp = torch.zeros(mp, np, dtype=A.dtype, device=A.device)
+            if transa == CUBLAS_OP_N:  # A 物理 (m,k): 同布局 pad
+                Ap[:m, :k].copy_(_row_view(A, lda)[:m, :k])
+            else:  # A 物理 (k,m): pad+转置 -> Ap(m,k)
+                g = (
+                    triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(mp, _PAD_BLK),
+                )
+                _bfgemm_pad_trans_kernel[g](
+                    A, Ap, k, m, lda, kp, mp,
+                    BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
+                )
+            if transb == CUBLAS_OP_N:  # B 物理 (k,n): pad+转置 -> Bt(n,k)
+                g = (
+                    triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(np, _PAD_BLK),
+                )
+                _bfgemm_pad_trans_kernel[g](
+                    B, Bt, k, n, ldb, kp, np,
+                    BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
+                )
+            else:  # B 物理 (n,k): 同布局 pad
+                Bt[:n, :k].copy_(_row_view(B, ldb)[:n, :k])
+            if not beta_is_zero:  # 预置 beta*C 语义: 拷贝 C 到 pad 缓冲左上
+                Cp[:m, :n].copy_(_row_view(C, ldc)[:m, :n])
+            _launch_pad_nt(A, Ap, Bt, Cp, alpha, beta, beta_is_zero, mp, np, kp, kp)
+            _row_view(C, ldc)[:m, :n].copy_(Cp[:m, :n])
+            return
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
             _bfgemm_nn_kernel[grid](
                 A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
