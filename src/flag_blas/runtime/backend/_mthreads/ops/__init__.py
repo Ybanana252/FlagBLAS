@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .bfgemm import bfgemm
 from .gbmv import cgbmv, dgbmv, sgbmv, zgbmv
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import cgerc, cgeru, sger
@@ -38,6 +39,7 @@ from .trmv import ctrmv, dtrmv, strmv, ztrmv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
 __all__ = [
+    "bfgemm",
     "bfgemv",
     "cgbmv",
     "dgbmv",

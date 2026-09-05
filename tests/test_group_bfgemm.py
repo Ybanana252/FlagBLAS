@@ -2,10 +2,8 @@ import ctypes
 import ctypes.util
 import random
 
-import cupy as cp
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
 from flag_blas.ops import CUBLAS_OP_N
@@ -27,7 +25,7 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on the system.")
 
 
-_cublas = load_cublas()
+_cublas = None
 
 
 def _cublasGemmGroupedBatchedEx(
@@ -74,9 +72,6 @@ def _cublasGemmGroupedBatchedEx(
         ctypes.c_void_p(group_size.data_ptr()),
         ctypes.c_int(compute_type),
     )
-
-
-cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
 
 
 CUDA_R_16F = 2
@@ -161,6 +156,13 @@ def _build_triton_arrays(group_A, group_B, group_C, offs_table):
 
 
 def cublas_group_gemm_reference(group_A, group_B, group_C, offs_table, alpha, beta):
+    global _cublas
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+    if _cublas is None:
+        _cublas = load_cublas()
+        cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
+
     e = len(offs_table)
     if e == 0:
         return torch.empty_like(group_C)
