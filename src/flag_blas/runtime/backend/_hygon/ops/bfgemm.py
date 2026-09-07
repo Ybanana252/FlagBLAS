@@ -69,6 +69,32 @@ def _nn_sched_kwargs(m, n, k):
     sched = _NN_SCHED_BY_SHAPE.get((m, n, k))
     return {"sched_latency": sched} if sched else {}
 
+# ---- 方向② 落地 (2026-09-07): kpack=2 门控 (官跑量化见报告 §9) ----
+# HIPOptions.kpack 控制 bf16 点积操作数每 32bit 打包的 K 数 (默认 1)。kpack=2
+# (2-K/32bit 打包, 消 v_perm/降寄存器往返) 官跑全谱量化:
+#   * NT 主内核无条件: NN-route 7 dims -0.5~-3.5、TN-route 6 dims -0.3~-3.6、
+#     NT-native 大 shape -2.5~-3.8 (8192x28672x8192 sp 0.821->0.852 达标)、
+#     pad-odd (NN/TN/TT 8191^3/4097x8191x4095) -0.4~-3.1、小 shape 噪声内, 无回退;
+#   * NN 主内核 per-shape: 仅 (2048,11008,4096) (NN/TN 残留, k=11008 w4/ds10) -4.2~-4.5%;
+#   * 排除: NN 512x16384x4096 (w8/ds12) +4.1%、direct-TN 小 shape 1024^3 +22% /
+#     128x4096x1024 +34%、direct-TT 大 shape 4096x8192x28672 +4.5% / 2048x2048x16384
+#     +5.1% / 2048x4096x11008 +4.9% / 2048^3 +3.7% 回退 (direct-TT 按内核排除);
+#   * 其它编译旋钮出局: matrix_instr_nonkdim=16 无效果 (gfx936 bf16 仅 16x16x16),
+#     mmac_layout_force 0 数值错 (err 1.38) / 3 编译败 (lit/lts 不支持)。
+def _kp2_kwargs():
+    return {"kpack": 2}
+
+# NN 主内核 kpack=2 白名单 shape (残留 NN 直路 + TN A^T 复合共用同一主内核)
+_NN_KP2_SHAPES = {(2048, 11008, 4096)}
+
+
+def _nn_kernel_kwargs(m, n, k):
+    """NN 主内核 launch kwargs: sched_latency 门控 + 方向② kpack 白名单。"""
+    kw = _nn_sched_kwargs(m, n, k)
+    if (m, n, k) in _NN_KP2_SHAPES:
+        kw["kpack"] = 2
+    return kw
+
 
 # ---- 方向① (2026-09-07): NN 大 shape B 转置一次 -> NT 主内核 ----
 # NN 布局 (A/B 均 k 末维) 在 tl.dot 主循环的调度/发射上吃亏, 同指令下 NT 布局
@@ -365,6 +391,7 @@ def _launch_pad_nt(
         kp,
         np,
         beta_is_zero,
+        **_kp2_kwargs(),
     )
 
 
@@ -478,12 +505,13 @@ def bfgemm(
                     num_warps=4,
                 )
                 _bfgemm_nt_kernel[grid](
-                    A, Bt, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero
+                    A, Bt, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero,
+                    **_kp2_kwargs(),
                 )
             else:
                 _bfgemm_nn_kernel[grid](
                     A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
-                    **_nn_sched_kwargs(m, n, k),
+                    **_nn_kernel_kwargs(m, n, k),
                 )
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if (m, n, k) in _TN_Y_SHAPES:
@@ -561,12 +589,13 @@ def bfgemm(
                         num_warps=4,
                     )
                     _bfgemm_nt_kernel[grid](
-                        At, Bt, C, alpha, beta, m, n, k, k, k, ldc, beta_is_zero
+                        At, Bt, C, alpha, beta, m, n, k, k, k, ldc, beta_is_zero,
+                        **_kp2_kwargs(),
                     )
                 else:
                     _bfgemm_nn_kernel[grid](
                         At, B, C, alpha, beta, m, n, k, k, ldb, ldc, beta_is_zero,
-                        **_nn_sched_kwargs(m, n, k),
+                        **_nn_kernel_kwargs(m, n, k),
                     )
             else:
                 _bfgemm_tn_kernel[grid](
@@ -574,7 +603,8 @@ def bfgemm(
                 )
         elif transa == CUBLAS_OP_N and transb == CUBLAS_OP_T:
             _bfgemm_nt_kernel[grid](
-                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
+                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+                **_kp2_kwargs(),
             )
         else:
             _bfgemm_tt_kernel[grid](
