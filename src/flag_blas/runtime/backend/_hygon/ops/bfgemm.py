@@ -44,6 +44,66 @@ from flag_blas.runtime import torch_device_fn
 _TN_TRANS_BLOCK_M = 64
 _TN_TRANS_BLOCK_K = 64
 
+# ---- 16 大 shape 编译器对齐 (2026-09-07): NN 主内核 sched_latency per-shape 门控 ----
+# flagtree clang 延迟布局 (-mmac-latency=5 + -ds-load-store-latency) 收益随生产 tile 分群:
+#   (256,256,BK64,w8/s2) 大 tile shape -> mmac5-ds12, 实测 -3.6~-3.9% (NN 直路与
+#   TN A^T 复合路径同源, 均落在本 NN 主内核上, 见 probe mmac_tncomp_probe 2026-09-07);
+#   (128,256,BK32,w4/s2) tile (4096^3 / 2048x11008x4096) -> mmac5-ds10 -2.0~-2.3%,
+#   ds12 仅 -1.0~-1.1% (调度面不同, 不能一刀切)。
+# 测量以生产 config (与 v8 warm DB 一致) 直调, base 对齐 v8 官跑 ±0.3%。其余 shape
+# (pad / fused-Y / direct-TN / NT / TT) 不触碰, 保持默认调度零风险。
+_NN_SCHED_BY_SHAPE = {
+    (8192, 8192, 8192): "mmac5-ds12",
+    (4096, 24576, 8192): "mmac5-ds12",
+    (8192, 28672, 8192): "mmac5-ds12",
+    (4096, 8192, 28672): "mmac5-ds12",
+    (2048, 4096, 11008): "mmac5-ds12",
+    (2048, 12288, 4096): "mmac5-ds12",
+    (512, 16384, 4096): "mmac5-ds12",
+    (4096, 4096, 4096): "mmac5-ds10",
+    (2048, 11008, 4096): "mmac5-ds10",
+}
+
+
+def _nn_sched_kwargs(m, n, k):
+    sched = _NN_SCHED_BY_SHAPE.get((m, n, k))
+    return {"sched_latency": sched} if sched else {}
+
+
+# ---- 方向① (2026-09-07): NN 大 shape B 转置一次 -> NT 主内核 ----
+# NN 布局 (A/B 均 k 末维) 在 tl.dot 主循环的调度/发射上吃亏, 同指令下 NT 布局
+# (B 读 (n,k) 末维连续) flag 低 16-23% (报告 §7 / probe dir1_ntroute 2026-09-07)。
+# 对 net 收益为正的 shape: 每次调用先 _bfgemm_tn_trans_kernel 把 B(k,n) 拷成
+# Bt(n,k) 连续缓冲 (与 _launch_pad_nt 同一条 NT 主内核路)。转置开销 0.07-0.31ms
+# 被主内核节约覆盖 (net -2.7~-17.4%)。例外: 512x16384x4096 (trans 0.31ms >
+# 主内核节约 0.09ms, net +49.9%) 与 2048x11008x4096 (net +1.4%) 净亏, 保留 NN
+# 主内核 + ds 门控。NT 主内核 config 复用 warm DB (v8 NT tune 段, 官跑命中)。
+_NN_NT_ROUTE_SHAPES = {
+    (8192, 8192, 8192),
+    (4096, 24576, 8192),
+    (8192, 28672, 8192),
+    (4096, 8192, 28672),
+    (4096, 4096, 4096),
+    (2048, 4096, 11008),
+    (2048, 12288, 4096),
+}
+
+# ---- 方向① TN 侧 (2026-09-07): Aᵀ 复合再叠加 transB -> NT 主内核 ----
+# TN 复合 (transA + NN 主内核) 把 NN 主内核换成 NT 主内核需补一次 transB
+# (B(k,n)->Bt(n,k)); transA 复合路径已付。net = 主内核差 - transB, §7 量化 6 dims
+# -2.3~-16.4% (8192³ -16.42 / 8192x28672 -15.38 / 4096x8192x28672 -10.28 /
+# 4096x24576x8192 -9.87 / 4096³ -6.82 / 2048x12288x4096 -2.25)。2048x11008x4096
+# (+1.72% 净亏) 保持 NN 主内核 + ds; 2048x4096x11008 TN sp>=0.85 不入列。命中走
+# NT 主内核 (warm DB config, 不叠 ds 门控)。
+_TN_NT_ROUTE_SHAPES = {
+    (8192, 8192, 8192),
+    (4096, 24576, 8192),
+    (8192, 28672, 8192),
+    (4096, 8192, 28672),
+    (4096, 4096, 4096),
+    (2048, 12288, 4096),
+}
+
 
 @triton.jit
 def _bfgemm_tn_trans_kernel(
@@ -374,6 +434,7 @@ def bfgemm(
                     BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
                 )
             if transb == CUBLAS_OP_N:  # B 物理 (k,n): pad+转置 -> Bt(n,k)
+                b_pad_trans = True
                 g = (
                     triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(np, _PAD_BLK),
                 )
@@ -382,19 +443,48 @@ def bfgemm(
                     BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
                 )
             else:  # B 物理 (n,k): 同布局 pad
+                b_pad_trans = False
                 Bt[:n, :k].copy_(_row_view(B, ldb)[:n, :k])
-            if kp > k:  # k-pad 条带归零 (转置 kernel 已自带 0, 幂等)
-                Ap[:, k:].zero_()
-                Bt[:, k:].zero_()
+            if kp > k:
+                # k-pad 条带归零: 仅 same-layout copy_ 的缓冲需要 (copy_ 只写
+                # [:m,:k]/[:n,:k], k-pad 是 torch.empty 残留); 转置 kernel 的
+                # store 覆盖整块缓冲且源越界处读 0 写入, k-pad 已为 0, 跳过。
+                if transa == CUBLAS_OP_N:  # A 同布局 copy, k-pad 需归零
+                    Ap[:, k:].zero_()
+                if not b_pad_trans:
+                    Bt[:, k:].zero_()
             if not beta_is_zero:  # 预置 beta*C 语义: 拷贝 C 到 pad 缓冲左上
                 Cp[:m, :n].copy_(_row_view(C, ldc)[:m, :n])
             _launch_pad_nt(A, Ap, Bt, Cp, alpha, beta, beta_is_zero, mp, np, kp, kp)
             _row_view(C, ldc)[:m, :n].copy_(Cp[:m, :n])
             return
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
-            _bfgemm_nn_kernel[grid](
-                A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero
-            )
+            if (m, n, k) in _NN_NT_ROUTE_SHAPES:
+                # 方向①: B(k,n) (k 行 stride=ldb) -> Bt(n,k) (行 stride=k), 再走 NT 主内核
+                Bt = torch.empty((n, k), dtype=B.dtype, device=B.device)
+                gt = (
+                    triton.cdiv(k, _TN_TRANS_BLOCK_K)
+                    * triton.cdiv(n, _TN_TRANS_BLOCK_M),
+                )
+                _bfgemm_tn_trans_kernel[gt](
+                    B,
+                    Bt,
+                    k,
+                    n,
+                    ldb,
+                    k,
+                    BR=_TN_TRANS_BLOCK_K,
+                    BC=_TN_TRANS_BLOCK_M,
+                    num_warps=4,
+                )
+                _bfgemm_nt_kernel[grid](
+                    A, Bt, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero
+                )
+            else:
+                _bfgemm_nn_kernel[grid](
+                    A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
+                    **_nn_sched_kwargs(m, n, k),
+                )
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if (m, n, k) in _TN_Y_SHAPES:
                 # Y 复合: B(k,n) 连续转置成 Bt(n,k), 再 NN 主循环 + 转置 store 直写 C
@@ -452,9 +542,32 @@ def bfgemm(
                     BC=_TN_TRANS_BLOCK_M,
                     num_warps=4,
                 )
-                _bfgemm_nn_kernel[grid](
-                    At, B, C, alpha, beta, m, n, k, k, ldb, ldc, beta_is_zero
-                )
+                if (m, n, k) in _TN_NT_ROUTE_SHAPES:
+                    # 方向① TN: 再补 B(k,n)->Bt(n,k) (行 stride=k), At+Bt 走 NT 主内核
+                    Bt = torch.empty((n, k), dtype=B.dtype, device=B.device)
+                    gb = (
+                        triton.cdiv(k, _TN_TRANS_BLOCK_K)
+                        * triton.cdiv(n, _TN_TRANS_BLOCK_M),
+                    )
+                    _bfgemm_tn_trans_kernel[gb](
+                        B,
+                        Bt,
+                        k,
+                        n,
+                        ldb,
+                        k,
+                        BR=_TN_TRANS_BLOCK_K,
+                        BC=_TN_TRANS_BLOCK_M,
+                        num_warps=4,
+                    )
+                    _bfgemm_nt_kernel[grid](
+                        At, Bt, C, alpha, beta, m, n, k, k, k, ldc, beta_is_zero
+                    )
+                else:
+                    _bfgemm_nn_kernel[grid](
+                        At, B, C, alpha, beta, m, n, k, k, ldb, ldc, beta_is_zero,
+                        **_nn_sched_kwargs(m, n, k),
+                    )
             else:
                 _bfgemm_tn_kernel[grid](
                     A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero

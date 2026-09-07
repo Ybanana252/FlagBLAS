@@ -2271,6 +2271,19 @@ bfgemm_nn: &bfgemm_nn_hygon_configs
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
     num_warps: 16
     num_stages: 2
+  # 小 shape (511/1023 级) 补充: 小块多 CTA 缓解并行不足。2026-09-06 do_bench
+  # (w200/r200) TN 511^3 扫: (64,64,BK64,w4/w8) 0.0280 -> (64,32,BK64,w4,s3)
+  # 0.0272/-6% ((64,32) 向 grid 8->16 个 CTA), (32,64,BK32,w4,s3) 0.0274,
+  # (32,32,BK32,w2,s3) 0.0280。四变体共享池, 由 autotune 按 shape 自选。
+  - META: {BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 2
+    num_stages: 3
 
 # bfgemm_nt: Hygon gfx936 bfgemm NT 直接内核 pool。此前 hygon 无 bfgemm_nt 段,
 # 回落到 NVIDIA 缺省池 (BK128/s3-6 在 gfx936 smem 上限外大量 shape 只选到次优
@@ -2281,3 +2294,12 @@ bfgemm_nn: &bfgemm_nn_hygon_configs
 # 16384^3 -> 32.8ms (sp 1.59)、4096x24576x8192 -> 6.30ms (sp 1.66)、8191^3 -> 9.45ms
 # (sp 0.54) 等, 输出与旧池逐位一致; 小 shape 由 autotune 选小 tile config, 无回退。
 bfgemm_nt: *bfgemm_nn_hygon_configs
+
+# bfgemm_tn: Hygon gfx936 bfgemm TN 直接内核 pool。此前 hygon 无 bfgemm_tn 段,
+# 回落到 NVIDIA 缺省池 (仅 4 config: (64,32,BK128,w8,s5)/(64,64,BK64,w4,s4)/
+# (128,128,BK64,w8,s6)/(128,128,BK64,w8,s3); s5/s6 超出 gfx936 64KB smem 编译失败,
+# 实际可用 ~1-2 个), TN shape 大量只能选到次优 tile (v7 TN 8192^3 仅 0.516 sp 而
+# NN 同 shape 0.595, 且 2048 级小 shape 全低于 NN 对应档)。TN 与 NN/NT 同源通用
+# level3 内核 (仅 A tile 读法不同: transa=T 时 A 物理 (k,m)), 直接共享 bfgemm_nn 池;
+# libtuner 每 shape 从并集自选最优, 池扩大无回归风险 (只增选择)。
+bfgemm_tn: *bfgemm_nn_hygon_configs
