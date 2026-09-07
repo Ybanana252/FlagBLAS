@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .bfgemm import bfgemm
+from .dgemm import dgemm
 from .gbmv import cgbmv, dgbmv, sgbmv, zgbmv
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import cgerc, cgeru, sger
@@ -47,6 +48,7 @@ __all__ = [
     "dspr2",
     "dsymv",
     "dsbmv",
+    "dgemm",
     "dgemv",
     "cgemv",
     "cgerc",

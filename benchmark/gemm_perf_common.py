@@ -413,6 +413,96 @@ def gems_sgemm_wrapper(
     return C_row
 
 
+def cublas_dgemm(
+    A_col,
+    B_col,
+    C_col,
+    transa,
+    transb,
+    m,
+    n,
+    k,
+    alpha,
+    A_row,
+    B_row,
+    C_row,
+    lda_cublas,
+    ldb_cublas,
+    ldc_cublas,
+    lda_flag,
+    ldb_flag,
+    ldc_flag,
+    beta,
+    handle,
+    alpha_ptr,
+    beta_ptr,
+):
+    """fp64 GEMM reference: official BLAS of the running vendor when available
+    (cuBLAS / muBLAS), otherwise a torch.matmul-based fallback."""
+    if native_blas_available():
+        native_gemm(
+            handle,
+            torch.float64,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col,
+            lda_cublas,
+            B_col,
+            ldb_cublas,
+            beta_ptr,
+            C_col,
+            ldc_cublas,
+        )
+        return C_col
+    return torch_gemm_reference(A_row, B_row, C_row, transa, transb, alpha, beta)
+
+
+def gems_dgemm_wrapper(
+    A_col,
+    B_col,
+    C_col,
+    transa,
+    transb,
+    m,
+    n,
+    k,
+    alpha,
+    A_row,
+    B_row,
+    C_row,
+    lda_cublas,
+    ldb_cublas,
+    ldc_cublas,
+    lda_flag,
+    ldb_flag,
+    ldc_flag,
+    beta,
+    handle,
+    alpha_ptr,
+    beta_ptr,
+):
+    flag_blas.dgemm(
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha,
+        A_row,
+        lda_flag,
+        B_row,
+        ldb_flag,
+        beta,
+        C_row,
+        ldc_flag,
+    )
+    return C_row
+
+
 def cublas_hgemm(
     A_col,
     B_col,
