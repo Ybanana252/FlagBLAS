@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .bfgemm import bfgemm
+from .cgemm import cgemm
 from .dgemm import dgemm
 from .gbmv import cgbmv, dgbmv, sgbmv, zgbmv
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
@@ -42,6 +43,7 @@ from .trsv import ctrsv, dtrsv, strsv, ztrsv
 __all__ = [
     "bfgemm",
     "bfgemv",
+    "cgemm",
     "cgbmv",
     "dgbmv",
     "dspmv",

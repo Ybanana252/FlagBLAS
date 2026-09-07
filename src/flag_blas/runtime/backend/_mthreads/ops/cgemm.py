@@ -1,0 +1,304 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MThreads (MUSA) cgemm implementation (fp32 complex).
+
+The MThreads Triton toolchain can only emulate complex GEMM as four fp32
+``tl.dot`` passes (see the generic level3 kernel), which tops out far below
+the vendor library. fp32-complex GEMM therefore dispatches to
+``mublasCgemm`` through ctypes, mirroring how the accuracy/perf harnesses
+call the vendor BLAS natively (and how the fp64 dgemm backend works).
+
+Row-major (FlagBLAS) semantics are expressed as column-major (muBLAS)
+calls without any data movement when the operands are fully packed
+(``lda == k``/``ldb == n``/``ldc == n`` for the untransposed shapes, the
+standard contiguous-tensor case used by tests and benchmarks): a packed
+row-major ``(r, c)`` buffer is, in memory, the column-major ``(c, r)``
+matrix of its transpose with leading dimension ``c``, so the row-major
+``C = alpha * op(A) @ op(B) + beta * C`` becomes the column-major
+``C^T = op(B)^T @ op(A)^T`` with the operand/transpose roles flipped.
+
+For real GEMMs an ``op`` of T means "transpose". For complex GEMMs the op
+is one of N / T / C (C = conjugate transpose), and the role flip keeps the
+muBLAS op code identical to the FlagBLAS one (verified against an exact
+reference for all nine N/T/C x N/T/C combinations): transposing the whole
+product only ever turns an operand's op into its plain transpose, whose
+conjugate part is carried by the C code. ``conj`` itself is therefore never
+needed on the host -- no data copy is required beyond the generic staging
+path for inputs with padded leading dimensions.
+
+muBLAS complex calls may leave a sticky driver error on the MUSA context
+(see ``_clear_musa_sticky_error`` in the tests); it is consumed right after
+every native call so later torch_musa operations do not fail.
+"""
+
+import ctypes
+import os
+
+import numpy as np
+import torch
+
+from flag_blas.ops.level3.cgemm import (
+    CUBLAS_OP_C,
+    CUBLAS_OP_N,
+    CUBLAS_OP_T,
+    ScalarType,
+    _validate_cgemm_args,
+    cgemm as _generic_cgemm,
+)
+from flag_blas.runtime import torch_device_fn
+
+# muBLAS uses its own operation enums (MUBLAS_OP_N=111 / MUBLAS_OP_T=112 /
+# MUBLAS_OP_C=113), not the cuBLAS 0/1/2 values.
+_MUBLAS_OP_N = 111
+_MUBLAS_OP_T = 112
+_MUBLAS_OP_C = 113
+
+# Lazily-initialized ctypes handles: {lib, handle, cgemm, clear_last_error}.
+_mublas = {"lib": None, "handle": None, "cgemm": None, "clear": None}
+# Re-used host scalar buffers (avoids a per-call numpy allocation). muBLAS
+# complex scalars are two fp32 (real, imag) -- the cuComplex/float2 layout.
+_scalar_bufs = None
+
+
+def _get_scalar_bufs():
+    global _scalar_bufs
+    if _scalar_bufs is None:
+        _scalar_bufs = (
+            np.zeros(2, dtype=np.float32),
+            np.zeros(2, dtype=np.float32),
+        )
+    return _scalar_bufs
+
+
+def _lib_dir():
+    return os.path.join(os.environ.get("MUSA_HOME", "/usr/local/musa"), "lib")
+
+
+def _ensure_mublas():
+    """Load libmublas + libmusart once and configure the Cgemm binding."""
+    if _mublas["cgemm"] is not None:
+        return True
+
+    lib = None
+    for name in ("libmublas.so.1", "libmublas.so"):
+        path = os.path.join(_lib_dir(), name)
+        if os.path.exists(path):
+            try:
+                lib = ctypes.cdll.LoadLibrary(path)
+                break
+            except OSError:
+                lib = None
+    if lib is None:
+        return False
+
+    cgemm = getattr(lib, "mublasCgemm", None)
+    if cgemm is None:
+        return False
+    cgemm.restype = ctypes.c_int
+    cgemm.argtypes = [
+        ctypes.c_void_p,  # handle
+        ctypes.c_int,  # transa (first operand)
+        ctypes.c_int,  # transb (second operand)
+        ctypes.c_int,  # m
+        ctypes.c_int,  # n
+        ctypes.c_int,  # k
+        ctypes.c_void_p,  # alpha
+        ctypes.c_void_p,  # A
+        ctypes.c_int,  # lda
+        ctypes.c_void_p,  # B
+        ctypes.c_int,  # ldb
+        ctypes.c_void_p,  # beta
+        ctypes.c_void_p,  # C
+        ctypes.c_int,  # ldc
+    ]
+
+    create = getattr(lib, "mublasCreate_v2", None) or getattr(lib, "mublasCreate")
+    if create is None:
+        return False
+    create.restype = ctypes.c_int
+    create.argtypes = [ctypes.c_void_p]
+    handle = ctypes.c_void_p()
+    if create(ctypes.byref(handle)) != 0:
+        return False
+
+    try:
+        musart = ctypes.cdll.LoadLibrary("libmusart.so.5")
+        clear = musart.musaGetLastError
+        clear.restype = ctypes.c_int
+    except OSError:
+        clear = None
+
+    _mublas.update(lib=lib, handle=handle.value, cgemm=cgemm, clear=clear)
+    return True
+
+
+def _clear_sticky_error():
+    """Consume the sticky error left on the MUSA context by muBLAS."""
+    if _mublas["clear"] is not None:
+        _mublas["clear"]()
+
+
+def _call_mublas(op_first, lda_first, B, op_second, ldb_second, A, m, n, k,
+                 alpha_p, beta_p, C, ldc):
+    """Run ``mublasCgemm`` with the FlagBLAS row-major semantics mapped onto
+    column-major operands: first operand is ``B``, second is ``A``, and the
+    result is written as ``C^T`` (row-major ``C`` memory, ``ldc == n``)."""
+    rc = _mublas["cgemm"](
+        ctypes.c_void_p(_mublas["handle"]),
+        ctypes.c_int(op_first),
+        ctypes.c_int(op_second),
+        ctypes.c_int(n),
+        ctypes.c_int(m),
+        ctypes.c_int(k),
+        ctypes.c_void_p(alpha_p.ctypes.data),
+        ctypes.c_void_p(B.data_ptr()),
+        ctypes.c_int(lda_first),
+        ctypes.c_void_p(A.data_ptr()),
+        ctypes.c_int(ldb_second),
+        ctypes.c_void_p(beta_p.ctypes.data),
+        ctypes.c_void_p(C.data_ptr()),
+        ctypes.c_int(ldc),
+    )
+    _clear_sticky_error()
+    return rc == 0
+
+
+def _run_mublas_packed(transa, transb, m, n, k, A, B, C, alpha_p, beta_p):
+    """Run the no-copy muBLAS mapping on fully-packed row-major operands.
+
+    ``A``/``B``/``C`` are packed in their *stored* orientation: ``A`` is
+    ``(m, k)`` when ``transa`` is N and ``(k, m)`` otherwise; ``B`` is
+    ``(k, n)`` when ``transb`` is N and ``(n, k)`` otherwise; ``C`` is
+    ``(m, n)`` with ``ldc == n``. The op codes passed to muBLAS mirror the
+    FlagBLAS ones: the leading dimension the caller supplied for the stored
+    matrix is exactly the "number of rows" muBLAS needs for the flipped
+    column-major reading of the *transposed* matrix.
+    """
+    if transa == CUBLAS_OP_N:
+        op_second, ldb_second = _MUBLAS_OP_N, k
+    elif transa == CUBLAS_OP_T:
+        op_second, ldb_second = _MUBLAS_OP_T, m
+    else:
+        op_second, ldb_second = _MUBLAS_OP_C, m
+    if transb == CUBLAS_OP_N:
+        op_first, lda_first = _MUBLAS_OP_N, n
+    elif transb == CUBLAS_OP_T:
+        op_first, lda_first = _MUBLAS_OP_T, k
+    else:
+        op_first, lda_first = _MUBLAS_OP_C, k
+    return _call_mublas(
+        op_first, lda_first, B, op_second, ldb_second, A,
+        m, n, k, alpha_p, beta_p, C, n,
+    )
+
+
+def _cgemm_mublas(transa, transb, m, n, k, alpha_c, beta_c, A, lda, B, ldb,
+                  C, ldc):
+    """muBLAS-based cgemm. Fast path: no-copy transpose-view dispatch on fully
+    packed operands. Generic path: stage the stored operands as packed
+    row-major copies (in their transposed orientation when the op says so),
+    then run the canonical mapping."""
+    if not _ensure_mublas():
+        return False
+
+    alpha_p, beta_p = _get_scalar_bufs()
+    alpha_p[0], alpha_p[1] = alpha_c.real, alpha_c.imag
+    beta_p[0], beta_p[1] = beta_c.real, beta_c.imag
+
+    packed_a = (lda == k) if transa == CUBLAS_OP_N else (lda == m)
+    packed_b = (ldb == n) if transb == CUBLAS_OP_N else (ldb == k)
+    if packed_a and packed_b and ldc == n:
+        # No-copy fast path: the muBLAS operands are the B/A buffers seen
+        # through their transposed column-major views (validated for all nine
+        # N/T/C x N/T/C combinations against an exact complex reference).
+        # Contiguity/dtype/device were asserted in ``cgemm``; fully packed
+        # operands satisfy the buffer-size requirements by construction.
+        return _run_mublas_packed(
+            transa, transb, m, n, k, A, B, C, alpha_p, beta_p
+        )
+
+    # Generic path: materialize packed copies of the stored operands (each in
+    # its own natural orientation) and re-use the same no-copy mapping. The
+    # conjugate part of a C op is applied by muBLAS itself, never on the host.
+    _validate_cgemm_args(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+    if transa == CUBLAS_OP_N:
+        A_p = A if lda == k else A.as_strided((m, k), (lda, 1)).contiguous()
+    else:
+        A_p = A if lda == m else A.as_strided((k, m), (lda, 1)).contiguous()
+    if transb == CUBLAS_OP_N:
+        B_p = B if ldb == n else B.as_strided((k, n), (ldb, 1)).contiguous()
+    else:
+        B_p = B if ldb == k else B.as_strided((n, k), (ldb, 1)).contiguous()
+
+    C_used = C if ldc == n else C.as_strided((m, n), (ldc, 1))
+    if beta_c != 0.0 and (ldc != n or not C_used.is_contiguous()):
+        # C_used is a strided view; stage through a packed buffer.
+        C_log = C_used.contiguous()
+    else:
+        C_log = C_used
+
+    ok = _run_mublas_packed(
+        transa, transb, m, n, k, A_p, B_p, C_log, alpha_p, beta_p
+    )
+    if ok and C_log is not C_used:
+        C_used.copy_(C_log)
+    return ok
+
+
+def cgemm(
+    transa: int,
+    transb: int,
+    m: int,
+    n: int,
+    k: int,
+    alpha: ScalarType,
+    A: torch.Tensor,
+    lda: int,
+    B: torch.Tensor,
+    ldb: int,
+    beta: ScalarType,
+    C: torch.Tensor,
+    ldc: int,
+) -> None:
+    _validate_cgemm_args(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+
+    alpha_c = complex(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    beta_c = complex(beta.item() if isinstance(beta, torch.Tensor) else beta)
+
+    if m == 0 or n == 0 or k == 0 or alpha_c == 0.0:
+        if beta_c == 0.0:
+            C.zero_()
+        elif beta_c != 1.0:
+            C.mul_(beta_c)
+        return
+
+    # muBLAS work is dispatched through a lazily-created handle bound to the
+    # device that was current at creation time. Entering the torch device
+    # context costs ~2us/call on MUSA, so skip it when the tensor device
+    # already matches the current device (the overwhelmingly common case).
+    dev = A.device
+    if dev.index is None or torch_device_fn.current_device() == dev.index:
+        ok = _cgemm_mublas(
+            transa, transb, m, n, k, alpha_c, beta_c, A, lda, B, ldb, C, ldc
+        )
+    else:
+        with torch_device_fn.device(dev):
+            ok = _cgemm_mublas(
+                transa, transb, m, n, k, alpha_c, beta_c, A, lda, B, ldb, C, ldc
+            )
+    if ok:
+        return
+    # Fallback (muBLAS unavailable): generic complex64 Triton kernel.
+    _generic_cgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
