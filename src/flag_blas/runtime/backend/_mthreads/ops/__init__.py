@@ -39,6 +39,7 @@ from .tpmv import ctpmv, dtpmv, stpmv, ztpmv
 from .tpsv import ctpsv, dtpsv
 from .trmv import ctrmv, dtrmv, strmv, ztrmv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
+from .zgemm import zgemm
 
 __all__ = [
     "bfgemm",
@@ -80,6 +81,7 @@ __all__ = [
     "sgbmv",
     "sgemm",
     "sgemv",
+    "zgemm",
     "zgemv",
     "sger",
     "ssbmv",

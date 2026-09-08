@@ -17,11 +17,15 @@ import os
 import numpy as np
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
 from benchmark.conftest import Config
-from benchmark.gemm_perf_common import GemmBenchmark
+from benchmark.gemm_perf_common import (
+    GemmBenchmark,
+    native_blas_available,
+    native_gemm,
+    torch_gemm_reference,
+)
 from flag_blas.ops import CUBLAS_OP_N, CUBLAS_OP_T
 
 pytestmark = pytest.mark.skipif(
@@ -30,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def cublas_zgemm(
+def zgemm_reference(
     A_col,
     B_col,
     C_col,
@@ -54,23 +58,28 @@ def cublas_zgemm(
     alpha_ptr,
     beta_ptr,
 ):
-    cublas.zgemm(
-        handle,
-        transa,
-        transb,
-        m,
-        n,
-        k,
-        alpha_ptr,
-        A_col.data_ptr(),
-        lda_cublas,
-        B_col.data_ptr(),
-        ldb_cublas,
-        beta_ptr,
-        C_col.data_ptr(),
-        ldc_cublas,
-    )
-    return C_col
+    """fp64-complex GEMM reference: official BLAS of the running vendor when
+    available (cuBLAS / muBLAS), otherwise a torch.matmul-based fallback."""
+    if native_blas_available():
+        native_gemm(
+            handle,
+            torch.complex128,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col,
+            lda_cublas,
+            B_col,
+            ldb_cublas,
+            beta_ptr,
+            C_col,
+            ldc_cublas,
+        )
+        return C_col
+    return torch_gemm_reference(A_row, B_row, C_row, transa, transb, alpha, beta)
 
 
 def gems_zgemm_wrapper(
@@ -126,7 +135,7 @@ class ZgemmBenchmark(GemmBenchmark):
 def _run_zgemm_benchmark(op_name, transa, transb):
     bench = ZgemmBenchmark(
         op_name=op_name,
-        torch_op=cublas_zgemm,
+        torch_op=zgemm_reference,
         gems_op=gems_zgemm_wrapper,
         dtypes=[torch.complex128],
         transa=transa,
@@ -143,7 +152,7 @@ def _run_zgemm_benchmark(op_name, transa, transb):
     if not Config.skip_correctness:
         for cur_dtype in bench.to_bench_dtypes:
             for A, B, C, kwargs in bench.get_input_iter(cur_dtype):
-                torch_result = cublas_zgemm(A, B, C.clone(), **kwargs)
+                torch_result = zgemm_reference(A, B, C.clone(), **kwargs)
                 gems_result = gems_zgemm_wrapper(A, B, C.clone(), **kwargs)
                 k = kwargs.get("k", 0)
                 bench.validate_results(torch_result, gems_result, k, tolerance=1e-8)
