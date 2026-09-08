@@ -41,8 +41,12 @@ from flag_blas.ops.level3.bfgemm import (
 from flag_blas.runtime import torch_device_fn
 
 # TN 复合转置内核 tile; 末维(load 沿 m, store 沿 k)均连续可向量化
-_TN_TRANS_BLOCK_M = 64
-_TN_TRANS_BLOCK_K = 64
+# dir4 (2026-09-07): 转置 tile 64x64 w4 -> 128x128 w8。扫描 5 个 NN-route B 形状
+# (8192/28672/24576/12288/11008 x ...), 带宽 811-903GB/s -> 1027-1144GB/s
+# (+16~+34%, torch copy 天花板仅 ~610GB/s)。路由净收 NN ~2-5%、TN ~4-7%,
+# 仍全部 <0.8 (主内核差 = fork 级, 见报告 §10)。
+_TN_TRANS_BLOCK_M = 128
+_TN_TRANS_BLOCK_K = 128
 
 # ---- 16 大 shape 编译器对齐 (2026-09-07): NN 主内核 sched_latency per-shape 门控 ----
 # flagtree clang 延迟布局 (-mmac-latency=5 + -ds-load-store-latency) 收益随生产 tile 分群:
@@ -502,7 +506,7 @@ def bfgemm(
                     k,
                     BR=_TN_TRANS_BLOCK_K,
                     BC=_TN_TRANS_BLOCK_M,
-                    num_warps=4,
+                    num_warps=8,
                 )
                 _bfgemm_nt_kernel[grid](
                     A, Bt, C, alpha, beta, m, n, k, lda, k, ldc, beta_is_zero,
@@ -530,7 +534,7 @@ def bfgemm(
                     k,
                     BR=_TN_TRANS_BLOCK_K,
                     BC=_TN_TRANS_BLOCK_M,
-                    num_warps=4,
+                    num_warps=8,
                 )
                 bm, bn = _tn_y_tiles(m, n, k)
                 gy = (triton.cdiv(m, bn) * triton.cdiv(n, bm),)
@@ -568,7 +572,7 @@ def bfgemm(
                     k,
                     BR=_TN_TRANS_BLOCK_K,
                     BC=_TN_TRANS_BLOCK_M,
-                    num_warps=4,
+                    num_warps=8,
                 )
                 if (m, n, k) in _TN_NT_ROUTE_SHAPES:
                     # 方向① TN: 再补 B(k,n)->Bt(n,k) (行 stride=k), At+Bt 走 NT 主内核
@@ -586,7 +590,7 @@ def bfgemm(
                         k,
                         BR=_TN_TRANS_BLOCK_K,
                         BC=_TN_TRANS_BLOCK_M,
-                        num_warps=4,
+                        num_warps=8,
                     )
                     _bfgemm_nt_kernel[grid](
                         At, Bt, C, alpha, beta, m, n, k, k, k, ldc, beta_is_zero,
