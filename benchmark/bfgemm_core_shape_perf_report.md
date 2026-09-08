@@ -506,3 +506,46 @@ sp 估计用 v9 官跑同进程 torch 基线（8192³ NN 3.2994 / TN 3.0233 等�
 - **回归检查点（非白名单无回退）**：NN 512×16384×4096 复现 v10（0.4387 vs 0.4389，门控排除生效）；TN 1024³ 1.154 / 128×4096×1024 0.942 保持 direct-TN v8 基线（排除生效）；TT direct-TT 大 shape 路径未触碰；pad-odd 与 NT/NN 小 shape（512³ 等）噪声内（≤±1%）。v11 = NN/TN/NT 三套件全 PASS、rc=0（424.87s，log `dir2_kp2_official_v11_nntnnt.log`）。
 - **数值**：kp2 官跑正确性 PASS（相对误差与 base 同量级 4e-3，bf16 无损路径）；beta=1.5 / alpha=0.5 抽查一致。
 - **结论**：方向② 编译器侧对齐在**不改内核源码、不 fork LLVM** 前提下用 HIPOptions 原生 kpack=2 兑现 NT 主内核全谱 -1.6~-3.8%、NN/TN 路由 -0.5~-3.6%（NN 残留白名单 (2048,11008,4096) -4.5%）。**NT 两个 shape 首次过线**：8192×28672×8192 sp 0.855（>0.85）、8192³ sp 0.906（>0.9）。NN 侧 8192³ 0.748→0.775、4096³ 0.818→0.824、TN 8192³ 0.641→0.663 仍 <0.85——方向①转置 + 方向② kpack 叠加后，NN/TN 残余缺口即 §4 结构上限（v_mmac 16×16×16 双速率 vs rocBLAS v_mfma），根治项（双累加器链、k-unroll、LDS swizzle 对齐 Tensile）属 fork 级重构，超出当前门控范围，暂缓。
+
+## 10. NN/TN 侧瓶颈分析 + fork 级重构方案（方向③，2026-09-07）
+
+### 10.1 现状拆解（v11 官跑 + SASS 口径）
+
+**v11 后 NN/TN 侧残差只剩三类路径**（§9 表；torch/rocBLAS 基线取同进程 json 值）：
+- **R1 = 路由到 NT 主内核(kpack=2) + transA/transB**：NN 8 dims sp 0.646–0.824、TN 4 dims sp 0.640–0.689。主内核已达 279TF(8192³)/281TF(8192×28672) 级，torch/rocBLAS 同 shape 参考 329–368TF（NN 8192³ 3.298ms=333TF、8192×28672 10.735ms=358TF、TN 同 shape 368TF）——**残余缺口 ≈ 主内核调度差 10–22% + 转置税 ~7%**。
+- **R2 = NN 主内核直路**：2048×11008×4096 sp 0.734（~190TF）、512×16384×4096 0.649——NN 布局发射面 (~60% 效率) 未对齐，是**最大单缺口**。
+- **R3 = fused-Y / direct-TN / TT**：不属 §4 第 1 类问题，本方案不触碰。
+
+**旗舰 shape 账本（8192³ NN，v11）**：flag 4.2534ms = NT-kp2 主内核 3.9455 + transB 0.318（税 7.5%）；对 0.85 线（torch 3.298/0.85 = 3.88ms）：R1 保持转置税需主内核 ≤3.56ms（279→**309TF，+10.7%**）；免转置需 NN-native 主内核 ≤3.88ms（198→**284TF，+43%**）。8192×28672 同口径需主内核 281→336TF（+19%，≈rocBLAS 峰值 94%）——**单 shape 到 0.85 的期望值边界清晰，量级即 fork 对齐 Tensile 的最后 10–20% 发射/调度**。
+
+**SASS 发射统计（dir2_sass_analyze，旗舰 config）**：
+
+| 内核(形态) | inst | mmac | v_perm | ds_read | wait | max_consec | 每 mmac 附随 inst |
+|---|---|---|---|---|---|---|---|
+| NN 256×256 BK64 w8 ds12（NN 冠军 198TF） | 6947 | 768 | 480 | 560 | 511 | **8** | ~9.0 |
+| NN 128×256 BK32 w4 ds10（4096³ 族） | 4256 | 384 | 368 | 276 | 130 | 32 | ~11.1 |
+| NT 256×256 w16 base（268TF 冠军） | 3409 | 384 | 32 | 168 | 194 | 14 | ~8.9 |
+| NT 256×256 w16 kp2（§9，302TF→实 279TF@8192³） | 3164 | — | — | 112 | 148 | **60** | ~8.2 |
+
+- NN-ds12 冠军 vs NT-w16：**v_perm 480 vs 32**（B 片段 LDS→寄存器布局要 v_perm 重排，NN 每 mmac ~0.63 条 vs NT ~0.08）、**wait 511 vs 194**（ds 延迟未用双缓冲掩盖）、**max_consec 8 vs 14**（kp2 60）——198 vs 279TF 的差全部落在这三项发射统计上，非指令宽度（同一条 v_mmac_f32_16x16x16_bf16）。
+- kp2 已验证方向：4 累加器共享同一 A frag 连发（14→60）+ wait 194→148 直接兑现 -3.8%（§9）——**证明"调度形态 = 吞吐"在本机成立，fork 重构的收益天花板即此曲线向 rocBLAS 形态继续推进**。
+- rocBLAS 参考内核形态（carve 自 librocblas.so.4.1，`locate_tensile_obj.py`）：`Cijk_Ailk_Bjlk_BBH_MT256x256x16_SE_AMAS3`——宏 tile 256×256、K 指令级 16、A/B k 主序片段、流式多级流水；obj 已落 `diag_scratch/tensile_bf16_obj.co` + `rocblas_co2/obj_*.co` 供 Phase 0 反汇编。
+
+### 10.2 fork 级重构方案（方向③）
+
+**前提**：本工作区只有已装 python 侧（`site-packages/triton/backends/hcu/compiler_hcu.py`）；C++ pass（flagtree fork）不在工作区（grep `AccelerateMatmul/mmac-latency` 无命中）——**Phase 0 需先拉取 fork 源码 + DTK(ai)LLVM 构建链到本机**。python 侧现成透传管道：`add_accelerate_matmul(pm, arch, matrix_instr_nonkdim, kpack, mmac_layout_force)`（compiler_hcu.py:444）与 `insert_instruction_sched_hints(pm, hint)`（:487），`mmac_layout_force` 内建枚举注释 = 0 mfma / 1 mmac legacy / **2 mmac interleave / 3 mmac transpose / 4 interleave+transpose**。
+
+**Phase 0 —— Tensile 基线档案（先于一切改动）**：对 `tensile_bf16_obj.co`/`rocblas_co2` 中 bf16 命中内核做 `ai-llvm-objdump -d`：统计 v_mmac 密度、acc 链长度与交错方式、LDS swizzle 地址序列、s_waitcnt 结构、寄存器占用（.saddr/vgpr）、全局读模式（buffer/lds 分块）。产出"目标形态档案"，作为后续每个 fork 变体的对齐基准与量化靶。同时锁定 fork 仓库/构建环境，建立"每变体一次 fork 编译 → 缓存 key 隔离 → 官跑对照"的回归环（基线 = §9 v11 表）。
+
+**Phase 1 —— 现有管道内先收割（不新增 pass，先修/试现成开关）**：
+1. **修 mmac_layout_force 并测 2/4**：v11 探针只测通默认(-1)/1；0 数值错（fp32-oracle err 1.38）、3 编译败（汇编器拒 lit/lts 后缀）需 fork 修；**2 "interleave" 与 4 "interleave+transpose" 正是"双累加器链 + 片段布局对齐"的现成实现，从未测通**——最高优先级试射。若 2/4 在 NT/NN 主内核达 -3~-5%，R1 的 8192³ NN 即过 0.85（需 -10.7% 总账，kp2 -3.8% 已近半）。
+2. **sched_latency 加 "tensile" variant**：在调度提示管道内模仿 Tensile 稳态循环——BK 组间无 wait 的 mmac 连发 + 1×LDS/1×reg 预取（后端已有 "local-prefetch" 变体作骨架，compiler_hcu.py:76–88），按 Tensile 参数化 mmac-latency 与 ds 预取深度，替代现在 ds10/ds12 的粗粒度手调。
+
+- **Phase 1 试跑（dir3_phase1_layout_probe，2026-09-07，负结果 = fork 前置证实）**：在现有管道（不改内核/不 fork）对 `mmac_layout_force` ∈ {2 interleave, 4 interleave+transpose} 及 kp2 组合，NT/NN 主内核 × 4 旗舰 shape 全部 **HSACOError 编译失败**——DTK gfx936 汇编器逐条报 "The lit and lts field not support on this GPU."（~50+ 处，与 3 transpose 同根因）：interleave/transpose 布局通路发射的 VOP3 指令带 lit/lts 字段，gfx936 MC layer 不支持。base/kp2 基线同列复现（nt_8192 base 4.1021ms、kp2 -3.56/-3.88/-3.89/-4.46%，与 §9 v11 官跑一致）。**结论：Phase 1 现成开关试尽且不可用——"双累加器链/片段布局对齐"必须经 fork 修 lit/lts 发射（该通路带 lit/lts 字段的编码物化为 s_mov+v_mov 位选、或关闭该 feature select）后才能触达**；sched "tensile" variant 同属 fork 新增，本不在现有管道。Phase 2 前置 = 该 fork 修复。
+
+**Phase 2 —— fork pass 真对齐（Tensile 形态三杠杆，对应 §10.1 三项发射统计）**：
+- **杠杆 a：双累加器链（interleave）**——tl.dot 的 acc 在 k 内分裂为两条独立链交错发射，掩盖 v_mmac 依赖延迟并消除 mmac 间 `s_waitcnt lgkmcnt`（kp2 已把 max_consec 14→60、wait 194→148；目标是 Tensile 级：零 wait 连发且 NN 布局同样受益）。
+- **杠杆 b：k-unroll 深度**——每 LDS 阶段多 k-tile（现 BK64/s2），摊还 barrier/s_waitcnt/指针更新；NT-w16 3409 条指令已证 256×256×BK64 寄存器预算够跑 w16，可再提 unroll 档位，联动寄存器分配。
+- **杠杆 c：LDS swizzle 对齐 Bjlk**——把 NN 布局 B 片段的 LDS 写布局改为 Tensile k 主序 swizzle，使 ds_read 直出 v_mmac 片段、**v_perm 480→~0**（NN 主内核 198→~280TF 的最大单杠杆）；同时使 NN 布局直路（免 transB）可行——**这是消除 R1 转置税 + 修复 R2 的同一根因**（mmac_layout_force=3/4 的 transpose 通路即其雏形，修编译败后复用）。
+
+**Phase 3 —— 验收/放量门控**：每杠杆独立提交 + HIPOptions 值入编译缓存 key（产物自动隔离）；正确性 37×4（fp32 oracle，β=0/非 0）PASS 后才进延迟对照（vs §9 v11 表，flag 自比口径，torch 漂移同 §3）；沿用 §9 门控模式（per-kernel/per-shape 注入白名单，无回退才放）。量化目标：NT/NN 主内核 279→~310TF（+10%，NN 8192³ R1 达 0.85）为近程里程碑；NN-native 198→284TF（+43%）为免转置达标的中程里程碑；TN 8192³ 0.663→0.85 需同型（其 torch 基线 3.025ms=364TF，需内核 ~310TF + 双转置税压低）。风险 gate：编译败(3)/数值错(0)类问题修一个放一个；小 shape/窄 m 系列不触碰（config 层现状保留）。
