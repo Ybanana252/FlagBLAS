@@ -194,7 +194,7 @@ def _make_case(n, dtype, uplo, diag, incx, device):
     torch.manual_seed(n + 17 * int(uplo) + 31 * int(diag) + 43 * int(incx))
     build_device = (
         "cpu"
-        if flag_blas.vendor_name == "ascend" and dtype == torch.complex64
+        if flag_blas.vendor_name in {"ascend", "mthreads"} and dtype == torch.complex64
         else device
     )
     AP = tpsv_randn(n * (n + 1) // 2, dtype=dtype, device=build_device) * 0.05
@@ -493,7 +493,7 @@ def test_tpsv_n_zero_is_noop(op, dtype):
 @pytest.mark.parametrize("uplo", [CUBLAS_FILL_MODE_UPPER, CUBLAS_FILL_MODE_LOWER])
 def test_tpsv_unit_diag_ignores_stored_diagonal(op, dtype, uplo):
     if (
-        flag_blas.vendor_name == "ascend"
+        flag_blas.vendor_name in {"ascend", "mthreads"}
         and dtype in (torch.float64, torch.complex128)
         and not flag_blas.runtime.device.support_fp64
     ):
@@ -502,7 +502,7 @@ def test_tpsv_unit_diag_ignores_stored_diagonal(op, dtype, uplo):
     AP, x = _make_case(n, dtype, uplo, CUBLAS_DIAG_UNIT, 1, flag_blas.device)
     build_device = (
         "cpu"
-        if flag_blas.vendor_name == "ascend" and dtype == torch.complex64
+        if flag_blas.vendor_name in {"ascend", "mthreads"} and dtype == torch.complex64
         else flag_blas.device
     )
     dirty = AP.to(build_device).clone()

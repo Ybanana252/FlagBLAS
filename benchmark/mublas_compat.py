@@ -78,7 +78,7 @@ class _MuBLASLibrary:
                 values[1] = {0: 111, 1: 112, 2: 113}.get(raw, raw)
             if len(values) > 1 and any(
                 token in lname
-                for token in ("hemv", "hbmv", "symv", "spmv", "sbmv", "her", "syr", "spr", "hpr")
+                for token in ("hemv", "hbmv", "hpmv", "symv", "spmv", "sbmv", "her", "syr", "spr", "hpr")
             ):
                 raw = enum_value(values[1])
                 values[1] = {0: 122, 1: 121}.get(raw, raw)

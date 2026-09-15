@@ -238,9 +238,12 @@ def _row_major_diag_offsets(n, uplo, device):
 def _make_case(n, dtype, uplo, diag, device):
     AP = torch.randn(n * (n + 1) // 2, dtype=dtype, device=device) * 0.02
     if diag == CUBLAS_DIAG_NON_UNIT:
-        AP[_row_major_diag_offsets(n, uplo, device)] = (
-            (2.0 + 0.25j) if dtype.is_complex else 2.0
-        )
+        offsets = _row_major_diag_offsets(n, uplo, device)
+        if IS_MTHREADS and dtype.is_complex:
+            torch.view_as_real(AP)[offsets, 0] = 2.0
+            torch.view_as_real(AP)[offsets, 1] = 0.25
+        else:
+            AP[offsets] = (2.0 + 0.25j) if dtype.is_complex else 2.0
     x = torch.randn(n, dtype=dtype, device=device)
     return AP.contiguous(), x.contiguous()
 

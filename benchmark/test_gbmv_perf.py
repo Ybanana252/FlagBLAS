@@ -299,11 +299,7 @@ gems_zgbmv_wrapper = _gems_wrapper(flag_blas.zgbmv)
 
 def _generate_banded_AB(m, n, kl, ku, lda, dtype, device):
     """Generate equivalent row-major and column-major band storage."""
-    # Current TorchMUSA does not implement vectorized IndexPut for complex
-    # tensors.  Build the small band-storage reference on the host in that
-    # case and transfer it once; this affects only benchmark setup, not the
-    # measured BLAS call.
-    storage_device = "cpu" if IS_MTHREADS else device
+    storage_device = device
     row_AB = torch.zeros((m, lda), dtype=dtype, device=storage_device)
     column_AB = torch.zeros((n, lda), dtype=dtype, device=storage_device)
     for d in range(-ku, kl + 1):
@@ -316,8 +312,13 @@ def _generate_banded_AB(m, n, kl, ku, lda, dtype, device):
                 vals = torch.randn(len(j_idx), dtype=dtype, device=storage_device)
             else:
                 vals = torch.randn(len(j_idx), dtype=dtype, device=storage_device) * 0.1
-            row_AB[i_idx, kl - d] = vals
-            column_AB[j_idx, ku + d] = vals
+            if IS_MTHREADS and dtype.is_complex:
+                # TorchMUSA complex indexing is unsupported; write real views.
+                torch.view_as_real(row_AB)[i_idx, kl - d] = torch.view_as_real(vals)
+                torch.view_as_real(column_AB)[j_idx, ku + d] = torch.view_as_real(vals)
+            else:
+                row_AB[i_idx, kl - d] = vals
+                column_AB[j_idx, ku + d] = vals
     return row_AB.contiguous().to(device), column_AB.contiguous().to(device)
 
 

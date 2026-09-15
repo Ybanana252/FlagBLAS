@@ -263,7 +263,12 @@ def _generate_triangular_A(n, lda, uplo, diag, dtype, device):
         valid = row_idx <= col_idx
     else:
         valid = row_idx >= col_idx
-    A[:, :n] = vals.masked_fill(~valid, 0.0)
+    if IS_MTHREADS and dtype.is_complex:
+        torch.view_as_real(A)[:, :n] = torch.view_as_real(vals).masked_fill(
+            ~valid.unsqueeze(-1), 0.0
+        )
+    else:
+        A[:, :n] = vals.masked_fill(~valid, 0.0)
     if diag == CUBLAS_DIAG_NON_UNIT:
         diag_vals = torch.diagonal(vals).clone()
         if dtype.is_complex:
@@ -271,7 +276,10 @@ def _generate_triangular_A(n, lda, uplo, diag, dtype, device):
         else:
             diag_vals = diag_vals + 2.0
         idx = torch.arange(n, device=device)
-        A[idx, idx] = diag_vals
+        if IS_MTHREADS and dtype.is_complex:
+            torch.view_as_real(A)[idx, idx] = torch.view_as_real(diag_vals)
+        else:
+            A[idx, idx] = diag_vals
     return A.contiguous()
 
 
