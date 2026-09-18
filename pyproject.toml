@@ -48,6 +48,9 @@ nvidia-cuda128 = [
     "cupy-cuda12x",
 ]
 
+thead = [
+    "cupy-cuda12x",
+]
 # Hygon DCU (ROCm/HIP): pinned DTK-patched torch from the flagos-pypi-hygon index.
 hygon = [
     #"torch==2.4.1+das.opt2.dtk2604",
