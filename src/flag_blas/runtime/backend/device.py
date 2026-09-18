@@ -115,6 +115,8 @@ class DeviceDetector(object):
         return None
 
     def _get_vendor_from_env(self):
+        if os.environ.get("PPU_SDK") or os.environ.get("PPU_HOME"):
+            return "thead"
         device_from_evn = os.environ.get("BLAS_VENDOR")
         return None if device_from_evn not in self.vendor_list else device_from_evn
 
