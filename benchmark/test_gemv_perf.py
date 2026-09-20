@@ -974,7 +974,6 @@ class HalfGemvBenchmark(GemvBenchmark):
 
         for shape in self.shapes:
             m, n = shape
-
             A_row = torch.randn(m, n, dtype=cur_dtype, device=self.device).contiguous()
 
             x_len, y_len = (n, m) if self.trans == CUBLAS_OP_N else (m, n)

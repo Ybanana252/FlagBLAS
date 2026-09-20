@@ -170,6 +170,15 @@ def pytest_configure(config):
         )
 
 
+def pytest_collection_modifyitems(config, items):
+    if flag_blas.vendor_name != "thead" or config.getoption("--ref") != "cuda":
+        return
+
+    from .thead_l2_reference import skip_unsupported_l2_references
+
+    skip_unsupported_l2_references(items)
+
+
 def pytest_runtest_teardown(item, nextitem):
     if not RECORD_LOG:
         return
