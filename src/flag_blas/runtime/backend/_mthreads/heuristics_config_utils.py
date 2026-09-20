@@ -12,11 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Moore Threads heuristic configuration.
-
-Level 2 kernels currently use static tune configurations.  Keep a vendor
-module in place so loading the MUSA backend never imports CUDA-only heuristic
-helpers by accident.
-"""
-
 HEURISTICS_CONFIGS = {}

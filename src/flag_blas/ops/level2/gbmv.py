@@ -21,7 +21,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas import runtime
 from flag_blas.ops.level2._constants import CUBLAS_OP_C, CUBLAS_OP_N, CUBLAS_OP_T
 from flag_blas.runtime import torch_device_fn
 
@@ -50,17 +49,6 @@ _SGBMV_T_CONFIGS = [
     triton.Config({"BLOCK_SIZE_M": 128, "BAND_TILE": 32}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_SIZE_M": 64, "BAND_TILE": 64}, num_warps=4, num_stages=2),
 ]
-
-# The MUSA Triton backend currently miscompiles the 64-wide reduction used by
-# this candidate. Keep every other tuning candidate and leave other vendors'
-# configuration sets unchanged.
-if runtime.device.vendor_name == "mthreads":
-    _SGBMV_N_CONFIGS = [
-        config for config in _SGBMV_N_CONFIGS if config.kwargs["BAND_TILE"] < 64
-    ]
-    _SGBMV_T_CONFIGS = [
-        config for config in _SGBMV_T_CONFIGS if config.kwargs["BAND_TILE"] < 64
-    ]
 
 _SGBMV_SPLIT_BAND_CONFIGS = [
     triton.Config({"BLOCK_SIZE_M": 32, "BAND_TILE": 16}, num_warps=2, num_stages=1),
@@ -195,8 +183,7 @@ def sgbmv_n_kernel(
         j = rows[:, None] + d[None, :]
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = safe_band_row[None, :] + safe_j * LDA
+        a_off = band_row[None, :] + safe_j * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_j * INCX, mask=mask, other=0.0)
         acc += tl.sum(a_vals * x_vals, axis=1)
@@ -246,9 +233,7 @@ def sgbmv_t_kernel(
         i = cols[:, None] + e[None, :]
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = safe_band_row[None, :] + safe_cols[:, None] * LDA
+        a_off = band_row[None, :] + cols[:, None] * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_i * INCX, mask=mask, other=0.0)
         acc += tl.sum(a_vals * x_vals, axis=1)
@@ -304,8 +289,7 @@ def sgbmv_n_split_band_kernel(
         j = rows[:, None] + d[None, :]
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = safe_band_row[None, :] + safe_j * LDA
+        a_off = band_row[None, :] + safe_j * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_j * INCX, mask=mask, other=0.0)
         acc += tl.sum(a_vals * x_vals, axis=1)
@@ -356,9 +340,7 @@ def sgbmv_t_split_band_kernel(
         i = cols[:, None] + e[None, :]
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = safe_band_row[None, :] + safe_cols[:, None] * LDA
+        a_off = band_row[None, :] + cols[:, None] * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_i * INCX, mask=mask, other=0.0)
         acc += tl.sum(a_vals * x_vals, axis=1)
@@ -449,8 +431,7 @@ def dgbmv_t_kernel(
         band_row = KU + e
         mask = col_mask & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        a_off = band_row + safe_cols * LDA
+        a_off = band_row + cols * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_i * INCX, mask=mask, other=0.0)
         acc += a_vals * x_vals
@@ -551,8 +532,7 @@ def dgbmv_t_split_band_kernel(
         band_row = KU + e
         mask = col_mask & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        a_off = band_row + safe_cols * LDA
+        a_off = band_row + cols * LDA
         a_vals = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + safe_i * INCX, mask=mask, other=0.0)
         acc += a_vals * x_vals
@@ -601,8 +581,7 @@ def cgbmv_n_kernel(
         j = rows[:, None] + d[None, :]
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_j * LDA) * 2
+        a_off = (band_row[None, :] + safe_j * LDA) * 2
         x_off = safe_j * INCX * 2
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         ai = tl.load(a_ptr + a_off + 1, mask=mask, other=0.0)
@@ -665,9 +644,7 @@ def cgbmv_t_kernel(
         i = cols[:, None] + e[None, :]
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_cols[:, None] * LDA) * 2
+        a_off = (band_row[None, :] + cols[:, None] * LDA) * 2
         x_off = safe_i * INCX * 2
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         ai = tl.load(a_ptr + a_off + 1, mask=mask, other=0.0)
@@ -735,8 +712,7 @@ def cgbmv_n_split_band_kernel(
         j = rows[:, None] + d[None, :]
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_j * LDA) * 2
+        a_off = (band_row[None, :] + safe_j * LDA) * 2
         x_off = safe_j * INCX * 2
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         ai = tl.load(a_ptr + a_off + 1, mask=mask, other=0.0)
@@ -799,9 +775,7 @@ def cgbmv_t_split_band_kernel(
         i = cols[:, None] + e[None, :]
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_cols[:, None] * LDA) * 2
+        a_off = (band_row[None, :] + cols[:, None] * LDA) * 2
         x_off = safe_i * INCX * 2
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
         ai = tl.load(a_ptr + a_off + 1, mask=mask, other=0.0)
@@ -864,8 +838,7 @@ def zgbmv_n_kernel(
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
 
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_j * LDA) * 2
+        a_off = (band_row[None, :] + safe_j * LDA) * 2
         x_off = safe_j * INCX * 2
 
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
@@ -936,9 +909,7 @@ def zgbmv_t_kernel(
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
 
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_cols[:, None] * LDA) * 2
+        a_off = (band_row[None, :] + cols[:, None] * LDA) * 2
         x_off = safe_i * INCX * 2
 
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
@@ -1012,8 +983,7 @@ def zgbmv_n_split_band_kernel(
         mask = row_mask[:, None] & band_mask[None, :] & (j >= 0) & (j < n)
         safe_j = tl.where(mask, j, 0)
 
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_j * LDA) * 2
+        a_off = (band_row[None, :] + safe_j * LDA) * 2
         x_off = safe_j * INCX * 2
 
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)
@@ -1082,9 +1052,7 @@ def zgbmv_t_split_band_kernel(
         mask = col_mask[:, None] & band_mask[None, :] & (i >= 0) & (i < m)
         safe_i = tl.where(mask, i, 0)
 
-        safe_cols = tl.where(col_mask, cols, 0)
-        safe_band_row = tl.where(band_mask, band_row, 0)
-        a_off = (safe_band_row[None, :] + safe_cols[:, None] * LDA) * 2
+        a_off = (band_row[None, :] + cols[:, None] * LDA) * 2
         x_off = safe_i * INCX * 2
 
         ar = tl.load(a_ptr + a_off, mask=mask, other=0.0)

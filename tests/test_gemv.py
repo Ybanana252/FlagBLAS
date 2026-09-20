@@ -1035,7 +1035,7 @@ def test_accuracy_sgemv(m, n, trans, beta):
     ref_y = gemv_reference(trans, m, n, alpha, A_col, m, x, 1, beta, y, 1)
     flag_blas.sgemv(trans, m, n, alpha, A_row, n, x, 1, beta, y, 1)
 
-    if TO_CPU:
+    if TO_CPU or IS_MTHREADS:
         blas_assert_close(y, ref_y, dtype, reduce_dim=x_len)
     else:
         tol = min(1e-5 * (x_len**0.5), 1e-3)

@@ -12,84 +12,259 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Conservative Level 2 launch configurations validated with Triton-MUSA.
-sgemv_n:
-  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-sgemv_t:
-  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-sgemv_n_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
+# GEMV candidate tiles, selected by libtuner; split counts stay with the algorithm.
+mthreads_sgemv:
+  - META: {BM: 1, BK: 128}
+    num_warps: 4
     num_stages: 1
-sgemv_t_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
     num_stages: 1
-cgemv_n:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-cgemv:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-cgemv_n_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
     num_stages: 1
-cgemv_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
     num_stages: 1
-hgemv_n:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-hgemv_t:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 1}
-    num_warps: 1
-    num_stages: 2
-hgemv_n_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
+  - META: {BM: 16, BK: 256}
+    num_warps: 4
     num_stages: 1
-hgemv_t_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 1
-bfgemv_n:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 2
-bfgemv_t:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 1}
-    num_warps: 1
-    num_stages: 2
-bfgemv_n_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 1
-bfgemv_t_splitk:
-  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 32}
-    num_warps: 1
-    num_stages: 1
-
-# Triton-MUSA miscompiles the shared 64 x 64 complex reduction candidate for
-# large CTRMV inputs. These four candidates are numerically stable on MUSA.
-ctrmv:
-  - META: {BLOCK_SIZE_M: 32, BLOCK_K: 16}
-    num_warps: 2
-    num_stages: 1
-  - META: {BLOCK_SIZE_M: 32, BLOCK_K: 32}
-    num_warps: 2
-    num_stages: 2
-  - META: {BLOCK_SIZE_M: 64, BLOCK_K: 32}
+  - META: {BM: 4, BK: 512}
     num_warps: 4
     num_stages: 2
-  - META: {BLOCK_SIZE_M: 128, BLOCK_K: 32}
-    num_warps: 8
+  - META: {BM: 64, BK: 64}
+    num_warps: 4
+    num_stages: 1
+mthreads_hgemv:
+  - META: {BM: 512, BK: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
     num_stages: 2
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 128, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 32}
+    num_warps: 4
+    num_stages: 1
+mthreads_cgemv:
+  - META: {BM: 4, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 16}
+    num_warps: 4
+    num_stages: 2
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
+    num_stages: 2
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 32, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BM: 4, BK: 256}
+    num_warps: 8
+    num_stages: 1
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BM: 1, BK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 1
+mthreads_bfgemv:
+  - META: {BM: 1, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 512, BK: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 512}
+    num_warps: 4
+    num_stages: 2
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 128, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 32}
+    num_warps: 4
+    num_stages: 1
+mthreads_sgemv_tiny_t:
+  - META: {BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BK: 1024}
+    num_warps: 4
+    num_stages: 1
+mthreads_hgemv_tiny_t:
+  - META: {BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BK: 1024}
+    num_warps: 4
+    num_stages: 1
+mthreads_bfgemv_tiny_t:
+  - META: {BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+# GBMV tiles shared across matrix sizes, bandwidths and transpose modes.
+mthreads_sgbmv:
+  - META: {BM: 4, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
+    num_stages: 1
+mthreads_cgbmv:
+  - META: {BM: 4, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 128, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+# Output-owned reductions: shared tiles, without global partial buffers.
+mthreads_symv:
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 64}
+    num_warps: 4
+    num_stages: 1
+mthreads_hemv:
+  - META: {BM: 4, BK: 128}
+    num_warps: 4
+    num_stages: 1
+
+mthreads_trmv:
+  - META: {BM: 1, BK: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 1, BK: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 1, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 2, BK: 128}
+    num_warps: 4
+    num_stages: 1
+
+mthreads_tbmv:
+  - META: {BM: 1, BK: 8}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 1, BK: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 32, BK: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 8, BK: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 2, BK: 128}
+    num_warps: 4
+    num_stages: 1
+
+mthreads_tpmv:
+  - META: {BM: 16, BK: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 32, BK: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 64}
+    num_warps: 16
+    num_stages: 1
