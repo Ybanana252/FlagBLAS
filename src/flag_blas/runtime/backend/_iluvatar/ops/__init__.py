@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .group_gemm import group_bfgemm
 from .nrm2 import dnrm2, dznrm2, scnrm2, snrm2
 from .tbsv import stbsv
 
 __all__ = [
+    "group_bfgemm",
     "stbsv",
     "snrm2",
     "dnrm2",

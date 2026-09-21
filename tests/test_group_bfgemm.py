@@ -9,12 +9,15 @@ from . import accuracy_utils as utils
 from .conftest import TO_CPU
 
 IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_ILUVATAR = flag_blas.vendor_name == "iluvatar"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
 
 if IS_ASCEND:
     torch_npu = pytest.importorskip("torch_npu")
+elif IS_ILUVATAR:
+    from ixformer import moe_w16a16_group_gemm
 elif IS_MTHREADS:
-    from flag_blas.runtime.backend._mthreads.ops.group_gemm import group_bfgemm
+    pass
 else:
     import ctypes
     import ctypes.util
@@ -38,7 +41,9 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on the system.")
 
 
-_cublas = load_cublas() if not IS_ASCEND and not IS_MTHREADS else None
+_cublas = (
+    load_cublas() if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS else None
+)
 
 
 def _cublasGemmGroupedBatchedEx(
@@ -87,7 +92,7 @@ def _cublasGemmGroupedBatchedEx(
     )
 
 
-if not IS_ASCEND and not IS_MTHREADS:
+if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS:
     cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
 
 
@@ -255,6 +260,63 @@ def cublas_group_gemm_reference(group_A, group_B, group_C, offs_table, alpha, be
 
 
 @pytest.mark.group_gemm
+@pytest.mark.skipif(not IS_ILUVATAR, reason="Iluvatar empty-output contract")
+@pytest.mark.parametrize("e,m,n", [(0, 0, 128), (4, 0, 128), (4, 17, 0)])
+def test_iluvatar_group_gemm_empty(e, m, n):
+    a = torch.empty(m, 64, device=flag_blas.device, dtype=torch.bfloat16)
+    b = torch.empty(e, 64, n, device=a.device, dtype=a.dtype)
+    ends = torch.full((e,), m, device=a.device, dtype=torch.int64)
+    out = torch.empty(m, n, device=a.device, dtype=a.dtype)
+    assert flag_blas.group_bfgemm(a, b, ends, out) is out
+
+
+@pytest.mark.group_gemm
+@pytest.mark.skipif(not IS_ILUVATAR, reason="Iluvatar cumulative-boundary regression")
+@pytest.mark.parametrize(
+    "counts,k,n",
+    [
+        ([0, 1, 31, 0, 65], 64, 128),
+        ([2, 17, 0, 129], 96, 192),
+        ([0, 33, 1, 0, 257], 65, 129),
+    ]
+    + [([0] * (e - 2) + [1, 4097], 64, 128) for e in (16, 17, 32, 64, 128, 512)],
+)
+def test_iluvatar_group_gemm_boundaries(counts, k, n):
+    # Pad only the vendor reference to meet its GEMM alignment requirements.
+    padded_k = (k + 31) // 32 * 32
+    padded_n = (n + 31) // 32 * 32
+    a = torch.randn(sum(counts), k, device=flag_blas.device, dtype=torch.bfloat16)
+    b = torch.randn(len(counts), k, n, device=flag_blas.device, dtype=torch.bfloat16)
+    ref_a = torch.zeros(sum(counts), padded_k, device=a.device, dtype=a.dtype)
+    ref_b = torch.zeros(len(counts), padded_n, padded_k, device=b.device, dtype=b.dtype)
+    ref_a[:, :k].copy_(a)
+    ref_b[:, :n, :k].copy_(b.transpose(1, 2))
+    cpu_counts = torch.tensor(counts, dtype=torch.int32)
+    ends = cpu_counts.to(a.device).cumsum(0)
+    ref = moe_w16a16_group_gemm(ref_a, ref_b, torch.bfloat16, cpu_counts, format="TN")[
+        :, :n
+    ]
+    out = torch.empty(sum(counts), n, device=a.device, dtype=a.dtype)
+    assert flag_blas.group_bfgemm(a, b, ends, out) is out
+    utils.blas_assert_close(out, ref, torch.bfloat16, reduce_dim=k, atol=2e-4)
+
+
+@pytest.mark.group_gemm
+@pytest.mark.skipif(not IS_ILUVATAR, reason="Iluvatar group-list cache regression")
+def test_iluvatar_group_gemm_group_list_mutation():
+    a = torch.randn(40, 64, device=flag_blas.device, dtype=torch.bfloat16)
+    b = torch.randn(4, 64, 128, device=a.device, dtype=a.dtype)
+    out = torch.empty(40, 128, device=a.device, dtype=a.dtype)
+    ends = torch.tensor([0, 7, 40, 40], device=a.device, dtype=torch.int64)
+    for counts in ([0, 7, 33, 0], [1, 6, 33, 0]):
+        cpu_counts = torch.tensor(counts, dtype=torch.int32)
+        ends.copy_(cpu_counts.cumsum(0).to(a.device))
+        ref = moe_w16a16_group_gemm(a, b, torch.bfloat16, cpu_counts, format="NN")
+        assert flag_blas.group_bfgemm(a, b, ends, out) is out
+        utils.blas_assert_close(out, ref, torch.bfloat16, reduce_dim=64, atol=2e-4)
+
+
+@pytest.mark.group_gemm
 @pytest.mark.parametrize("k,e,n", utils.GROUP_GEMM_SHAPES)
 def test_accuracy_group_gemm(k, e, n):
     device = flag_blas.device
@@ -284,6 +346,24 @@ def test_accuracy_group_gemm(k, e, n):
         utils.blas_assert_close(group_out, group_ref, torch.bfloat16, reduce_dim=k)
         return
 
+    if IS_ILUVATAR:
+        group_A = torch.randn(total_M, k, dtype=torch.bfloat16, device=device)
+        group_B = torch.randn(e, k, n, dtype=torch.bfloat16, device=device)
+        tokens_per_experts = torch.tensor(m_list, dtype=torch.int32)
+        group_list = tokens_per_experts.to(device).cumsum(0)
+        ref = moe_w16a16_group_gemm(
+            group_A,
+            group_B.transpose(1, 2).contiguous(),
+            torch.bfloat16,
+            tokens_per_experts,
+            format="TN",
+        )
+        out = flag_blas.group_bfgemm(
+            group_A, group_B, group_list, torch.empty_like(ref)
+        )
+        utils.blas_assert_close(out, ref, torch.bfloat16, reduce_dim=k, atol=2e-4)
+        return
+
     if IS_MTHREADS:
         group_A = torch.randn(total_M, k, dtype=torch.bfloat16, device=device)
         group_B = torch.randn(e, k, n, dtype=torch.bfloat16, device=device)
@@ -297,7 +377,9 @@ def test_accuracy_group_gemm(k, e, n):
             ],
             dim=0,
         )
-        out = flag_blas.group_bfgemm(group_A, group_B, group_list, torch.empty_like(ref))
+        out = flag_blas.group_bfgemm(
+            group_A, group_B, group_list, torch.empty_like(ref)
+        )
         utils.blas_assert_close(out, ref, torch.bfloat16, reduce_dim=k, atol=2e-4)
         return
 
@@ -344,7 +426,7 @@ def test_accuracy_group_gemm(k, e, n):
 
 @pytest.mark.group_gemm
 @pytest.mark.skipif(
-    IS_ASCEND or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
 )
 def test_group_gemm_alpha_zero():
     m, k, e, n = 16, 64, 4, 128
@@ -368,7 +450,7 @@ def test_group_gemm_alpha_zero():
 
 @pytest.mark.group_gemm
 @pytest.mark.skipif(
-    IS_ASCEND or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
 )
 def test_group_gemm_beta_zero():
     m, k, e, n = 8, 32, 3, 64
@@ -395,7 +477,7 @@ def test_group_gemm_beta_zero():
     "alpha,beta", [(1.0, 0.0), (2.0, 0.0), (2.0, 0.5), (0.0, 1.0), (0.5, 1.5)]
 )
 @pytest.mark.skipif(
-    IS_ASCEND or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS, reason="Hopper-only alpha/beta interface"
 )
 def test_group_gemm_alpha_beta(alpha, beta):
     m, k, e, n = 32, 128, 2, 128
