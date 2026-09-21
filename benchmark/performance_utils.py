@@ -329,9 +329,10 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / Config.repetition * 1000
         elif Config.mode == BenchMode.KERNEL:
+            musa_testing = getattr(triton, "musa_testing", None)
             do_bench = (
-                triton.musa_testing.do_bench
-                if device == "musa"
+                musa_testing.do_bench
+                if device == "musa" and musa_testing is not None
                 else triton.testing.do_bench
             )
             latency = do_bench(
@@ -340,6 +341,11 @@ class Benchmark:
                 rep=Config.repetition,
                 return_mode="median",
                 grad_to_none=xs if self.is_backward else None,
+                **(
+                    {"device_type": "musa"}
+                    if device == "musa" and musa_testing is None
+                    else {}
+                ),
             )
         elif Config.mode == BenchMode.WRAPPER:
             for i in range(Config.warm_up):

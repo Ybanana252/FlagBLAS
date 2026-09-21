@@ -69,6 +69,15 @@ group_bfgemm_tle_ws:
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, PANEL_WIDTH: 8, PIPELINE_STAGES: 4}
     num_stages: 4
     num_warps: 16
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, PANEL_WIDTH: 8, PIPELINE_STAGES: 3}
+    num_stages: 3
+    num_warps: 16
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, PANEL_WIDTH: 16, PIPELINE_STAGES: 4}
+    num_stages: 4
+    num_warps: 16
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, PANEL_WIDTH: 2, PIPELINE_STAGES: 5}
+    num_stages: 5
+    num_warps: 16
   - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, PANEL_WIDTH: 8, PIPELINE_STAGES: 6}
     num_stages: 6
     num_warps: 16
