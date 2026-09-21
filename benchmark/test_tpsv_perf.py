@@ -19,6 +19,7 @@ from flag_blas.ops import (
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
 
 TPSV_SIZES = [
     64,
@@ -46,6 +47,10 @@ TPSV_SIZES = [
 
 
 def _load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     names = ["libcublas.so.13"]
     found = ctypes.util.find_library("cublas")
     if found:
@@ -74,6 +79,9 @@ _CUBLAS_TPSV_FUNCS = (
 
 
 def _get_cublas_handle():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import get_mublas_handle
+        return get_mublas_handle()
     global _cublas_handle
     if _cublas_handle is None:
         handle = ctypes.c_void_p()
@@ -230,9 +238,12 @@ def _row_major_diag_offsets(n, uplo, device):
 def _make_case(n, dtype, uplo, diag, device):
     AP = torch.randn(n * (n + 1) // 2, dtype=dtype, device=device) * 0.02
     if diag == CUBLAS_DIAG_NON_UNIT:
-        AP[_row_major_diag_offsets(n, uplo, device)] = (
-            (2.0 + 0.25j) if dtype.is_complex else 2.0
-        )
+        offsets = _row_major_diag_offsets(n, uplo, device)
+        if IS_MTHREADS and dtype.is_complex:
+            torch.view_as_real(AP)[offsets, 0] = 2.0
+            torch.view_as_real(AP)[offsets, 1] = 0.25
+        else:
+            AP[offsets] = (2.0 + 0.25j) if dtype.is_complex else 2.0
     x = torch.randn(n, dtype=dtype, device=device)
     return AP.contiguous(), x.contiguous()
 

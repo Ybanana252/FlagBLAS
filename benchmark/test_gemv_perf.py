@@ -25,16 +25,18 @@ from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
 IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
 
 pytestmark = pytest.mark.skipif(
     IS_ASCEND,
     reason="GEMV vendor-reference benchmarks are unavailable on Ascend",
 )
-
 if IS_HYGON:
     import atexit
     import ctypes
     import ctypes.util
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
 elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
@@ -481,7 +483,14 @@ def cublas_half_gemv(
         m_c, n_c, k_c = n, 1, m
         lda_c, ldb_c, ldc_c = lda_row, m, n
 
-    cublas.gemmEx(
+    compute_type = CUDA_R_32F
+    if IS_MTHREADS:
+        transA = 112 if trans == CUBLAS_OP_N else 111
+        transB = 111
+        # Match muBLAS compute modes and the scalar types prepared below.
+        compute_type = 64 if A_row.dtype == torch.float16 else 68
+
+    status = cublas.gemmEx(
         handle,
         transA,
         transB,
@@ -499,9 +508,11 @@ def cublas_half_gemv(
         y.data_ptr(),
         cuda_type,
         ldc_c,
-        CUDA_R_32F,
+        compute_type,
         0,
     )
+    if IS_MTHREADS and status != 0:
+        raise RuntimeError(f"muBLAS GemmEx failed with status {status}")
     return y
 
 
@@ -952,8 +963,11 @@ class HalfGemvBenchmark(GemvBenchmark):
         else:
             handle = cp.cuda.device.get_cublas_handle()
             cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
-            alpha_np = np.array(self.alpha, dtype=np.float32)
-            beta_np = np.array(self.beta, dtype=np.float32)
+            scalar_dtype = (
+                np.float16 if IS_MTHREADS and cur_dtype == torch.float16 else np.float32
+            )
+            alpha_np = np.array(self.alpha, dtype=scalar_dtype)
+            beta_np = np.array(self.beta, dtype=scalar_dtype)
             alpha_ptr = alpha_np.ctypes.data
             beta_ptr = beta_np.ctypes.data
             cuda_type = 2 if cur_dtype == torch.float16 else 14

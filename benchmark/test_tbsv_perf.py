@@ -33,6 +33,7 @@ from flag_blas.ops import (
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
 
 STBSV_SIZES = [
     256,
@@ -49,6 +50,10 @@ STBSV_KS = [1, 4, 16, 64, 256]
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -66,6 +71,9 @@ _cublas_handle = None
 
 
 def _get_cublas_handle():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import get_mublas_handle
+        return get_mublas_handle()
     global _cublas_handle
     if _cublas_handle is None:
         handle = ctypes.c_void_p()
@@ -238,12 +246,18 @@ def _make_triangular_banded(n, k, lda, uplo, dtype, device):
         columns = rows + bands - k
         diag_col = k
     valid = (columns >= 0) & (columns < n)
-    A[:, : k + 1] = values.masked_fill(~valid, 0.0)
+    if IS_MTHREADS and dtype.is_complex:
+        torch.view_as_real(A)[:, : k + 1] = torch.view_as_real(values).masked_fill(
+            ~valid.unsqueeze(-1), 0.0
+        )
+    else:
+        A[:, : k + 1] = values.masked_fill(~valid, 0.0)
     A[:, diag_col] = diag_floor
     column_bands = (k - bands).expand(n, k + 1)
-    column_A[columns.expand(n, k + 1)[valid], column_bands[valid]] = A[:, : k + 1][
-        valid
-    ]
+    # Use real views for both complex gather and scatter on TorchMUSA.
+    source = torch.view_as_real(A) if IS_MTHREADS and dtype.is_complex else A
+    target = torch.view_as_real(column_A) if IS_MTHREADS and dtype.is_complex else column_A
+    target[columns.expand(n, k + 1)[valid], column_bands[valid]] = source[:, : k + 1][valid]
     return A.contiguous(), column_A.contiguous()
 
 
