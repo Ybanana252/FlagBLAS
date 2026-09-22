@@ -21,7 +21,7 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
 
@@ -50,6 +50,14 @@ SYR_SIZES = [
 ]
 IS_HYGON = flag_blas.vendor_name == "hygon"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
+
 CUBLAS_POINTER_MODE_HOST = 0
 HIPBLAS_POINTER_MODE_HOST = 0
 _HIPBLAS_LIBRARY = None
@@ -311,6 +319,9 @@ def _row_to_column_full(A, n, lda):
 
 
 class SyrBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "syr"
+
     DEFAULT_SHAPES = [(n,) for n in SYR_SIZES]
     DEFAULT_SHAPE_DESC = "N"
 
@@ -327,6 +338,23 @@ class SyrBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                lda = n
+                yield (
+                    ascend_randn((n, lda), dtype=cur_dtype, device=self.device),
+                    ascend_randn(n, dtype=cur_dtype, device=self.device),
+                    {
+                        "uplo": self.uplo,
+                        "n": n,
+                        "alpha": self.alpha,
+                        "incx": 1,
+                        "lda": lda,
+                        "matrix_layout": "row_major_full",
+                    },
+                )
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor = _resolve_hipblas_syr(library, cur_dtype)
@@ -411,7 +439,12 @@ def _run_syr(op_name, dtype, uplo, alpha):
         uplo=uplo,
         alpha=alpha,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Correctness uses tests/test_syr.py with --ref cpu; this path only
+        # times FlagBLAS and compares with saved H100 cuBLAS measurements.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 SYR_PERF_CASES = [

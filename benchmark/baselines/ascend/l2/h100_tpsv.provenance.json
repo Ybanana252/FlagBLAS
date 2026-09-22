@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "baseline_id": "h100_tpsv_all_67d53218412f",
+  "latency_unit": "ms",
+  "work_model": "level2-scalar-useful-v1",
+  "timing": {
+    "mode": "kernel",
+    "scope": "complete_benchmark_operation_call",
+    "statistic": "median",
+    "warmup_ms": 10,
+    "rep_ms": 100,
+    "replay_policy": "inplace_solve_no_reset",
+    "cache_policy": "unknown",
+    "graph": false,
+    "timer": "triton.testing.do_bench",
+    "timer_version": "unknown",
+    "stream": "unknown",
+    "synchronization": "unknown",
+    "evidence": {
+      "mode": "observed_in_log",
+      "warmup_ms": "observed_in_command",
+      "rep_ms": "observed_in_command",
+      "other_fields": "inferred_from_current_source_not_historical_verification"
+    }
+  },
+  "provenance": {
+    "log": {
+      "path": "/root/zhangluchen/h100_perf/worker_00_test_tpsv_perf.log",
+      "sha256": "67d53218412f36c7e1349ad73834d34aa057126c99bde1a90fd40b2b4c2035d2"
+    },
+    "source": {
+      "path": "benchmark/test_tpsv_perf.py",
+      "sha256": "374067c2af1c56dcbee9a005f94e0cc065e5cd581b67c3e058c7ff22a235afcd"
+    },
+    "source_association": "UNVERIFIED_HISTORICAL_SOURCE_ASSOCIATION",
+    "parameter_source": "observed_in_log",
+    "parameter_evidence": {
+      "op/dtype/n/uplo/trans/diag/incx": "observed_in_log"
+    },
+    "source_command": "/usr/bin/python -m pytest 'test_tpsv_perf.py::test_perf_tpsv[stpsv-dtype0-0-0]' 'test_tpsv_perf.py::test_perf_tpsv[stpsv-dtype1-1-0]' 'test_tpsv_perf.py::test_perf_tpsv[stpsv-dtype2-0-1]' 'test_tpsv_perf.py::test_perf_tpsv[stpsv-dtype3-1-1]' 'test_tpsv_perf.py::test_perf_tpsv[dtpsv-dtype4-0-0]' 'test_tpsv_perf.py::test_perf_tpsv[dtpsv-dtype5-1-0]' 'test_tpsv_perf.py::test_perf_tpsv[dtpsv-dtype6-0-1]' 'test_tpsv_perf.py::test_perf_tpsv[dtpsv-dtype7-1-1]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype8-0-0]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype9-1-0]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype10-0-1]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype11-1-1]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype12-0-2]' 'test_tpsv_perf.py::test_perf_tpsv[ctpsv-dtype13-1-2]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype14-0-0]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype15-1-0]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype16-0-1]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype17-1-1]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype18-0-2]' 'test_tpsv_perf.py::test_perf_tpsv[ztpsv-dtype19-1-2]' -v -s --color=yes --warmup=10 --iter=100",
+    "reference_library": "cuBLAS",
+    "reference_apis": {
+      "stpsv": "cublasStpsv_v2",
+      "dtpsv": "cublasDtpsv_v2",
+      "ctpsv": "cublasCtpsv_v2",
+      "ztpsv": "cublasZtpsv_v2"
+    },
+    "reference_layout": "column-major packed storage produced by the row-major argument transformation before timing",
+    "target_layout": "row-major packed storage",
+    "device_family": "H100",
+    "device_family_source": "workspace_dataset_identity_unverified_by_log",
+    "reference_device": "H100 (dataset identity supplied by workspace owner)",
+    "exact_device": "unknown",
+    "cuda_version": "unknown",
+    "cublas_version": "unknown",
+    "triton_version": "unknown",
+    "benchmark_commit": "unknown",
+    "missing": [
+      "historical_source_identity",
+      "exact_H100_model",
+      "CUDA/cuBLAS/Triton_versions",
+      "cache_policy",
+      "clock/power_state",
+      "stream/synchronization"
+    ]
+  },
+  "migration": {
+    "source_artifact": "/root/zhangluchen/h100_perf/worker_00_test_tpsv_perf.log",
+    "source_artifact_sha256": "67d53218412f36c7e1349ad73834d34aa057126c99bde1a90fd40b2b4c2035d2",
+    "destination": "h100.json",
+    "case_count": 420,
+    "case_counts": {
+      "stpsv": 84,
+      "dtpsv": 84,
+      "ctpsv": 126,
+      "ztpsv": 126
+    },
+    "field_mapping": {
+      "latency_ms": "Ref Latency (ms)",
+      "tflops": "Ref TFLOPS",
+      "gbps": "Ref GBPS"
+    },
+    "note": "Copied the logged cuBLAS metrics without rescaling; all case parameters are parsed from the logged Size Detail."
+  }
+}

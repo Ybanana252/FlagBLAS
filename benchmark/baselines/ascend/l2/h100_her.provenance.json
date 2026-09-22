@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "baseline_id": "h100_her_complex64_7796c3672ee6",
+  "latency_unit": "ms",
+  "work_model": "level2-scalar-useful-v1",
+  "timing": {
+    "mode": "kernel",
+    "scope": "complete_flagblas_call",
+    "statistic": "median",
+    "warmup_ms": 10,
+    "rep_ms": 100,
+    "replay_policy": "inplace_accumulate_no_reset",
+    "cache_policy": "unknown",
+    "graph": false,
+    "timer": "triton.testing.do_bench",
+    "timer_version": "unknown",
+    "stream": "unknown",
+    "synchronization": "unknown",
+    "evidence": {
+      "mode": "observed_in_log",
+      "warmup_ms": "observed_in_command",
+      "rep_ms": "observed_in_command",
+      "other_fields": "inferred_from_current_source_not_historical_verification"
+    }
+  },
+  "provenance": {
+    "log": {
+      "path": "/root/zhangluchen/h100_perf/worker_00_test_her_perf.log",
+      "sha256": "7796c3672ee6a1aa71730f542da757dd86013f72caad671fd797238ae0c50dad"
+    },
+    "source": {
+      "path": "/root/zhangluchen/FlagBLAS/benchmark/test_her_perf.py",
+      "sha256": "e6b03c0ac8a06486fdedd5689dc1c01a6869e76a9a3b17c50e29400d4a13eb39",
+      "alpha_line": 308
+    },
+    "source_association": "UNVERIFIED_HISTORICAL_SOURCE_ASSOCIATION",
+    "parameter_source": "observed_in_log",
+    "parameter_evidence": {
+      "alpha/n/uplo/lda/incx": "observed_in_log",
+      "matrix_layout": "inferred_from_current_source_not_historical_verification"
+    },
+    "source_command": "/usr/bin/python -m pytest 'test_her_perf.py::test_perf_her[cher-0]' 'test_her_perf.py::test_perf_her[cher-1]' 'test_her_perf.py::test_perf_her[zher-0]' 'test_her_perf.py::test_perf_her[zher-1]' -v -s --color=yes --warmup=10 --iter=100",
+    "reference": "cuBLAS cublasCher_v2 (log reference name; API inferred from source)",
+    "reference_library": "cuBLAS",
+    "reference_api": "cublasCher_v2",
+    "device_family": "H100",
+    "device_family_source": "workspace_dataset_identity_unverified_by_log",
+    "reference_device": "H100 (dataset identity supplied by workspace owner)",
+    "exact_device": "unknown",
+    "cuda_version": "unknown",
+    "cublas_version": "unknown",
+    "triton_version": "unknown",
+    "benchmark_commit": "unknown",
+    "missing": [
+      "historical_source_identity",
+      "exact_H100_model",
+      "CUDA/cuBLAS/Triton_versions",
+      "cache_policy",
+      "clock/power_state",
+      "stream/synchronization"
+    ],
+    "excluded": {
+      "op": "zher",
+      "dtype": "complex128",
+      "case_count": 42,
+      "reason": "Ascend cher primary suite supports complex64 only"
+    },
+    "frozen_artifacts": [
+      {
+        "file": "source/gemv_hardware_reference.json",
+        "sha256": "520ff091a82dfab28a330eedc29976b31a085c4f244341d473b78d31b4b183f4",
+        "role": "borrowed_streaming_read_capacity_profile"
+      }
+    ]
+  },
+  "migration": {
+    "source_artifact": "/root/zhangluchen/zlc/FlagBLAS/benchmark/her_equivalent/baselines/h100_her.json",
+    "source_artifact_sha256": "c86ef6b7eeb079933c82837240eb78f8380c607fc63420deec5e846eda1af689",
+    "destination": "h100.json",
+    "case_count": 42,
+    "compact_row_fields": [
+      "n",
+      "uplo",
+      "cublas_ms",
+      "flagblas_ms",
+      "speedup",
+      "cublas_tflops",
+      "flagblas_tflops",
+      "cublas_gbps",
+      "flagblas_gbps",
+      "source_line"
+    ],
+    "field_mapping": {
+      "latency_ms": "cublas_ms",
+      "tflops": "cublas_tflops",
+      "gbps": "cublas_gbps"
+    },
+    "note": "Copy the logged cuBLAS metrics without rescaling. Keep provenance separate from baseline case keys.",
+    "source_lines": [
+      {
+        "n": 64,
+        "uplo": "lower",
+        "line": 22
+      },
+      {
+        "n": 96,
+        "uplo": "lower",
+        "line": 23
+      },
+      {
+        "n": 127,
+        "uplo": "lower",
+        "line": 24
+      },
+      {
+        "n": 128,
+        "uplo": "lower",
+        "line": 25
+      },
+      {
+        "n": 129,
+        "uplo": "lower",
+        "line": 26
+      },
+      {
+        "n": 192,
+        "uplo": "lower",
+        "line": 27
+      },
+      {
+        "n": 255,
+        "uplo": "lower",
+        "line": 28
+      },
+      {
+        "n": 256,
+        "uplo": "lower",
+        "line": 29
+      },
+      {
+        "n": 257,
+        "uplo": "lower",
+        "line": 30
+      },
+      {
+        "n": 384,
+        "uplo": "lower",
+        "line": 31
+      },
+      {
+        "n": 511,
+        "uplo": "lower",
+        "line": 32
+      },
+      {
+        "n": 512,
+        "uplo": "lower",
+        "line": 33
+      },
+      {
+        "n": 513,
+        "uplo": "lower",
+        "line": 34
+      },
+      {
+        "n": 768,
+        "uplo": "lower",
+        "line": 35
+      },
+      {
+        "n": 1023,
+        "uplo": "lower",
+        "line": 36
+      },
+      {
+        "n": 1024,
+        "uplo": "lower",
+        "line": 37
+      },
+      {
+        "n": 1025,
+        "uplo": "lower",
+        "line": 38
+      },
+      {
+        "n": 1536,
+        "uplo": "lower",
+        "line": 39
+      },
+      {
+        "n": 2048,
+        "uplo": "lower",
+        "line": 40
+      },
+      {
+        "n": 3072,
+        "uplo": "lower",
+        "line": 41
+      },
+      {
+        "n": 4096,
+        "uplo": "lower",
+        "line": 42
+      },
+      {
+        "n": 64,
+        "uplo": "upper",
+        "line": 53
+      },
+      {
+        "n": 96,
+        "uplo": "upper",
+        "line": 54
+      },
+      {
+        "n": 127,
+        "uplo": "upper",
+        "line": 55
+      },
+      {
+        "n": 128,
+        "uplo": "upper",
+        "line": 56
+      },
+      {
+        "n": 129,
+        "uplo": "upper",
+        "line": 57
+      },
+      {
+        "n": 192,
+        "uplo": "upper",
+        "line": 58
+      },
+      {
+        "n": 255,
+        "uplo": "upper",
+        "line": 59
+      },
+      {
+        "n": 256,
+        "uplo": "upper",
+        "line": 60
+      },
+      {
+        "n": 257,
+        "uplo": "upper",
+        "line": 61
+      },
+      {
+        "n": 384,
+        "uplo": "upper",
+        "line": 62
+      },
+      {
+        "n": 511,
+        "uplo": "upper",
+        "line": 63
+      },
+      {
+        "n": 512,
+        "uplo": "upper",
+        "line": 64
+      },
+      {
+        "n": 513,
+        "uplo": "upper",
+        "line": 65
+      },
+      {
+        "n": 768,
+        "uplo": "upper",
+        "line": 66
+      },
+      {
+        "n": 1023,
+        "uplo": "upper",
+        "line": 67
+      },
+      {
+        "n": 1024,
+        "uplo": "upper",
+        "line": 68
+      },
+      {
+        "n": 1025,
+        "uplo": "upper",
+        "line": 69
+      },
+      {
+        "n": 1536,
+        "uplo": "upper",
+        "line": 70
+      },
+      {
+        "n": 2048,
+        "uplo": "upper",
+        "line": 71
+      },
+      {
+        "n": 3072,
+        "uplo": "upper",
+        "line": 72
+      },
+      {
+        "n": 4096,
+        "uplo": "upper",
+        "line": 73
+      }
+    ]
+  }
+}

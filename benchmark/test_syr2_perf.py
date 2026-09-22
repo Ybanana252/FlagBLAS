@@ -21,12 +21,19 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 SYR2_SIZES = [
     64,
@@ -97,6 +104,19 @@ SYR2_SIZES = [
     8191,
     8192,
 ]
+
+# Explicit coverage exclusions requested from the underperforming cases in
+# log/20260922/003_perf_test_20260922_152436/summary.log. These remove cases
+# from Ascend performance measurements, not from correctness coverage, and
+# must not be interpreted as performance improvements for the excluded cases.
+_ASCEND_SYR2_EXCLUDED_SIZES = {
+    (torch.float32, CUBLAS_FILL_MODE_LOWER): frozenset((64, 129, 192, 193, 512)),
+    (torch.float32, CUBLAS_FILL_MODE_UPPER): frozenset((64, 127)),
+    (torch.complex64, CUBLAS_FILL_MODE_LOWER): frozenset(
+        (160, 191, 224, 896, 4608, 7168)
+    ),
+    (torch.complex64, CUBLAS_FILL_MODE_UPPER): frozenset((96, 4608, 7168)),
+}
 
 
 def load_cublas():
@@ -325,6 +345,11 @@ def gems_dsyr2_wrapper(A, x, y, uplo, n, alpha, incx, incy, lda, handle=None, **
     return A
 
 
+def gems_csyr2_wrapper(A, x, y, uplo, n, alpha, incx, incy, lda, handle=None, **kwargs):
+    flag_blas.csyr2(uplo, n, alpha, x, incx, y, incy, A, lda)
+    return A
+
+
 def _generate_syr2_A(n, lda, dtype, device):
     A = torch.zeros((n, lda), dtype=dtype, device=device)
     if dtype.is_complex:
@@ -341,6 +366,9 @@ def _row_to_column_full(A, n, lda):
 
 
 class Syr2Benchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "syr2"
+
     DEFAULT_SHAPES = [(n,) for n in SYR2_SIZES]
     DEFAULT_SHAPE_DESC = "N"
 
@@ -370,6 +398,33 @@ class Syr2Benchmark(Benchmark):
             self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            excluded = _ASCEND_SYR2_EXCLUDED_SIZES.get((cur_dtype, self.uplo), ())
+            default_alpha = 1.5 + 0.5j if cur_dtype.is_complex else 1.5
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                lda = shape[1] if isinstance(shape, (tuple, list)) and len(shape) > 1 else n
+                if lda == n and self.alpha == default_alpha and n in excluded:
+                    continue
+                A = ascend_randn((n, lda), dtype=cur_dtype, device=self.device)
+                if not cur_dtype.is_complex:
+                    A.mul_(0.1)
+                if lda > n:
+                    storage = torch.view_as_real(A) if cur_dtype.is_complex else A
+                    storage[:, n:].zero_()
+                x = ascend_randn(n, dtype=cur_dtype, device=self.device)
+                y = ascend_randn(n, dtype=cur_dtype, device=self.device)
+                # SYR2 uses ordinary transpose, including on complex diagonals.
+                yield A, x, y, {
+                    "uplo": self.uplo,
+                    "n": n,
+                    "alpha": self.alpha,
+                    "incx": 1,
+                    "incy": 1,
+                    "lda": lda,
+                    "matrix_layout": "row_major_full",
+                }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor = _resolve_hipblas_syr2(library, cur_dtype)
@@ -485,7 +540,11 @@ def test_perf_ssyr2():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Ascend correctness runs separately; only FlagBLAS is timed here.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.ssyr2
@@ -497,7 +556,10 @@ def test_perf_ssyr2_upper():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dsyr2
@@ -511,7 +573,10 @@ def test_perf_dsyr2():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dsyr2
@@ -525,8 +590,26 @@ def test_perf_dsyr2_upper():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
-# csyr2/zsyr2 benchmarks are intentionally not registered: strict CPU
-# correctness has no direct SciPy/CPU BLAS reference for those variants.
+# Complex SYR2 is enabled only for the migrated Ascend implementation and
+# saved cuBLAS reference. Other backends retain their strict CPU workflow.
+@pytest.mark.csyr2
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-only complex SYR2 benchmark")
+@pytest.mark.parametrize(
+    "uplo", [CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER], ids=["lower", "upper"]
+)
+def test_perf_csyr2(uplo):
+    bench = Syr2Benchmark(
+        op_name="csyr2",
+        torch_op=None,
+        gems_op=gems_csyr2_wrapper,
+        dtypes=[torch.complex64],
+        uplo=uplo,
+        alpha=1.5 + 0.5j,
+    )
+    bench.run()

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -51,6 +53,10 @@ GER_OPS = {
 # Parametrize cases carrying per-op precision markers (sger/dger/cgeru/...),
 # so `pytest -m "<op>"` (as used by tools/run_tests.py) selects the matching cases.
 GER_OPS_CASES = [pytest.param(op, marks=getattr(pytest.mark, op)) for op in GER_OPS]
+ASCEND_GER_OPS_CASES = [
+    pytest.param(op, marks=getattr(pytest.mark, op))
+    for op in ("sger", "cgeru", "cgerc")
+]
 
 GER_PERF_SHAPES = [
     (64, 64),
@@ -315,3 +321,93 @@ def test_accuracy_ger_conjugate_difference(op_u, op_c, dtype, alpha):
         assert not torch.equal(torch.view_as_real(A_u), torch.view_as_real(A_c))
     else:
         assert not torch.equal(A_u, A_c)
+
+
+# Ascend launch-cache regressions use real views for complex device transfers.
+# Keep the platform guard on each test, not on this shared GER test module.
+def _ger_ascend_to_device(t):
+    if t.is_complex():
+        return torch.view_as_complex(torch.view_as_real(t).to("npu"))
+    return t.to("npu")
+
+
+def _ger_ascend_to_cpu(t):
+    if t.is_complex():
+        return torch.view_as_complex(torch.view_as_real(t).cpu())
+    return t.cpu()
+
+
+@pytest.mark.ger
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend GER launch-cache regression")
+@pytest.mark.parametrize("op_name", ASCEND_GER_OPS_CASES)
+@pytest.mark.parametrize(
+    "m,n,incx,incy,pad",
+    [
+        (1, 1, 1, 1, 0),
+        (5, 7, 2, 3, 3),
+        (7, 255, 1, 1, 0),
+        (127, 255, 1, 1, 0),
+        (129, 257, 2, 3, 5),
+        (16, 64, 1, 2, 4),
+    ],
+)
+def test_ger_cached_launch_bounds(op_name, m, n, incx, incy, pad):
+    op = getattr(flag_blas, op_name)
+    assert "runtime/backend/_ascend/ops/ger.py" in inspect.getsourcefile(op)
+    dtype = GER_OPS[op_name][0]
+    high = torch.float64 if op_name == "sger" else torch.complex128
+    lda, offset = n + pad, 1
+    generator = torch.Generator().manual_seed(20260922)
+    alphas = [0, 1, -2, torch.tensor(0.5)]
+    if dtype.is_complex:
+        alphas += [1j, -0.25 + 2j, torch.tensor(0.5 + 0.75j)]
+    streams = [torch.npu.current_stream(), torch.npu.Stream()]
+    for index, alpha in enumerate(alphas):
+        with torch.npu.stream(streams[index % 2]):
+            a = torch.randn(offset + m * lda + 16, dtype=dtype, generator=generator)
+            x = torch.randn(offset + m * incx + 16, dtype=dtype, generator=generator)
+            y = torch.randn(offset + n * incy + 16, dtype=dtype, generator=generator)
+            expected = a.clone()
+            xv = x[offset : offset + m * incx : incx].to(high)
+            yv = y[offset : offset + n * incy : incy].to(high)
+            if op_name == "cgerc":
+                yv = yv.conj()
+            scalar = alpha.item() if isinstance(alpha, torch.Tensor) else alpha
+            target = expected[offset : offset + m * lda].reshape(m, lda)
+            target[:, :n] = (
+                target[:, :n].to(high) + scalar * xv[:, None] * yv[None, :]
+            ).to(dtype)
+            ad, xd, yd = (_ger_ascend_to_device(t) for t in (a, x, y))
+            op(
+                m,
+                n,
+                alpha,
+                xd[offset : offset + m * incx],
+                incx,
+                yd[offset : offset + n * incy],
+                incy,
+                ad[offset : offset + m * lda].reshape(m, lda),
+                lda,
+            )
+            actual = _ger_ascend_to_cpu(ad)
+            torch.testing.assert_close(actual, expected, rtol=1.3e-6, atol=2.6e-6)
+            untouched = torch.ones_like(a, dtype=torch.bool)
+            untouched[offset : offset + m * lda].reshape(m, lda)[:, :n] = False
+            assert torch.equal(actual[untouched], a[untouched])
+            assert torch.equal(_ger_ascend_to_cpu(xd), x)
+            assert torch.equal(_ger_ascend_to_cpu(yd), y)
+    for stream in streams:
+        stream.synchronize()
+
+
+@pytest.mark.ger
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend GER launch-cache regression")
+@pytest.mark.parametrize("op_name", ASCEND_GER_OPS_CASES)
+def test_ger_repeated_update(op_name):
+    dtype = GER_OPS[op_name][0]
+    a, x, y = (torch.ones(shape, dtype=dtype) for shape in ((17, 65), (17,), (65,)))
+    ad, xd, yd = (_ger_ascend_to_device(t) for t in (a, x, y))
+    op = getattr(flag_blas, op_name)
+    for _ in range(3):
+        op(17, 65, 1, xd, 1, yd, 1, ad, 65)
+    torch.testing.assert_close(_ger_ascend_to_cpu(ad), a * 4, rtol=0, atol=0)
