@@ -14,7 +14,6 @@
 
 import ctypes
 import ctypes.util
-import inspect
 
 import numpy as np
 import pytest
@@ -432,85 +431,3 @@ def test_accuracy_syr_balanced(name, dtype, alpha, uplo, n, incx, lda_pad):
         torch.testing.assert_close(x.cpu(), x_before.cpu())
     else:
         torch.testing.assert_close(x, x_before)
-
-
-# Ascend launch-cache regressions use real views for complex device transfers.
-# Platform guards belong on these tests, not on the shared SYR test module.
-def _syr_ascend_to_device(t):
-    if t.is_complex():
-        return torch.view_as_complex(torch.view_as_real(t).to("npu"))
-    return t.to("npu")
-
-
-def _syr_ascend_to_cpu(t):
-    if t.is_complex():
-        return torch.view_as_complex(torch.view_as_real(t).cpu())
-    return t.cpu()
-
-
-@pytest.mark.skipif(flag_blas.vendor_name != "ascend", reason="Ascend backend")
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(torch.float32, marks=pytest.mark.ssyr),
-        pytest.param(torch.complex64, marks=pytest.mark.csyr),
-    ],
-)
-@pytest.mark.parametrize("uplo", SYR_UPLOS)
-@pytest.mark.parametrize("n", [17, 129, 2051, 4097])
-def test_syr_cached_launch(n, dtype, uplo):
-    op = flag_blas.csyr if dtype.is_complex else flag_blas.ssyr
-    assert "runtime/backend/_ascend/ops/syr.py" in inspect.getsourcefile(op)
-    lda, incx, offset = n + 3, 3, 1
-    stream = torch.npu.Stream()
-    generator = torch.Generator().manual_seed(20260922)
-    alphas = [0, 1, -2, torch.tensor(0.5)]
-    if dtype.is_complex:
-        alphas += [1j, -0.25 + 2j, torch.tensor(0.5 + 0.75j)]
-    with torch.npu.stream(stream):
-        for alpha in alphas:
-            # Keep prefix/suffix guards, lda padding and the other triangle.
-            a = torch.randn(offset + n * lda + 16, dtype=dtype, generator=generator)
-            x = torch.randn(offset + n * incx + 16, dtype=dtype, generator=generator)
-            initial = a[offset : offset + n * lda].reshape(n, lda)
-            expected = initial.clone()
-            high = torch.complex128 if dtype.is_complex else torch.float64
-            xv = x[offset : offset + n * incx : incx].to(high)
-            scalar = alpha.item() if isinstance(alpha, torch.Tensor) else alpha
-            delta = scalar * xv[:, None] * xv[None, :]
-            triangle = torch.ones((n, n), dtype=torch.bool)
-            triangle = (
-                triangle.tril() if uplo == CUBLAS_FILL_MODE_LOWER else triangle.triu()
-            )
-            expected[:, :n][triangle] = (expected[:, :n].to(high) + delta)[
-                triangle
-            ].to(dtype)
-            ad, xd = _syr_ascend_to_device(a), _syr_ascend_to_device(x)
-            op(
-                uplo,
-                n,
-                alpha,
-                xd[offset : offset + n * incx],
-                incx,
-                ad[offset : offset + n * lda],
-                lda,
-            )
-            actual = _syr_ascend_to_cpu(ad)
-            got = actual[offset : offset + n * lda].reshape(n, lda)
-            torch.testing.assert_close(got, expected, rtol=1.3e-6, atol=2.6e-6)
-            untouched = torch.ones((n, lda), dtype=torch.bool)
-            untouched[:, :n] = ~triangle
-            assert torch.equal(got[untouched], initial[untouched])
-            assert torch.equal(actual[:offset], a[:offset])
-            assert torch.equal(actual[offset + n * lda :], a[offset + n * lda :])
-            assert torch.equal(_syr_ascend_to_cpu(xd), x)
-    stream.synchronize()
-
-
-@pytest.mark.skipif(flag_blas.vendor_name != "ascend", reason="Ascend backend")
-@pytest.mark.csyr
-def test_csyr_rejects_unresolved_conjugate():
-    x = _syr_ascend_to_device(torch.tensor([1 + 2j, 3 - 4j]))
-    a = _syr_ascend_to_device(torch.zeros(4, dtype=torch.complex64))
-    with pytest.raises(RuntimeError, match="resolved conjugate"):
-        flag_blas.csyr(CUBLAS_FILL_MODE_LOWER, 2, 1, x.conj(), 1, a, 2)

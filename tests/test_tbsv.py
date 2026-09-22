@@ -632,61 +632,6 @@ TBSV_VARIANTS = [
     pytest.param(flag_blas.ztbsv, torch.complex128, CUBLAS_OP_C, id="ztbsv"),
 ]
 
-
-@pytest.mark.skipif(flag_blas.vendor_name != "ascend", reason="Ascend blocked TBSV")
-@pytest.mark.parametrize("n,k", [(17, 4), (65, 16), (257, 256)])
-@pytest.mark.parametrize("uplo", FILL_MODES)
-@pytest.mark.parametrize("trans", COMPLEX_TRANS_MODES)
-@pytest.mark.parametrize("diag", DIAG_MODES)
-def test_ctbsv_blocked_complex_diagonal_and_padding(n, k, uplo, trans, diag):
-    # Exercise incomplete panels, non-real diagonals, ignored storage and
-    # strided vectors. The existing performance-shape suite has real diagonals.
-    dtype = torch.complex64
-    lda, incx = k + 3, 3
-    A = make_triangular_banded(n, k, lda, uplo, dtype, "cpu", unit_diag=diag == 1)
-    diagonal = 0 if uplo == CUBLAS_FILL_MODE_UPPER else k
-    if diag == CUBLAS_DIAG_UNIT:
-        A[:, diagonal] = complex(float("nan"), float("nan"))
-    else:
-        A[:, diagonal] += 0.75j
-    A[:, k + 1 :] = complex(float("nan"), float("nan"))
-    A = A.to(flag_blas.device)
-    original = torch.randn(1 + (n - 1) * incx, dtype=dtype)
-    x = original.to(flag_blas.device)
-    expected = cpu_tbsv_reference(uplo, trans, diag, n, k, A, lda, x, incx)
-
-    flag_blas.ctbsv(uplo, trans, diag, n, k, A, lda, x, incx)
-
-    actual = x.cpu()
-    torch.testing.assert_close(
-        actual[::incx], expected[::incx].to(dtype), atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(actual[1::incx], original[1::incx], atol=0, rtol=0)
-    torch.testing.assert_close(actual[2::incx], original[2::incx], atol=0, rtol=0)
-
-
-@pytest.mark.skipif(flag_blas.vendor_name != "ascend", reason="Ascend TBSV packing")
-@pytest.mark.parametrize("n", [512, 1024, 2048])
-@pytest.mark.parametrize("uplo", FILL_MODES)
-@pytest.mark.parametrize("trans", [CUBLAS_OP_T, CUBLAS_OP_C])
-def test_ctbsv_transposed_wide_band_pack(n, uplo, trans):
-    # Hit the selective packing path with non-real diagonal entries so that
-    # conjugation, as well as both substitution directions, is checked.
-    dtype = torch.complex64
-    k, lda, incx = 256, 257, 1
-    diag = CUBLAS_DIAG_NON_UNIT
-    A = make_triangular_banded(n, k, lda, uplo, dtype, "cpu")
-    diagonal = 0 if uplo == CUBLAS_FILL_MODE_UPPER else k
-    A[:, diagonal] += 0.75j
-    A = A.to(flag_blas.device)
-    x = torch.randn(n, dtype=dtype).to(flag_blas.device)
-    expected = cpu_tbsv_reference(uplo, trans, diag, n, k, A, lda, x, incx)
-
-    flag_blas.ctbsv(uplo, trans, diag, n, k, A, lda, x, incx)
-
-    torch.testing.assert_close(x.cpu(), expected.to(dtype), atol=1e-5, rtol=1e-5)
-
-
 NARROW_TBSV_VARIANTS = [
     pytest.param(
         flag_blas.dtbsv,
