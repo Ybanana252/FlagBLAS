@@ -1,5 +1,5 @@
 from .gemv import cgemv, sgemv
-from .ger import cgerc, cgeru
+from .ger import cgerc, cgeru, sger
 from .hemv import chemv
 from .her import cher
 from .her2 import cher2
@@ -10,7 +10,7 @@ from .spr import sspr
 from .spr2 import sspr2
 from .symv import csymv, ssymv
 from .syr import csyr, ssyr
-from .syr2 import ssyr2
+from .syr2 import csyr2, ssyr2
 from .tbmv import ctbmv, stbmv
 from .tbsv import ctbsv, stbsv
 from .tpmv import ctpmv, stpmv
@@ -18,6 +18,7 @@ from .tpsv import ctpsv, stpsv
 from .trsv import ctrsv, strsv
 
 __all__ = [
+    "sger",
     "cgeru",
     "cgerc",
     "sgemv",
@@ -31,6 +32,7 @@ __all__ = [
     "ssyr",
     "csyr",
     "ssyr2",
+    "csyr2",
     "chemv",
     "cher",
     "cher2",

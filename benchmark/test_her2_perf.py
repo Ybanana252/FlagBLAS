@@ -21,12 +21,19 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 HER2_SIZES = [
     64,
@@ -322,6 +329,9 @@ def _row_to_column_full(A, n, lda):
 
 
 class Her2Benchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "her2"
+
     DEFAULT_SHAPES = [(n,) for n in HER2_SIZES]
     DEFAULT_SHAPE_DESC = "N"
 
@@ -346,6 +356,24 @@ class Her2Benchmark(Benchmark):
             self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                lda = n
+                A = ascend_randn((n, lda), dtype=cur_dtype, device=self.device)
+                x = ascend_randn(n, dtype=cur_dtype, device=self.device)
+                y = ascend_randn(n, dtype=cur_dtype, device=self.device)
+                torch.view_as_real(A)[..., 1].diagonal().zero_()
+                yield A, x, y, {
+                    "uplo": self.uplo,
+                    "n": n,
+                    "alpha": self.alpha,
+                    "incx": 1,
+                    "incy": 1,
+                    "lda": lda,
+                    "matrix_layout": "row_major_full",
+                }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor = _resolve_hipblas_her2(library, cur_dtype)
@@ -441,7 +469,11 @@ def test_perf_cher2():
         dtypes=[torch.complex64],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Device correctness is covered separately by tests/test_her2.py.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cher2
@@ -453,7 +485,10 @@ def test_perf_cher2_upper():
         dtypes=[torch.complex64],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zher2
@@ -467,7 +502,10 @@ def test_perf_zher2():
         dtypes=[torch.complex128],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zher2
@@ -481,4 +519,7 @@ def test_perf_zher2_upper():
         dtypes=[torch.complex128],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)

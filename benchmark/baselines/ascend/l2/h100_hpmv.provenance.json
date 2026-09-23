@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "baseline_id": "h100_hpmv_5d87745c9749",
+  "latency_unit": "ms",
+  "work_model": "level2-scalar-useful-v1",
+  "timing": {
+    "mode": "kernel",
+    "scope": "complete_cublas_call",
+    "statistic": "median",
+    "warmup_ms": 10,
+    "rep_ms": 100,
+    "replay_policy": "inplace_y_update_no_reset",
+    "cache_policy": "unknown",
+    "graph": false,
+    "timer": "triton.testing.do_bench",
+    "timer_version": "unknown",
+    "stream": "unknown",
+    "synchronization": "unknown",
+    "evidence": {
+      "mode": "observed_in_log",
+      "warmup_ms": "observed_in_command",
+      "rep_ms": "observed_in_command",
+      "other_fields": "inferred_from_hash_matched_source_not_historical_runtime_verification"
+    }
+  },
+  "provenance": {
+    "log": {
+      "path": "/root/zhangluchen/h100_perf/worker_00_test_hpmv_perf.log",
+      "sha256": "5d87745c9749dabda22f8f7da50fb16bc88db16846f7f6564ddcbf18d814b500"
+    },
+    "source": {
+      "path": "/root/zhangluchen/FlagBLAS/benchmark/test_hpmv_perf.py",
+      "sha256": "ecdc7409860b817a42cdf3b9cf8b92a9c9b9eee2e9cf46b2eb530d6c37331d35",
+      "commit": "a58367a67db99c55e5f8622435e0623a0c5fea47"
+    },
+    "source_association": "HASH_MATCHES_PRE_MIGRATION_BENCHMARK_SOURCE",
+    "parameter_source": "observed_in_log_and_source",
+    "parameter_evidence": {
+      "n/uplo/incx/incy": "observed_in_log",
+      "alpha/beta": "reconstructed from hash-matched source because legacy shape recording omitted complex scalars",
+      "packed_layout": "confirmed by hash-matched source"
+    },
+    "source_command": "/usr/bin/python -m pytest test_hpmv_perf.py::test_perf_chpmv test_hpmv_perf.py::test_perf_chpmv_upper test_hpmv_perf.py::test_perf_zhpmv test_hpmv_perf.py::test_perf_zhpmv_upper -v -s --color=yes --warmup=10 --iter=100",
+    "reference_library": "cuBLAS",
+    "reference_api": "cublasChpmv_v2",
+    "reference_layout": "column-major packed storage created by conjugating row-major AP and flipping uplo",
+    "target_layout": "row-major packed storage",
+    "correctness": "all 18 included complex64 cases passed against cuBLAS before timing",
+    "device_family": "H100",
+    "device_family_source": "workspace_dataset_identity_unverified_by_log",
+    "exact_device": "unknown",
+    "cuda_version": "unknown",
+    "cublas_version": "unknown",
+    "triton_version": "unknown",
+    "missing": [
+      "exact_H100_model",
+      "CUDA/cuBLAS/Triton_versions",
+      "cache_policy",
+      "clock/power_state",
+      "stream/synchronization"
+    ],
+    "excluded": {
+      "op": "zhpmv",
+      "dtype": "torch.complex128",
+      "case_count": 18,
+      "reason": "Ascend HPMV backend exposes complex64 chpmv only"
+    },
+    "hardware_profile": {
+      "path": "benchmark/baselines/ascend/l2/hardware.json",
+      "sha256": "7ab34bb1b02feae938d64ff6cac60f16a22b43b3c8d8136c8876a102ba1a77a8"
+    }
+  },
+  "migration": {
+    "source_artifact": "/root/zhangluchen/h100_perf/worker_00_test_hpmv_perf.log",
+    "destination": "h100.json",
+    "case_count": 18,
+    "included_ops": ["chpmv"],
+    "source_lines": {
+      "chpmv_lower": [22, 30],
+      "chpmv_upper": [41, 49]
+    },
+    "field_mapping": {
+      "latency_ms": "Ref Latency (ms)",
+      "tflops": "Ref TFLOPS",
+      "gbps": "Ref GBPS"
+    },
+    "note": "Logged cuBLAS metrics are copied without rescaling. Complex alpha and beta are restored from the hash-matched source as [real, imag]."
+  }
+}
