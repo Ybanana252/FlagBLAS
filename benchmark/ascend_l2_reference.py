@@ -59,7 +59,7 @@ class AscendL2Reference:
         project = Path(__file__).resolve().parents[1]
         relative = os.environ.get(
             "FLAGBLAS_L2_REFERENCE_FILE",
-            "benchmark/baselines/ascend/l2/h100.json",
+            "benchmark/baselines/h100.json",
         )
         self.path = project / relative
         self.baseline_id = self.path.stem
@@ -81,7 +81,7 @@ class AscendL2Reference:
                 raise ValueError(f"Invalid L2 reference performance: {key}")
             self.cases[key] = row
         self.calibration = json.loads(
-            (project / "benchmark/baselines/ascend/l2/hardware.json").read_text()
+            (project / "benchmark/baselines/hardware.json").read_text()
         )
         # Tensor entries are explanatory scenarios, not the default L2 scoring basis.
         if self.bottleneck not in ("memory", "vector"):

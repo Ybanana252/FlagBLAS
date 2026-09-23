@@ -350,6 +350,8 @@ def probe_env():
 def get_env(gpu_ids):
     env = os.environ.copy()
     vendor = ENV_INFO.get("flag_blas", {}).get("vendor", "")
+    if vendor == "ascend":
+        env.setdefault("TASK_QUEUE_ENABLE", "2")
 
     vendor_env_map = {
         "ascend": ["ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"],
@@ -550,11 +552,24 @@ def parse_benchmark_log(log_file, op):
             total += speedup
 
         if details:
-            bench_res[dtype] = {
-                "result": "OK",
-                "details": details,
-                "speedup": total / count if count else 0.0,
-            }
+            # Ascend GEMV logs several directions with the same dtype.
+            # Their shape keys include trans, so merge instead of replacing.
+            if (
+                ENV_INFO.get("flag_blas", {}).get("vendor") == "ascend"
+                and op in {"sgemv", "cgemv", "hgemv", "bfgemv"}
+                and dtype in bench_res
+            ):
+                previous = bench_res[dtype]
+                previous_count = len(previous["details"])
+                previous_total = previous["speedup"] * previous_count
+                previous["details"].update(details)
+                previous["speedup"] = (previous_total + total) / (previous_count + count)
+            else:
+                bench_res[dtype] = {
+                    "result": "OK",
+                    "details": details,
+                    "speedup": total / count if count else 0.0,
+                }
         else:
             bench_res[dtype] = {
                 "result": "Unknown",
@@ -574,14 +589,20 @@ def run_accuracy_q(gpu_id, op):
     """Run accuracy test for one op. Returns result dict."""
     env = get_env(str(gpu_id))
 
+    pytest_target = ""
+    if ENV_INFO.get("flag_blas", {}).get("vendor") == "ascend":
+        target = getattr(CFG, "ascend_accuracy_targets", {}).get(op)
+        if target:
+            pytest_target = f"{target} "
+
     if op in CFG.skip_cpu_tests:
         cmd = (
-            f'pytest -m "{op}" --record json --output accuracy_{op}.json'
+            f'pytest {pytest_target}-m "{op}" --record json --output accuracy_{op}.json'
             " --continue-on-collection-errors -vs"
         )
     else:
         cmd = (
-            f'pytest -m "{op}" --record json --output accuracy_{op}.json --ref cpu'
+            f'pytest {pytest_target}-m "{op}" --record json --output accuracy_{op}.json --ref cpu'
             " --continue-on-collection-errors -vs"
         )
 
@@ -642,6 +663,8 @@ def run_benchmark_q(gpu_id, op):
     a deterministic name, mirroring FlagGems.
     """
     env = get_env(str(gpu_id))
+    if ENV_INFO["flag_blas"]["vendor"] == "ascend" and op == "csymv":
+        env["FLAGBLAS_ASCEND_TOOLS_CSYMV_SHAPES"] = "1"
 
     benchmark_dir = ROOT / "benchmark"
     op_dir = CFG.output_dir.joinpath(op)
@@ -654,12 +677,23 @@ def run_benchmark_q(gpu_id, op):
         except OSError:
             pass
 
+    # Ascend GEMV shares one benchmark file. Avoid collecting unrelated CUDA tests.
+    ascend_gemv_ops = {"sgemv", "dgemv", "cgemv", "zgemv", "hgemv", "bfgemv", "fp8_gemv"}
+    is_ascend_gemv = ENV_INFO["flag_blas"]["vendor"] == "ascend" and op in ascend_gemv_ops
+    pytest_target = ""
+    if ENV_INFO["flag_blas"]["vendor"] == "ascend":
+        target = getattr(CFG, "ascend_performance_targets", {}).get(op)
+        if target:
+            pytest_target = f"{target} "
     dur = time.time()
     cmd = (
-        f'pytest -m "{op}" --level core --record log'
+        f'pytest {pytest_target}-m "{op}" --level core --record log'
         f" --output benchmark_{op}.log --skip_correctness"
         " --continue-on-collection-errors"
     )
+    if is_ascend_gemv:
+        # Match the established Ascend run_perf GEMV timing window (milliseconds).
+        cmd += " --warmup=20 --iter=50"
     if ENV_INFO["flag_blas"]["vendor"] == "kunlunxin":
         cmd += " --fg_mode operator"
     code = run_cmd(
@@ -699,6 +733,8 @@ def run_benchmark_q(gpu_id, op):
         "data": {},
     }
     record.update(parse_benchmark_log(dest, op))
+    if ENV_INFO["flag_blas"]["vendor"] == "ascend" and code != 0:
+        record["status"] = "Error"
     return record
 
 
@@ -886,6 +922,17 @@ def handle_interrupt(signum, frame):
 
 def get_ops_to_test():
     op_catalog = get_ops_from_inventory()
+    if ENV_INFO.get("flag_blas", {}).get("vendor") == "ascend":
+        CFG.ascend_accuracy_targets = {}
+        CFG.ascend_performance_targets = {}
+        for entry in op_catalog:
+            for label in entry.get("labels", []):
+                accuracy = ROOT / "tests" / f"test_{label}.py"
+                performance = ROOT / "benchmark" / f"test_{label}_perf.py"
+                if accuracy.is_file():
+                    CFG.ascend_accuracy_targets.setdefault(entry["id"], accuracy.name)
+                if performance.is_file():
+                    CFG.ascend_performance_targets.setdefault(entry["id"], performance.name)
     skip_cpu_tests = []
     for op in op_catalog:
         labels = op.get("labels", [])
@@ -1011,6 +1058,12 @@ def main():
     probe_env()
 
     ops = get_ops_to_test()
+    if ENV_INFO.get("flag_blas", {}).get("vendor") == "ascend":
+        unsupported = {"fp8_gemv", "fp8gemv"}
+        skipped = [op for op in ops if op in unsupported]
+        if skipped:
+            pinfo(f"Ascend: skipping unsupported FP8 GEMV ({', '.join(skipped)})")
+        ops = [op for op in ops if op not in unsupported]
     op_count = len(ops)
     if op_count == 0:
         pwarn("No operators to test. Please specify at least one operator.")
