@@ -1,8 +1,6 @@
-import cupy as cp
 import numpy as np
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas
 
 import flag_blas
@@ -10,6 +8,40 @@ from flag_blas.ops import CUBLAS_OP_N, CUBLAS_OP_T
 
 from . import accuracy_utils as utils
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if not IS_HYGON:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
+    def _cublas_dgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc):
+        handle = cp.cuda.device.get_cublas_handle()
+        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+        alpha_np = np.asarray(alpha, dtype=np.float64)
+        beta_np = np.asarray(beta, dtype=np.float64)
+        cublas.dgemm(
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_np.ctypes.data,
+            A.data_ptr(),
+            lda,
+            B.data_ptr(),
+            ldb,
+            beta_np.ctypes.data,
+            C.data_ptr(),
+            ldc,
+        )
+else:
+    from .hipblas_reference import get_hipblas_context, hipblas_dgemm
+
+    def _cublas_dgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc):
+        _, handle = get_hipblas_context(C)
+        hipblas_dgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
 
 DGEMM_SHAPES = [(32, 32, 32), (64, 64, 64), (127, 65, 33)]
 
@@ -20,28 +52,7 @@ def cublas_dgemm_reference(
     if m == 0 or n == 0:
         return
 
-    handle = cp.cuda.device.get_cublas_handle()
-    cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
-
-    alpha_np = np.asarray(alpha, dtype=np.float64)
-    beta_np = np.asarray(beta, dtype=np.float64)
-
-    cublas.dgemm(
-        handle,
-        transa,
-        transb,
-        m,
-        n,
-        k,
-        alpha_np.ctypes.data,
-        A.data_ptr(),
-        lda,
-        B.data_ptr(),
-        ldb,
-        beta_np.ctypes.data,
-        C.data_ptr(),
-        ldc,
-    )
+    _cublas_dgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
 
 
 @pytest.mark.dgemm

@@ -81,6 +81,11 @@ if IS_HYGON:
                 ctypes.c_int,
             ]
             library.hipblasSgemm.restype = ctypes.c_int
+            # hipblasDgemm (fp64 in/out) shares the same signature as
+            # hipblasSgemm; only the scalar type pointed by alpha/beta
+            # differs (fp64 instead of fp32).
+            library.hipblasDgemm.argtypes = library.hipblasSgemm.argtypes
+            library.hipblasDgemm.restype = ctypes.c_int
             # hipblasHgemm (fp16 in/out, fp32 accumulate) shares the same
             # (handle, transa, transb, m, n, k, alpha, A, lda, B, ldb,
             # beta, C, ldc) signature as hipblasSgemm.
@@ -173,6 +178,44 @@ if IS_HYGON:
                 ldc,
             ),
             "hipblasSgemm",
+        )
+        return C
+
+    def _hipblas_dgemm(
+        handle,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha_ptr,
+        A,
+        lda,
+        B,
+        ldb,
+        beta_ptr,
+        C,
+        ldc,
+    ):
+        library = _load_hipblas()
+        _check_hipblas_status(
+            library.hipblasDgemm(
+                handle,
+                _HIPBLAS_OP_MAP[transa],
+                _HIPBLAS_OP_MAP[transb],
+                m,
+                n,
+                k,
+                alpha_ptr,
+                ctypes.c_void_p(A.data_ptr()),
+                lda,
+                ctypes.c_void_p(B.data_ptr()),
+                ldb,
+                beta_ptr,
+                ctypes.c_void_p(C.data_ptr()),
+                ldc,
+            ),
+            "hipblasDgemm",
         )
         return C
 
@@ -504,6 +547,69 @@ def cublas_hgemm(
         ldc_cublas,
         CUDA_R_32F,
         0,
+    )
+    return C_col
+
+
+def cublas_dgemm(
+    A_col,
+    B_col,
+    C_col,
+    transa,
+    transb,
+    m,
+    n,
+    k,
+    alpha,
+    A_row,
+    B_row,
+    C_row,
+    lda_cublas,
+    ldb_cublas,
+    ldc_cublas,
+    lda_flag,
+    ldb_flag,
+    ldc_flag,
+    beta,
+    handle,
+    alpha_ptr,
+    beta_ptr,
+):
+    if IS_HYGON:
+        # hipblasDgemm reads the alpha/beta host scalars as fp64; the
+        # get_input_iter hygon branch packs them into c_double when
+        # alpha_dtype is np.float64.
+        return _hipblas_dgemm(
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col,
+            lda_cublas,
+            B_col,
+            ldb_cublas,
+            beta_ptr,
+            C_col,
+            ldc_cublas,
+        )
+    cublas.dgemm(
+        handle,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        alpha_ptr,
+        A_col.data_ptr(),
+        lda_cublas,
+        B_col.data_ptr(),
+        ldb_cublas,
+        beta_ptr,
+        C_col.data_ptr(),
+        ldc_cublas,
     )
     return C_col
 
@@ -850,6 +956,10 @@ class GemmBenchmark(Benchmark):
                 beta_np = ctypes.c_ushort(
                     int.from_bytes(struct.pack("<e", float(self.beta)), "little")
                 )
+            elif self.alpha_dtype == np.float64:
+                # hipblasDgemm reads alpha/beta as fp64 host scalars.
+                alpha_np = ctypes.c_double(float(self.alpha))
+                beta_np = ctypes.c_double(float(self.beta))
             else:
                 alpha_np = ctypes.c_float(float(self.alpha))
                 beta_np = ctypes.c_float(float(self.beta))
