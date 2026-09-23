@@ -677,9 +677,6 @@ def run_benchmark_q(gpu_id, op):
         except OSError:
             pass
 
-    # Ascend GEMV shares one benchmark file. Avoid collecting unrelated CUDA tests.
-    ascend_gemv_ops = {"sgemv", "dgemv", "cgemv", "zgemv", "hgemv", "bfgemv", "fp8_gemv"}
-    is_ascend_gemv = ENV_INFO["flag_blas"]["vendor"] == "ascend" and op in ascend_gemv_ops
     pytest_target = ""
     if ENV_INFO["flag_blas"]["vendor"] == "ascend":
         target = getattr(CFG, "ascend_performance_targets", {}).get(op)
@@ -691,9 +688,6 @@ def run_benchmark_q(gpu_id, op):
         f" --output benchmark_{op}.log --skip_correctness"
         " --continue-on-collection-errors"
     )
-    if is_ascend_gemv:
-        # Match the established Ascend run_perf GEMV timing window (milliseconds).
-        cmd += " --warmup=20 --iter=50"
     if ENV_INFO["flag_blas"]["vendor"] == "kunlunxin":
         cmd += " --fg_mode operator"
     code = run_cmd(
