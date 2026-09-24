@@ -42,6 +42,34 @@ _MAX_CORE_DIM = 65535
 _SYMV_KEY = ["n"]
 _RESTORE = ["y_ptr"]
 
+try:
+    from triton.backends.ascend import utils as _ascend_driver_utils
+    from triton.backends.ascend.driver import NPULauncher as _NPU_LAUNCHER
+except ImportError:
+    _NPU_LAUNCHER = None
+
+try:
+    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _current_raw_stream
+except ImportError:
+
+    def _current_raw_stream(device):
+        return triton.runtime.driver.active.get_current_stream(device)
+
+
+try:
+    from torch_npu._C import _npu_getDevice as _current_device
+except ImportError:
+    _current_device = torch_device_fn.current_device
+
+_HOOK_CHAIN_TYPE = getattr(triton.knobs, "HookChain", None)
+
+
+class _DevicePointer(int):
+    """NPU pointer retaining its tensor for profiler metadata."""
+
+    def size(self):
+        return self.tensor.size()
+
 
 @triton.jit
 def _triangular_tile_ids(tile_id, UPLO: tl.constexpr):
@@ -520,10 +548,8 @@ _CSYMV_PACKED_ROWS_CACHE = {}
 
 
 def _csymv_packed_rows_launch(A, X, Y, ar, ai, br, bi, n, lda, incx, incy, uplo):
-    from . import spr
-
     device = A.device.index
-    if device != spr._current_device():
+    if device != _current_device():
         with torch_device_fn.device(A.device):
             return _csymv_packed_rows_launch(
                 A, X, Y, ar, ai, br, bi, n, lda, incx, incy, uplo
@@ -560,14 +586,14 @@ def _csymv_packed_rows_launch(A, X, Y, ar, ai, br, bi, n, lda, incx, incy, uplo)
         return
 
     compiled, run, special = cached
-    stream = spr._current_raw_stream(device)
+    stream = _current_raw_stream(device)
     knobs = triton.knobs.runtime
     enter, exit = knobs.launch_enter_hook, knobs.launch_exit_hook
     has_enter = enter is not None and (
-        type(enter) is not spr._HOOK_CHAIN_TYPE or bool(enter.calls)
+        type(enter) is not _HOOK_CHAIN_TYPE or bool(enter.calls)
     )
     has_exit = exit is not None and (
-        type(exit) is not spr._HOOK_CHAIN_TYPE or bool(exit.calls)
+        type(exit) is not _HOOK_CHAIN_TYPE or bool(exit.calls)
     )
     if special or has_enter or has_exit:
         real_tensors = tuple(torch.view_as_real(t) for t in tensors)
@@ -575,11 +601,11 @@ def _csymv_packed_rows_launch(A, X, Y, ar, ai, br, bi, n, lda, incx, incy, uplo)
         return
     args = []
     for tensor, pointer in zip(tensors, pointers):
-        arg = spr._DevicePointer(pointer)
+        arg = _DevicePointer(pointer)
         arg.tensor = tensor
         args.append(arg)
     direct = (
-        type(run) is spr._NPU_LAUNCHER
+        type(run) is _NPU_LAUNCHER
         and not run.compile_only
         and not run.enable_msprof_register_tensor
         and not getattr(run.metadata, "debug_enabled", False)
@@ -590,23 +616,16 @@ def _csymv_packed_rows_launch(A, X, Y, ar, ai, br, bi, n, lda, incx, incy, uplo)
         None, None, None, *args, *values,
     )
     if direct:
-        spr._ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
+        _ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
 
 
 _CSYMV_DIRECT_ENTRIES = {}
 _CSYMV_DIRECT_CACHE = {}
-_CSYMV_SPR = None
 
 
 def _csymv_direct_launch(A, X, Y, ar, ai, n, lda, incx, incy, uplo, core_limit):
-    global _CSYMV_SPR
-    if _CSYMV_SPR is None:
-        from . import spr
-
-        _CSYMV_SPR = spr
-    spr = _CSYMV_SPR
     device = A.device.index
-    if device != spr._current_device():
+    if device != _current_device():
         with torch_device_fn.device(A.device):
             return _csymv_direct_launch(
                 A, X, Y, ar, ai, n, lda, incx, incy, uplo, core_limit
@@ -657,25 +676,25 @@ def _csymv_direct_launch(A, X, Y, ar, ai, n, lda, incx, incy, uplo, core_limit):
     tiles = triton.cdiv(n, block_size)
     grid = min(tiles * (tiles + 1) // 2, core_limit)
     values = (ar, ai, n, lda, incx, incy, uplo, block_size)
-    stream = spr._current_raw_stream(device)
+    stream = _current_raw_stream(device)
     knobs = triton.knobs.runtime
     enter, exit = knobs.launch_enter_hook, knobs.launch_exit_hook
     has_enter = enter is not None and (
-        type(enter) is not spr._HOOK_CHAIN_TYPE or bool(enter.calls)
+        type(enter) is not _HOOK_CHAIN_TYPE or bool(enter.calls)
     )
     has_exit = exit is not None and (
-        type(exit) is not spr._HOOK_CHAIN_TYPE or bool(exit.calls)
+        type(exit) is not _HOOK_CHAIN_TYPE or bool(exit.calls)
     )
     if special or has_enter or has_exit:
         compiled[(grid, 1, 1)](*tensors, *values, stream=stream)
         return
     args = []
     for tensor, pointer in zip(tensors, pointers):
-        arg = spr._DevicePointer(pointer)
+        arg = _DevicePointer(pointer)
         arg.tensor = tensor
         args.append(arg)
     direct = (
-        type(run) is spr._NPU_LAUNCHER
+        type(run) is _NPU_LAUNCHER
         and not run.compile_only
         and not run.enable_msprof_register_tensor
         and not getattr(run.metadata, "debug_enabled", False)
@@ -695,7 +714,7 @@ def _csymv_direct_launch(A, X, Y, ar, ai, n, lda, incx, incy, uplo, core_limit):
         *values,
     )
     if direct:
-        spr._ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
+        _ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
 
 
 @libentry()
@@ -869,7 +888,6 @@ def _ssymv_scale_kernel(
 
 _SSYMV_ROWS_ENTRIES = {}
 _SSYMV_ROWS_CACHE = {}
-_SSYMV_SPR = None
 
 
 def _ssymv_rows_entry(device, kind="rows"):
@@ -888,7 +906,6 @@ def _ssymv_rows_entry(device, kind="rows"):
 
 
 def _ssymv_rows_launch(uplo, n, alpha, A, lda, x, incx, beta, y, incy, kind="rows"):
-    global _SSYMV_SPR
     assert A.dtype == torch.float32 == x.dtype == y.dtype
     _check_common(A, x, y, uplo, n, lda, incx, incy)
     if n == 0:
@@ -898,13 +915,8 @@ def _ssymv_rows_launch(uplo, n, alpha, A, lda, x, incx, beta, y, incy, kind="row
     if alpha == 0 and beta == 1:
         return
     assert A.device.type == "npu"
-    if _SSYMV_SPR is None:
-        from . import spr
-
-        _SSYMV_SPR = spr
-    spr = _SSYMV_SPR
     device = A.device.index
-    if device != spr._current_device():
+    if device != _current_device():
         with torch_device_fn.device(A.device):
             return _ssymv_rows_launch(
                 uplo, n, alpha, A, lda, x, incx, beta, y, incy, kind=kind
@@ -965,25 +977,25 @@ def _ssymv_rows_launch(uplo, n, alpha, A, lda, x, incx, beta, y, incy, kind="row
     compiled, run, special, bm, bk = cached
     values = (*values, bm, bk)
     grid = triton.cdiv(n, bm)
-    stream = spr._current_raw_stream(device)
+    stream = _current_raw_stream(device)
     knobs = triton.knobs.runtime
     enter, exit = knobs.launch_enter_hook, knobs.launch_exit_hook
     has_enter = enter is not None and (
-        type(enter) is not spr._HOOK_CHAIN_TYPE or bool(enter.calls)
+        type(enter) is not _HOOK_CHAIN_TYPE or bool(enter.calls)
     )
     has_exit = exit is not None and (
-        type(exit) is not spr._HOOK_CHAIN_TYPE or bool(exit.calls)
+        type(exit) is not _HOOK_CHAIN_TYPE or bool(exit.calls)
     )
     if special or has_enter or has_exit:
         compiled[(grid, 1, 1)](A, x, y, *values, stream=stream)
         return
     args = []
     for tensor, pointer in zip((A, x, y), pointers):
-        arg = spr._DevicePointer(pointer)
+        arg = _DevicePointer(pointer)
         arg.tensor = tensor
         args.append(arg)
     direct = (
-        type(run) is spr._NPU_LAUNCHER
+        type(run) is _NPU_LAUNCHER
         and not run.compile_only
         and not run.enable_msprof_register_tensor
         and not getattr(run.metadata, "debug_enabled", False)
@@ -1003,4 +1015,4 @@ def _ssymv_rows_launch(uplo, n, alpha, A, lda, x, incx, beta, y, incy, kind="row
         *values,
     )
     if direct:
-        spr._ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
+        _ascend_driver_utils.TRITON_PROFILER_REGISTERED = registered == 1
