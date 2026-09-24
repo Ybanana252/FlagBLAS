@@ -20,7 +20,7 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark as _run_benchmark
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -34,12 +34,19 @@ from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 if IS_HYGON:
     import atexit
 elif IS_MTHREADS:
     from benchmark.mublas_compat import cp, cublas
-else:
+elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -168,11 +175,11 @@ if IS_HYGON:
     atexit.register(_destroy_hipblas_handles)
 
 
-_cublas = None if IS_HYGON else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 
 _CUBLAS_TBMV_FUNCS = (
     {}
-    if IS_HYGON
+    if IS_HYGON or IS_ASCEND
     else {
         torch.float32: _cublas.cublasStbmv_v2,
         torch.float64: _cublas.cublasDtbmv_v2,
@@ -242,17 +249,27 @@ gems_ztbmv_wrapper = _gems_wrapper(flag_blas.ztbmv)
 
 
 def _generate_triangular_banded(n, k, lda, uplo, dtype, device):
-    A = torch.zeros((n, lda), dtype=dtype, device=device)
-    column_A = torch.zeros((n, lda), dtype=dtype, device=device)
+    build_device = "cpu" if IS_ASCEND and dtype.is_complex else device
+    A = torch.zeros((n, lda), dtype=dtype, device=build_device)
+    column_A = (
+        None
+        if IS_ASCEND
+        else torch.zeros((n, lda), dtype=dtype, device=build_device)
+    )
+    randn = ascend_randn if IS_ASCEND else torch.randn
     for d in range(k + 1):
         count = n - d
-        vals = torch.randn(count, dtype=dtype, device=device) * 0.1
+        vals = randn(count, dtype=dtype, device=build_device) * 0.1
         if uplo == CUBLAS_FILL_MODE_UPPER:
             A[:count, d] = vals
-            column_A[d:, k - d] = vals
+            if column_A is not None:
+                column_A[d:, k - d] = vals
         else:
             A[d:, k - d] = vals
-            column_A[:count, d] = vals
+            if column_A is not None:
+                column_A[:count, d] = vals
+    if IS_ASCEND:
+        return A.to(device).contiguous(), None
     return A.contiguous(), column_A.contiguous()
 
 
@@ -265,6 +282,12 @@ def _triangular_banded_nnz(n, k):
 
 
 class TbmvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "tbmv"
+
+    DEFAULT_SHAPES = [(n,) for n in TBMV_SIZES]
+    DEFAULT_SHAPE_DESC = "N"
+
     def __init__(
         self,
         *args,
@@ -296,7 +319,7 @@ class TbmvBenchmark(Benchmark):
             hip_uplo = 121 if self.uplo == CUBLAS_FILL_MODE_UPPER else 122
             hip_trans = 111 + self.trans
             hip_diag = 131 + self.diag
-        else:
+        elif not IS_ASCEND:
             handle = cp.cuda.device.get_cublas_handle()
             cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
 
@@ -320,7 +343,20 @@ class TbmvBenchmark(Benchmark):
                 A, column_A = _generate_triangular_banded(
                     n, k, lda, self.uplo, cur_dtype, self.device
                 )
-                x = torch.randn(n, dtype=cur_dtype, device=self.device)
+                randn = ascend_randn if IS_ASCEND else torch.randn
+                x = randn(n, dtype=cur_dtype, device=self.device)
+                if IS_ASCEND:
+                    yield A, x, {
+                        "uplo": self.uplo,
+                        "trans": self.trans,
+                        "diag": self.diag,
+                        "n": n,
+                        "k": k,
+                        "lda": lda,
+                        "incx": 1,
+                        "handle": None,
+                    }
+                    continue
                 vendor_args = (
                     (
                         handle,
@@ -401,6 +437,15 @@ class TbmvBenchmark(Benchmark):
         ref_args = (A, ref_x)
         blas_args = (A, x.clone())
         return ref_args, ref_kwargs, blas_args, kwargs
+
+
+def run_correctness_then_benchmark(bench):
+    if IS_ASCEND:
+        # Correctness is covered separately by tests/test_tbmv.py; this path
+        # times FlagBLAS against the saved H100 cuBLAS reference only.
+        bench.run()
+    else:
+        _run_benchmark(bench)
 
 
 @pytest.mark.stbmv

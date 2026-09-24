@@ -19,9 +19,10 @@ import os
 from pathlib import Path
 
 import torch
+import triton
 
 import flag_blas
-from benchmark.attri_util import BenchmarkMetrics, BenchmarkResult
+from benchmark.attri_util import BenchMode, BenchmarkMetrics, BenchmarkResult
 from benchmark.conftest import Config, emit_record_logger
 from benchmark.level2_metrics import level2_workload
 from benchmark.performance_utils import Benchmark
@@ -168,6 +169,18 @@ class AscendL2Benchmark(Benchmark):
         self.init_user_config()
         reference = AscendL2Reference()
         reference.describe()
+        if Config.mode == BenchMode.KERNEL:
+            # do_bench estimates iteration counts around cache.zero_() as well
+            # as the operation. Ascend's first cache clear initializes runtime
+            # state; including that setup can reduce warmup and sampling to a
+            # single iteration. Initialize the timer's cache-clear path first,
+            # without executing the operation or changing the measured region.
+            driver = triton.runtime.driver.active
+            cache = driver.get_empty_cache_for_benchmark()
+            driver.clear_cache(cache)
+            driver.get_device_interface().synchronize()
+            del cache
+            print("[timing] cache-clear setup initialized before do_bench estimation")
         for dtype in self.to_bench_dtypes:
             metrics = []
             records = []
