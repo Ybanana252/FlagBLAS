@@ -1,4 +1,5 @@
-from .gemv import cgemv, sgemv
+from .gbmv import cgbmv, sgbmv
+from .gemv import bfgemv, cgemv, hgemv, sgemv
 from .ger import cgerc, cgeru, sger
 from .hemv import chemv
 from .her import cher
@@ -18,11 +19,15 @@ from .tpsv import ctpsv, stpsv
 from .trsv import ctrsv, strsv
 
 __all__ = [
+    "sgbmv",
+    "cgbmv",
     "sger",
     "cgeru",
     "cgerc",
     "sgemv",
     "cgemv",
+    "hgemv",
+    "bfgemv",
     "sspr",
     "sspr2",
     "chpr",

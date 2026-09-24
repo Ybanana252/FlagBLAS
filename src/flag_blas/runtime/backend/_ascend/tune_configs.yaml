@@ -1,3 +1,46 @@
+# Large SSYMV read-once triangular panels, shared across shapes.
+ssymv_panel_ascend:
+  - META: {BM: 32, BK: 256}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 32, BK: 512}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 64, BK: 256}
+    num_warps: 1
+    num_stages: 1
+
+# CGBMV shared structural tiles; no per-shape configuration table.
+cgbmv_short_ascend:
+  - META: {BM: 64}
+    num_warps: 1
+    num_stages: 1
+cgbmv_flat_ascend:
+  - META: {BM: 32}
+    num_warps: 1
+    num_stages: 1
+cgbmv_n_ascend:
+  - META: {BM: 8, BK: 256}
+    num_warps: 1
+    num_stages: 1
+cgbmv_t_ascend:
+  - META: {BM: 128, BK: 8}
+    num_warps: 1
+    num_stages: 1
+cgbmv_t_strided_ascend:
+  # BM=8 fails transposed strided correctness on Ascend (UB address error).
+  - META: {BM: 16, BK: 8}
+    num_warps: 1
+    num_stages: 1
+cgbmv_bounded_ascend:
+  - META: {BM: 8, BK: 8}
+    num_warps: 1
+    num_stages: 1
+cgbmv_scale_ascend:
+  - META: {BM: 256}
+    num_warps: 1
+    num_stages: 1
+
 attention:
 - gen: true
   param_map:
@@ -986,6 +1029,17 @@ cgemv_splitk_ascend:
   - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 64}
     num_warps: 1
     num_stages: 1
+
+sgemv_t_coalesced_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 2
 
 sgemv_n_wide_ascend:
   - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 512}
@@ -2697,6 +2751,17 @@ chpr2:
   - META: {BLOCK_SIZE: 16}
     num_warps: 1
     num_stages: 1
+ssymv_rows_ascend:
+  - META: {BM: 32, BK: 128}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 32, BK: 256}
+    num_warps: 1
+    num_stages: 1
+  - META: {BM: 64, BK: 128}
+    num_warps: 1
+    num_stages: 1
+
 ssymv:
   - META: {BLOCK_SIZE: 32}
     num_warps: 1
@@ -2754,6 +2819,9 @@ dsymv:
     num_warps: 4
     num_stages: 2
 csymv:
+  - META: {BLOCK_SIZE: 16}
+    num_warps: 1
+    num_stages: 1
   - META: {BLOCK_SIZE: 32}
     num_warps: 1
     num_stages: 1
@@ -2812,3 +2880,389 @@ ctrsv_panel:
   - META: {BLOCK_N: 8}
     num_warps: 1
     num_stages: 1
+
+hgemv_t_coalesced_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+bfgemv_t_coalesced_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+cgemv_n_packed_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 1
+
+cgemv_t_packed_ascend:
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 2
+
+
+sgemv_t_large_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+
+hgemv_t_large_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 512, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 1
+
+
+bfgemv_t_large_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 1
+
+
+cgemv_t_large_ascend:
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 1
+
+cgemv_t_packed_split_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 32, SPLIT_COUNT: 8}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 16, SPLIT_COUNT: 8}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 32, SPLIT_COUNT: 4}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 16, SPLIT_COUNT: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 512, BLOCK_SIZE_K: 8, SPLIT_COUNT: 16}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 2048, BLOCK_SIZE_K: 2, SPLIT_COUNT: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 512, BLOCK_SIZE_K: 8, SPLIT_COUNT: 10}
+    num_warps: 1
+    num_stages: 2
+
+
+cgemv_n_large_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 16}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+
+sgbmv_diagonal_ascend:
+  - META: {BM: 256}
+    num_warps: 1
+    num_stages: 1
+sgbmv_short_n_ascend:
+  - META: {BM: 256}
+    num_warps: 1
+    num_stages: 1
+sgbmv_short_t_ascend:
+  - META: {BM: 128}
+    num_warps: 1
+    num_stages: 1
+sgbmv_short_strided_ascend:
+  - META: {BM: 32}
+    num_warps: 1
+    num_stages: 1
+sgbmv_flat_ascend:
+  - META: {BM: 16}
+    num_warps: 1
+    num_stages: 1
+sgbmv_n_tail_ascend:
+  - META: {BM: 16, ZB: 256}
+    num_warps: 1
+    num_stages: 1
+sgbmv_n_regular_ascend:
+  - META: {BM: 8, ZB: 256}
+    num_warps: 1
+    num_stages: 1
+sgbmv_t_ascend:
+  - META: {BM: 256, BK: 8}
+    num_warps: 1
+    num_stages: 1
+sgbmv_t_strided_ascend:
+  - META: {BM: 32, BK: 8}
+    num_warps: 1
+    num_stages: 1
+sgbmv_scale_ascend:
+  - META: {BM: 256}
+    num_warps: 1
+    num_stages: 1
+sgbmv_bounded_ascend:
+  - META: {BM: 8, BK: 8}
+    num_warps: 1
+    num_stages: 1
+
+sgbmv_t_compact_ascend:
+- META:
+    BM: 32
+    BK: 64
+  num_warps: 1
+  num_stages: 1
+
+sgbmv_t_flat_tail_ascend:
+- META:
+    BM: 32
+    ZB: 1024
+  num_warps: 1
+  num_stages: 1
+
+
+# SGEMV streaming reads: shared pools, selected by libtuner.
+sgemv_n_stream_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+
+sgemv_t_stream_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+
+# SGEMV running 1D reductions; shared libtuner pools.
+sgemv_n_reduce_tiles_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+
+sgemv_t_reduce_tiles_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 3
+
+# Validated low-precision GEMV matrix streaming on Ascend.
+hgemv_n_stream_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+hgemv_t_stream_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+# Validated low-precision GEMV matrix streaming on Ascend.
+bfgemv_n_stream_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+bfgemv_t_stream_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+# BF16 aligned medium GEMV: validated shared block configuration pools.
+bfgemv_n_block_ascend:
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256, FULL_TILES: false}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 2
+bfgemv_t_block_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 3
+
+# FP16 aligned medium GEMV: validated shared block configuration pools.
+hgemv_n_block_ascend:
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256, FULL_TILES: false}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 2
+hgemv_t_block_ascend:
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64, FULL_TILES: true}
+    num_warps: 1
+    num_stages: 3
+
+# SGEMV medium transpose: output-parallel per-tile reduction.
+sgemv_t_medium_tiles_ascend:
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+
+# FP16 aligned large GEMV: full-tile matrix loads.
+hgemv_n_large_block_ascend:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 256}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+hgemv_t_large_block_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
+
+# BF16 medium skinny transpose GEMV: validated coalesced tile pool.
+bfgemv_t_medium_skinny_ascend:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 128}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 256, BLOCK_SIZE_K: 32}
+    num_warps: 1
+    num_stages: 2
