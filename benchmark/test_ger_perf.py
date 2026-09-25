@@ -19,12 +19,30 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
 
-if IS_HYGON:
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+
+    # Avoid importing CUDA libraries just to populate the shared GER metadata.
+    # FP64 variants retain the normal device capability check below.
+    GER_BENCH_OPS = {
+        "sger": (torch.float32, None, None, 1e-5),
+        "dger": (torch.float64, None, None, 1e-5),
+        "cgeru": (torch.complex64, None, None, 1e-5 + 2e-5j),
+        "cgerc": (torch.complex64, None, None, 1e-5 + 2e-5j),
+        "zgeru": (torch.complex128, None, None, 1e-5 + 2e-5j),
+        "zgerc": (torch.complex128, None, None, 1e-5 + 2e-5j),
+    }
+elif IS_HYGON:
+    from benchmark.performance_utils import Benchmark
+
     import atexit
     import ctypes
     import ctypes.util
@@ -161,7 +179,21 @@ if IS_HYGON:
         _HIPBLAS_HANDLES.clear()
 
     atexit.register(_destroy_hipblas_handles)
+elif IS_MTHREADS:
+    from benchmark.performance_utils import Benchmark
+    from benchmark.mublas_compat import cp, cublas
+
+    GER_BENCH_OPS = {
+        "sger": (torch.float32, cublas.sger, np.float32, 1e-5),
+        "dger": (torch.float64, cublas.dger, np.float64, 1e-5),
+        "cgeru": (torch.complex64, cublas.cgeru, np.complex64, 1e-5 + 2e-5j),
+        "cgerc": (torch.complex64, cublas.cgerc, np.complex64, 1e-5 + 2e-5j),
+        "zgeru": (torch.complex128, cublas.zgeru, np.complex128, 1e-5 + 2e-5j),
+        "zgerc": (torch.complex128, cublas.zgerc, np.complex128, 1e-5 + 2e-5j),
+    }
 else:
+    from benchmark.performance_utils import Benchmark
+
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -255,7 +287,27 @@ def flag_blas_ger_wrapper(
     return A_row
 
 
+def flag_blas_ger_ascend_wrapper(
+    A,
+    x,
+    y,
+    m,
+    n,
+    alpha,
+    lda,
+    incx,
+    incy,
+    gems_func,
+    **kwargs,
+):
+    gems_func(m, n, alpha, x, incx, y, incy, A, lda)
+    return A
+
+
 class GerBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "ger"
+
     def __init__(self, *args, ger_op_name, incx=1, incy=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.ger_op_name = ger_op_name
@@ -283,6 +335,23 @@ class GerBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            gems_func = getattr(flag_blas, self.ger_op_name)
+            for m, n in self.shapes:
+                A = ascend_randn((m, n), dtype=cur_dtype, device=self.device)
+                x = ascend_randn(m * self.incx, dtype=cur_dtype, device=self.device)
+                y = ascend_randn(n * self.incy, dtype=cur_dtype, device=self.device)
+                yield A, x, y, {
+                    "m": m,
+                    "n": n,
+                    "alpha": self.alpha,
+                    "lda": n,
+                    "incx": self.incx,
+                    "incy": self.incy,
+                    "matrix_layout": "row_major_full",
+                    "gems_func": gems_func,
+                }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             _, symbol, scalar_type, _ = GER_BENCH_OPS[self.ger_op_name]
@@ -391,12 +460,19 @@ def _run_ger_benchmark(op_name):
 
     bench = GerBenchmark(
         op_name=op_name,
-        torch_op=hipblas_ger if IS_HYGON else cublas_ger,
-        gems_op=flag_blas_ger_wrapper,
+        torch_op=None if IS_ASCEND else hipblas_ger if IS_HYGON else cublas_ger,
+        gems_op=(
+            flag_blas_ger_ascend_wrapper if IS_ASCEND else flag_blas_ger_wrapper
+        ),
         dtypes=[dtype],
         ger_op_name=op_name,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Correctness is covered by tests/test_ger.py; this path only times
+        # FlagBLAS and compares it with saved H100 cuBLAS measurements.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.sger

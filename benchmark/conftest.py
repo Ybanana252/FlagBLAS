@@ -33,12 +33,41 @@ from benchmark.attri_util import (
     OperationAttribute,
     get_recommended_shapes,
 )
+from benchmark.l2_supported_perf import keep_thead_l2_perf_node
 from flag_blas.runtime import torch_device_fn
 
 device = flag_blas.device
 vendor_name = flag_blas.vendor_name
 recordLogger = logging.getLogger("flag_blas_benchmark")
 recordLogger.propagate = False
+
+_THEAD_COMPLEX_L2_SUFFIXES = {
+    "gbmv",
+    "gemv",
+    "gerc",
+    "geru",
+    "hbmv",
+    "hemv",
+    "her",
+    "her2",
+    "hpmv",
+    "hpr",
+    "hpr2",
+    "symv",
+    "syr",
+    "syr2",
+    "tbmv",
+    "tbsv",
+    "tpmv",
+    "tpsv",
+    "trmv",
+    "trsv",
+}
+_THEAD_UNSUPPORTED_COMPLEX_L2_MARKS = {
+    f"{prefix}{suffix}"
+    for prefix in ("c", "z")
+    for suffix in _THEAD_COMPLEX_L2_SUFFIXES
+}
 
 
 def emit_record_logger(message: str) -> None:
@@ -258,6 +287,30 @@ BUILTIN_MARKS = {
     "tryfirst",
     "trylast",
 }
+
+
+def pytest_collection_modifyitems(items):
+    if vendor_name != "thead":
+        return
+
+    items[:] = [item for item in items if keep_thead_l2_perf_node(item.nodeid)]
+
+    unsupported = pytest.mark.skip(
+        reason="T-Head HGGC does not support complex Level-2 BLAS references"
+    )
+    unsupported_fp8gemv = pytest.mark.skip(
+        reason="T-Head PPU does not support the FP8 GEMV benchmark"
+    )
+    for item in items:
+        marker_names = {mark.name for mark in item.iter_markers()}
+        if "fp8gemv" in marker_names:
+            item.add_marker(unsupported_fp8gemv)
+            continue
+        if any(
+            mark.name in _THEAD_UNSUPPORTED_COMPLEX_L2_MARKS
+            for mark in item.iter_markers()
+        ):
+            item.add_marker(unsupported)
 
 
 @pytest.fixture(scope="session", autouse=True)

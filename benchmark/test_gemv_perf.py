@@ -14,22 +14,33 @@
 
 from typing import Generator
 
+import flag_blas
 import numpy as np
 import pytest
 import torch
-
-import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_OP_C, CUBLAS_OP_N, CUBLAS_OP_T
 from flag_blas.utils import shape_utils
 
+from benchmark.performance_utils import run_correctness_then_benchmark
+
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 if IS_HYGON:
     import atexit
     import ctypes
     import ctypes.util
-else:
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
+elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -475,7 +486,14 @@ def cublas_half_gemv(
         m_c, n_c, k_c = n, 1, m
         lda_c, ldb_c, ldc_c = lda_row, m, n
 
-    cublas.gemmEx(
+    compute_type = CUDA_R_32F
+    if IS_MTHREADS:
+        transA = 112 if trans == CUBLAS_OP_N else 111
+        transB = 111
+        # Match muBLAS compute modes and the scalar types prepared below.
+        compute_type = 64 if A_row.dtype == torch.float16 else 68
+
+    status = cublas.gemmEx(
         handle,
         transA,
         transB,
@@ -493,9 +511,11 @@ def cublas_half_gemv(
         y.data_ptr(),
         cuda_type,
         ldc_c,
-        CUDA_R_32F,
+        compute_type,
         0,
     )
+    if IS_MTHREADS and status != 0:
+        raise RuntimeError(f"muBLAS GemmEx failed with status {status}")
     return y
 
 
@@ -640,6 +660,9 @@ def gems_bfgemv_wrapper(
 
 
 class GemvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "gemv"
+
     def __init__(self, *args, trans=CUBLAS_OP_N, alpha=1.5, beta=0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.trans = trans
@@ -705,6 +728,28 @@ class GemvBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for m, n in self.shapes:
+                A = ascend_randn((m, n), dtype=cur_dtype, device=self.device)
+                x_len, y_len = (n, m) if self.trans == CUBLAS_OP_N else (m, n)
+                x = ascend_randn(x_len, dtype=cur_dtype, device=self.device)
+                y = ascend_randn(y_len, dtype=cur_dtype, device=self.device)
+                yield A, x, y, {
+                    "trans": self.trans,
+                    "m": m,
+                    "n": n,
+                    "alpha": self.alpha,
+                    "beta": self.beta,
+                    "A_row": A,
+                    "lda_row": n,
+                    "lda_col": m,
+                    "incx": 1,
+                    "incy": 1,
+                    "handle": None,
+                    "alpha_ptr": None,
+                    "beta_ptr": None,
+                }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, scalar_type = _resolve_hipblas_gemv(library, cur_dtype)
@@ -792,7 +837,10 @@ def test_perf_sgemv():
         dtypes=[torch.float32],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.sgemv
@@ -804,7 +852,10 @@ def test_perf_sgemv_trans():
         dtypes=[torch.float32],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dgemv
@@ -818,7 +869,10 @@ def test_perf_dgemv():
         dtypes=[torch.float64],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dgemv
@@ -832,7 +886,10 @@ def test_perf_dgemv_trans():
         dtypes=[torch.float64],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgemv
@@ -846,7 +903,10 @@ def test_perf_cgemv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgemv
@@ -860,7 +920,10 @@ def test_perf_cgemv_trans():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgemv
@@ -874,7 +937,10 @@ def test_perf_cgemv_conj():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgemv
@@ -890,7 +956,10 @@ def test_perf_zgemv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgemv
@@ -906,7 +975,10 @@ def test_perf_zgemv_trans():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgemv
@@ -922,11 +994,17 @@ def test_perf_zgemv_conj():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 class HalfGemvBenchmark(GemvBenchmark):
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            yield from super().get_input_iter(cur_dtype)
+            return
         if IS_HYGON:
             if cur_dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError(
@@ -940,15 +1018,17 @@ class HalfGemvBenchmark(GemvBenchmark):
         else:
             handle = cp.cuda.device.get_cublas_handle()
             cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
-            alpha_np = np.array(self.alpha, dtype=np.float32)
-            beta_np = np.array(self.beta, dtype=np.float32)
+            scalar_dtype = (
+                np.float16 if IS_MTHREADS and cur_dtype == torch.float16 else np.float32
+            )
+            alpha_np = np.array(self.alpha, dtype=scalar_dtype)
+            beta_np = np.array(self.beta, dtype=scalar_dtype)
             alpha_ptr = alpha_np.ctypes.data
             beta_ptr = beta_np.ctypes.data
             cuda_type = 2 if cur_dtype == torch.float16 else 14
 
         for shape in self.shapes:
             m, n = shape
-
             A_row = torch.randn(m, n, dtype=cur_dtype, device=self.device).contiguous()
 
             x_len, y_len = (n, m) if self.trans == CUBLAS_OP_N else (m, n)
@@ -998,7 +1078,10 @@ def test_perf_hgemv():
         dtypes=[torch.float16],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.hgemv
@@ -1012,7 +1095,10 @@ def test_perf_hgemv_trans():
         dtypes=[torch.float16],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.bfgemv
@@ -1026,7 +1112,10 @@ def test_perf_bfgemv():
         dtypes=[torch.bfloat16],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.bfgemv
@@ -1040,7 +1129,10 @@ def test_perf_bfgemv_trans():
         dtypes=[torch.bfloat16],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 def cublas_sgemv_fp8_baseline(
@@ -1218,6 +1310,10 @@ class Fp8GemvBenchmark(Benchmark):
 
 @pytest.mark.fp8gemv
 def test_perf_fp8_gemv_e4m3_vs_sgemv_trans():
+    if IS_ASCEND:
+        pytest.skip("Ascend does not support FP8 GEMV")
+    if flag_blas.vendor_name == "iluvatar":
+        pytest.skip("FP8 GEMV vendor baseline is unavailable on Iluvatar")
     if IS_HYGON:
         pytest.skip("FP8 GEMV cuBLAS baseline is unavailable on Hygon")
     bench = Fp8GemvBenchmark(
@@ -1228,11 +1324,18 @@ def test_perf_fp8_gemv_e4m3_vs_sgemv_trans():
         trans=CUBLAS_OP_T,
         fp8_dtype=torch.float8_e4m3fn,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.fp8gemv
 def test_perf_fp8_gemv_e5m2_vs_sgemv_trans():
+    if IS_ASCEND:
+        pytest.skip("Ascend does not support FP8 GEMV")
+    if flag_blas.vendor_name == "iluvatar":
+        pytest.skip("FP8 GEMV vendor baseline is unavailable on Iluvatar")
     if IS_HYGON:
         pytest.skip("FP8 GEMV cuBLAS baseline is unavailable on Hygon")
     bench = Fp8GemvBenchmark(
@@ -1243,4 +1346,7 @@ def test_perf_fp8_gemv_e5m2_vs_sgemv_trans():
         trans=CUBLAS_OP_T,
         fp8_dtype=torch.float8_e5m2,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)

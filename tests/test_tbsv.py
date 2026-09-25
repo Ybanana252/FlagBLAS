@@ -20,6 +20,8 @@ import torch
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
+
+from .vendor_blas_reference import check_hipblas_status, get_hipblas_context
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -32,7 +34,6 @@ from flag_blas.ops import (
 
 from .accuracy_utils import blas_assert_close, to_cpu_blas_tensor
 from .conftest import TO_CPU
-from .hipblas_reference import check_hipblas_status, get_hipblas_context
 
 
 def load_cublas():
@@ -49,7 +50,9 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on this system")
 
 
-_cublas = None if flag_blas.vendor_name == "hygon" else load_cublas()
+_cublas = (
+    None if flag_blas.vendor_name in {"ascend", "hygon", "mthreads"} else load_cublas()
+)
 
 
 def row_to_column_band(A, n, k, lda, uplo):
@@ -64,9 +67,14 @@ def row_to_column_band(A, n, k, lda, uplo):
         columns = rows + bands - k
     column_bands = (k - bands).expand(n, k + 1)
     valid = (columns >= 0) & (columns < n)
-    column_A[columns.expand(n, k + 1)[valid], column_bands[valid]] = A[:, : k + 1][
-        valid
-    ]
+    dst_rows = columns.expand(n, k + 1)[valid]
+    dst_cols = column_bands[valid]
+    if flag_blas.vendor_name == "mthreads" and A.dtype.is_complex:
+        column_real = torch.view_as_real(column_A)
+        source_real = torch.view_as_real(A[:, : k + 1])
+        column_real[dst_rows, dst_cols] = source_real[valid]
+    else:
+        column_A[dst_rows, dst_cols] = A[:, : k + 1][valid]
     return column_A.contiguous()
 
 
@@ -173,7 +181,10 @@ def cpu_tbsv_reference(uplo, trans, diag, n, k, A, lda, x, incx):
     if n == 0:
         return ref_x
 
-    ref_A = to_cpu_blas_tensor(row_to_column_band(A, n, k, lda, uplo))
+    if flag_blas.vendor_name == "ascend":
+        ref_A = row_to_column_band(to_cpu_blas_tensor(A), n, k, lda, uplo)
+    else:
+        ref_A = to_cpu_blas_tensor(row_to_column_band(A, n, k, lda, uplo))
     func = cpu_blas.ztbsv if ref_A.dtype.is_complex else cpu_blas.dtbsv
 
     xout = func(
@@ -194,7 +205,7 @@ def tbsv_reference(uplo, trans, diag, n, k, A, lda, x, incx):
         return cpu_tbsv_reference(uplo, trans, diag, n, k, A, lda, x, incx)
 
     ref_x = x.clone()
-    if flag_blas.vendor_name == "hygon":
+    if flag_blas.vendor_name in {"hygon", "mthreads"}:
         hipblas_tbsv_reference(uplo, trans, diag, n, k, A, lda, ref_x, incx)
     else:
         cublas_tbsv_reference(uplo, trans, diag, n, k, A, lda, ref_x, incx)
@@ -214,14 +225,26 @@ COMPLEX_TRANS_MODES = [CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_OP_C]
 DIAG_MODES = [CUBLAS_DIAG_NON_UNIT, CUBLAS_DIAG_UNIT]
 
 
+def tbsv_randn(*shape, dtype, device):
+    if flag_blas.vendor_name == "ascend" and dtype == torch.complex64:
+        values = torch.randn((*shape, 2), dtype=torch.float32, device=device)
+        return torch.view_as_complex(values)
+    return torch.randn(shape, dtype=dtype, device=device)
+
+
 def make_triangular_banded(n, k, lda, uplo, dtype, device, unit_diag=False):
     if n == 0:
         return torch.zeros((n, lda), dtype=dtype, device=device).contiguous()
 
-    A = torch.randn((n, lda), dtype=dtype, device=device) * 0.1
+    build_device = (
+        "cpu"
+        if flag_blas.vendor_name == "ascend" and dtype == torch.complex64
+        else device
+    )
+    A = tbsv_randn(n, lda, dtype=dtype, device=build_device) * 0.1
     diag_floor = 2.0 * (k + 1) + 1.0
-    bands = torch.arange(lda, device=device).view(1, lda)
-    rows = torch.arange(n, device=device).view(n, 1)
+    bands = torch.arange(lda, device=build_device).view(1, lda)
+    rows = torch.arange(n, device=build_device).view(n, 1)
 
     if uplo == CUBLAS_FILL_MODE_UPPER:
         valid = bands <= torch.clamp(n - 1 - rows, max=k)
@@ -240,14 +263,14 @@ def make_triangular_banded(n, k, lda, uplo, dtype, device, unit_diag=False):
             else torch.float32
         )
         sign = torch.where(
-            torch.rand(n, device=device) < 0.5,
-            torch.full((n,), -1.0, dtype=real_dtype, device=device),
-            torch.full((n,), 1.0, dtype=real_dtype, device=device),
+            torch.rand(n, device=build_device) < 0.5,
+            torch.full((n,), -1.0, dtype=real_dtype, device=build_device),
+            torch.full((n,), 1.0, dtype=real_dtype, device=build_device),
         )
         A[:, diag_col] = (
-            sign * (diag_floor + torch.rand(n, dtype=real_dtype, device=device))
+            sign * (diag_floor + torch.rand(n, dtype=real_dtype, device=build_device))
         ).to(dtype)
-    return A.contiguous()
+    return A.to(device).contiguous()
 
 
 def _effective_k(n, k):
@@ -260,6 +283,8 @@ def check_fp64_support():
 
 
 def _make_x(length, dtype, device):
+    if flag_blas.vendor_name == "ascend" and dtype == torch.complex64:
+        return tbsv_randn(length, dtype=dtype, device=device)
     if dtype.is_complex:
         return torch.randn(length, dtype=dtype, device=device) + 1j * torch.randn(
             length, dtype=dtype, device=device

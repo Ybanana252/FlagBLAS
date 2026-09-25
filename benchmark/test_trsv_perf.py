@@ -22,17 +22,18 @@ import torch
 import flag_blas
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
 
 if IS_HYGON:
     import atexit
-else:
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
+elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
-from benchmark.performance_utils import (  # noqa: E402
-    Benchmark,
-    run_correctness_then_benchmark,
-)
+from benchmark.performance_utils import run_correctness_then_benchmark  # noqa: E402
 from flag_blas.ops import (  # noqa: E402
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -44,10 +45,20 @@ from flag_blas.ops import (  # noqa: E402
 )
 from flag_blas.utils import shape_utils  # noqa: E402
 
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
+
 TRSV_SIZES = [64, 256, 512, 1024, 2048, 4096, 8192]
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -60,11 +71,11 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on this system")
 
 
-_cublas = None if IS_HYGON else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 
 _CUBLAS_TRSV_FUNCS = (
     {}
-    if IS_HYGON
+    if IS_HYGON or IS_ASCEND
     else {
         torch.float32: _cublas.cublasStrsv_v2,
         torch.float64: _cublas.cublasDtrsv_v2,
@@ -233,6 +244,8 @@ def _run_trsv_benchmark(
     diag,
     require_fp64=False,
 ):
+    if IS_ASCEND and dtype not in (torch.float32, torch.complex64):
+        pytest.skip("Ascend TRSV benchmark supports float32 and complex64")
     if require_fp64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
     bench = TrsvBenchmark(
@@ -244,31 +257,50 @@ def _run_trsv_benchmark(
         trans=trans,
         diag=diag,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Use saved H100 timings, not a CUDA reference on the NPU. Operator
+        # correctness is checked separately; this path measures performance.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 def _generate_triangular_A(n, lda, uplo, diag, dtype, device):
-    vals = torch.randn(n, n, dtype=dtype, device=device) * 0.02
-    A = torch.zeros((n, lda), dtype=dtype, device=device)
-    row_idx = torch.arange(n, device=device).view(1, n)
-    col_idx = torch.arange(n, device=device).view(n, 1)
+    # Keep input preparation outside timing and avoid unsupported complex
+    # random/masking/diagonal operations on Ascend.
+    build_device = "cpu" if IS_ASCEND and dtype.is_complex else device
+    vals = torch.randn(n, n, dtype=dtype, device=build_device) * 0.02
+    A = torch.zeros((n, lda), dtype=dtype, device=build_device)
+    row_idx = torch.arange(n, device=build_device).view(1, n)
+    col_idx = torch.arange(n, device=build_device).view(n, 1)
     if uplo == CUBLAS_FILL_MODE_UPPER:
         valid = row_idx <= col_idx
     else:
         valid = row_idx >= col_idx
-    A[:, :n] = vals.masked_fill(~valid, 0.0)
+    if IS_MTHREADS and dtype.is_complex:
+        torch.view_as_real(A)[:, :n] = torch.view_as_real(vals).masked_fill(
+            ~valid.unsqueeze(-1), 0.0
+        )
+    else:
+        A[:, :n] = vals.masked_fill(~valid, 0.0)
     if diag == CUBLAS_DIAG_NON_UNIT:
         diag_vals = torch.diagonal(vals).clone()
         if dtype.is_complex:
             diag_vals = diag_vals + (2.0 + 0.25j)
         else:
             diag_vals = diag_vals + 2.0
-        idx = torch.arange(n, device=device)
-        A[idx, idx] = diag_vals
-    return A.contiguous()
+        idx = torch.arange(n, device=build_device)
+        if IS_MTHREADS and dtype.is_complex:
+            torch.view_as_real(A)[idx, idx] = torch.view_as_real(diag_vals)
+        else:
+            A[idx, idx] = diag_vals
+    return A.to(device).contiguous() if IS_ASCEND else A.contiguous()
 
 
 class TrsvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "trsv"
+
     def __init__(
         self,
         *args,
@@ -283,7 +315,7 @@ class TrsvBenchmark(Benchmark):
         self.diag = diag
 
     def set_more_metrics(self):
-        self.correctness_reference = "hipBLAS" if IS_HYGON else "cuBLAS"
+        self.correctness_reference = "hipBLAS" if IS_HYGON else ("muBLAS" if IS_MTHREADS else "cuBLAS")
         return ["tflops", "gbps"]
 
     def set_more_shapes(self):
@@ -300,7 +332,7 @@ class TrsvBenchmark(Benchmark):
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func = _resolve_hipblas_trsv(library, cur_dtype)
-        else:
+        elif not IS_ASCEND:
             handle = cp.cuda.device.get_cublas_handle()
             cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
             if cur_dtype not in _CUBLAS_TRSV_FUNCS:
@@ -312,7 +344,18 @@ class TrsvBenchmark(Benchmark):
             A = _generate_triangular_A(
                 n, lda, self.uplo, self.diag, cur_dtype, self.device
             )
-            x = torch.randn(n, dtype=cur_dtype, device=self.device)
+            randn = ascend_randn if IS_ASCEND else torch.randn
+            x = randn(n, dtype=cur_dtype, device=self.device)
+            if IS_ASCEND:
+                yield A, x, {
+                    "uplo": self.uplo,
+                    "trans": self.trans,
+                    "diag": self.diag,
+                    "n": n,
+                    "lda": lda,
+                    "incx": 1,
+                }
+                continue
             reference_x = x.clone()
             if self.trans == CUBLAS_OP_C:
                 reference_x.copy_(reference_x.conj())

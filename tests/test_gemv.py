@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Keep GEMV coverage across data types when updating a backend implementation.
 
 import ctypes
 
@@ -27,15 +28,17 @@ from .conftest import TO_CPU
 
 IS_ASCEND = flag_blas.vendor_name == "ascend"
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_THEAD = flag_blas.vendor_name == "thead"
 
-if IS_HYGON:
-    from .hipblas_reference import (
+if IS_HYGON or IS_MTHREADS:
+    from .vendor_blas_reference import (
         HipComplex,
         HipDoubleComplex,
         check_hipblas_status,
         get_hipblas_context,
     )
-elif not IS_ASCEND:
+elif not (IS_ASCEND or IS_MTHREADS):
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -51,6 +54,10 @@ HYGON_ONLY = pytest.mark.skipif(not IS_HYGON, reason="Hygon regression")
 HYGON_FP8_UNSUPPORTED = pytest.mark.skipif(
     IS_HYGON,
     reason="Hygon does not support FP8 GEMV",
+)
+THEAD_FP8_E4M3_UNSUPPORTED = pytest.mark.skipif(
+    IS_THEAD,
+    reason="T-Head PPU Triton does not support the fp8e4nv encoding",
 )
 
 
@@ -564,8 +571,16 @@ def hipblas_low_precision_gemv_reference(
     ]
     function.restype = ctypes.c_int
 
-    alpha_value = ctypes.c_float(float(alpha))
-    beta_value = ctypes.c_float(float(beta))
+    if IS_MTHREADS and A.dtype == torch.float16:
+        alpha_value = ctypes.c_uint16(
+            np.asarray(alpha, dtype=np.float16).view(np.uint16).item()
+        )
+        beta_value = ctypes.c_uint16(
+            np.asarray(beta, dtype=np.float16).view(np.uint16).item()
+        )
+    else:
+        alpha_value = ctypes.c_float(float(alpha))
+        beta_value = ctypes.c_float(float(beta))
     if trans == CUBLAS_OP_N:
         trans_a = 112
         gemm_m, gemm_k = m, n
@@ -592,8 +607,8 @@ def hipblas_low_precision_gemv_reference(
             ctypes.c_void_p(y_work.data_ptr()),
             data_type,
             gemm_m,
-            2,
-            160,
+            (64 if A.dtype == torch.float16 else 68) if IS_MTHREADS else 2,
+            0 if IS_MTHREADS else 160,
         ),
         "hipblasGemmEx_v2",
     )
@@ -638,7 +653,7 @@ def gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
         return cpu_gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
 
     ref_y = y.clone()
-    if IS_HYGON:
+    if IS_HYGON or IS_MTHREADS:
         if A.dtype == torch.float32:
             hipblas_sgemv_reference(
                 trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy
@@ -660,7 +675,7 @@ def gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
                 trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy
             )
         else:
-            raise ValueError(f"Unsupported Hygon GEMV reference dtype: {A.dtype}")
+            raise ValueError(f"Unsupported vendor GEMV reference dtype: {A.dtype}")
     elif A.dtype in (torch.float16, torch.bfloat16):
         cupy_half_gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy)
     else:
@@ -933,9 +948,14 @@ def fp8_gemv_reference(trans, m, n, alpha, A, A_col_ref, x, x_ref, incx, beta, y
         return cpu_gemv_reference(trans, m, n, alpha, A, n, x, incx, beta, y, incy)
 
     ref_y = y.float().clone()
-    cublas_gemv_reference(
-        trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
-    )
+    if IS_MTHREADS:
+        hipblas_sgemv_reference(
+            trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
+        )
+    else:
+        cublas_gemv_reference(
+            trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
+        )
     return ref_y
 
 
@@ -1020,7 +1040,7 @@ def test_accuracy_sgemv(m, n, trans, beta):
     ref_y = gemv_reference(trans, m, n, alpha, A_col, m, x, 1, beta, y, 1)
     flag_blas.sgemv(trans, m, n, alpha, A_row, n, x, 1, beta, y, 1)
 
-    if TO_CPU:
+    if TO_CPU or IS_MTHREADS or IS_THEAD:
         blas_assert_close(y, ref_y, dtype, reduce_dim=x_len)
     else:
         tol = min(1e-5 * (x_len**0.5), 1e-3)
@@ -1043,7 +1063,7 @@ def test_accuracy_sgemv_stride(m, n, trans, incx, incy):
     ref_y = gemv_reference(trans, m, n, alpha, A_col, m, x, incx, beta, y, incy)
     flag_blas.sgemv(trans, m, n, alpha, A_row, n, x, incx, beta, y, incy)
 
-    if TO_CPU:
+    if TO_CPU or IS_THEAD:
         blas_assert_close(y, ref_y, dtype, reduce_dim=x_len)
     else:
         tol = min(1e-5 * (x_len**0.5), 1e-3)
@@ -1280,6 +1300,7 @@ def test_accuracy_bfgemv_stride(m, n, trans, incx, incy):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", FP8_GEMV_SHAPES)
 @pytest.mark.parametrize("beta", [0.0, 0.5])
@@ -1308,6 +1329,7 @@ def test_accuracy_fp8_gemv_e4m3(m, n, beta):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(64, 128), (128, 64), (256, 256)])
 @pytest.mark.parametrize("incx,incy", STRIDES)
@@ -1392,6 +1414,7 @@ def test_accuracy_fp8_gemv_e5m2_stride(m, n, incx, incy):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(256, 256), (1024, 1024), (4096, 4096)])
 @pytest.mark.parametrize("y_dtype", [torch.float16, torch.bfloat16])
@@ -1420,6 +1443,7 @@ def test_accuracy_fp8_gemv_output_dtype(m, n, y_dtype):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_alpha_zero():
     m, n = 128, 256
@@ -1445,6 +1469,7 @@ def test_fp8_gemv_alpha_zero():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_beta_zero():
     m, n = 128, 256
@@ -1478,6 +1503,7 @@ def test_fp8_gemv_beta_zero():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_empty():
     fp8_dtype = torch.float8_e4m3fn
@@ -1500,6 +1526,7 @@ def test_fp8_gemv_empty():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(256, 256), (1024, 1024)])
 def test_accuracy_fp8_gemv_mixed_dtype(m, n):

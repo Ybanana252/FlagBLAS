@@ -95,3 +95,282 @@ group_bfgemm:
   - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, NUM_WM: 8}
     num_warps: 8
     num_stages: 5
+# PPU SDK 2.1 / FlagTree 3.6: independently measured small GEMV regions.
+thead_sgemv_t_fullk:
+  - META: {BLOCK_SIZE_M: 8, BLOCK_SIZE_K: 512}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_K: 1024}
+    num_warps: 8
+    num_stages: 2
+
+thead_dgemv_t_fullk:
+  - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 256}
+    num_warps: 8
+    num_stages: 1
+
+thead_lowp_gemv_n_medium:
+  - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 512}
+    num_warps: 4
+    num_stages: 1
+
+thead_lowp_gemv_t_k4:
+  - META: {BLOCK_SIZE_M: 1024, BLOCK_SIZE_K: 4}
+    num_warps: 4
+    num_stages: 2
+
+sgemv_t_narrow_thead:
+  - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 2048}
+    num_warps: 32
+    num_stages: 2
+
+dgemv_t_narrow_thead:
+  - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 2048}
+    num_warps: 32
+    num_stages: 4
+
+lowp_gemv_t_thead:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 256}
+    num_warps: 32
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 5
+  - META: {BLOCK_SIZE_M: 128, BLOCK_SIZE_K: 128}
+    num_warps: 32
+    num_stages: 3
+
+lowp_gemv_t_narrow_split_thead:
+  - META: {BLOCK_SIZE_M: 1, BLOCK_SIZE_K: 1024}
+    num_warps: 8
+    num_stages: 2
+
+sgemv_t_k1_thead:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 16
+    num_stages: 1
+
+lowp_gemv_t_k1_thead:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 1
+
+dgemv_n3_thead:
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_K: 4}
+    num_warps: 4
+    num_stages: 1
+
+thead_spr_row:
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE: 128}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 8
+    num_stages: 2
+
+# Measured upper-packed, unit-stride SPR regions; other paths retain tuning.
+thead_sspr_row_medium:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 4
+    num_stages: 1
+
+thead_dspr_row_medium:
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 1
+
+thead_spr_row_wide:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 8
+    num_stages: 1
+
+thead_spr_tile_small:
+  - META: {BLOCK_SIZE: 8}
+    num_warps: 2
+    num_stages: 2
+
+thead_spr2_row:
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE: 128}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 8
+    num_stages: 2
+
+thead_spr2_tile_small:
+  - META: {BLOCK_SIZE: 8}
+    num_warps: 2
+    num_stages: 2
+
+thead_spr2_tile_medium:
+  - META: {BLOCK_SIZE: 16}
+    num_warps: 4
+    num_stages: 1
+
+thead_dspr2_tri:
+  - META: {BLOCK_SIZE: 16}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 8
+    num_stages: 1
+
+thead_syr:
+  - META: {BLOCK_SIZE: 16}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 8
+    num_stages: 1
+
+thead_ssyr_col:
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BLOCK_SIZE: 128}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 8
+    num_stages: 2
+
+thead_ssyr_col_1536:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 8
+    num_stages: 1
+
+thead_ssyr2_tri:
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_SIZE: 128}
+    num_warps: 8
+    num_stages: 1
+
+thead_ssyr2_aligned:
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 64}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_SIZE: 128}
+    num_warps: 8
+    num_stages: 1
+
+# Fixed configs for independently verified SYR2 shapes; other paths keep tuning.
+thead_ssyr2_aligned_focused:
+  - META: {BLOCK_SIZE: 32}
+    num_warps: 4
+    num_stages: 2
+
+thead_dsyr2_1024:
+  - META: {BLOCK_SIZE: 16}
+    num_warps: 2
+    num_stages: 1
+
+thead_sger:
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 16}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 256}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 256}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 128}
+    num_warps: 8
+    num_stages: 3
+
+thead_dger:
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_N: 64}
+    num_warps: 2
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_N: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 4, BLOCK_SIZE_N: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 256}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 256}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 128}
+    num_warps: 8
+    num_stages: 3

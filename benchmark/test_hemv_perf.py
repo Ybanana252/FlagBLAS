@@ -21,15 +21,27 @@ import torch
 
 import flag_blas
 
-if flag_blas.vendor_name == "hygon":
+IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+elif IS_HYGON:
     import atexit
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
 else:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
+
+if not IS_ASCEND:
+    from benchmark.performance_utils import Benchmark
 
 HEMV_SIZES = [
     128,
@@ -52,6 +64,10 @@ HEMV_SIZES = [
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -64,7 +80,7 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on this system")
 
 
-_cublas = None if flag_blas.vendor_name == "hygon" else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 
 
 class cuComplex(ctypes.Structure):
@@ -77,7 +93,7 @@ class cuDoubleComplex(ctypes.Structure):
 
 _CUBLAS_HEMV_FUNCS = (
     {}
-    if flag_blas.vendor_name == "hygon"
+    if IS_HYGON or IS_ASCEND
     else {
         torch.complex64: (_cublas.cublasChemv_v2, cuComplex),
         torch.complex128: (_cublas.cublasZhemv_v2, cuDoubleComplex),
@@ -238,6 +254,12 @@ def _generate_her_A(n, lda, dtype, device):
 
 
 class HemvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "hemv"
+
+    DEFAULT_SHAPES = [(n,) for n in HEMV_SIZES]
+    DEFAULT_SHAPE_DESC = "N"
+
     def __init__(
         self,
         *args,
@@ -261,8 +283,34 @@ class HemvBenchmark(Benchmark):
         self.shapes = [(n,) for n in HEMV_SIZES]
         return None
 
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+        max_n = max(HEMV_SIZES)
+        if any(len(shape) != 1 or shape[0] > max_n for shape in self.shapes):
+            self.shapes = list(self.DEFAULT_SHAPES)
+            self.shape_desc = self.DEFAULT_SHAPE_DESC
+
     def get_input_iter(self, cur_dtype) -> Generator:
-        if flag_blas.vendor_name == "hygon":
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                yield (
+                    ascend_randn((n, n), dtype=cur_dtype, device=self.device),
+                    ascend_randn(n, dtype=cur_dtype, device=self.device),
+                    ascend_randn(n, dtype=cur_dtype, device=self.device),
+                    {
+                        "uplo": self.uplo,
+                        "n": n,
+                        "alpha": self.alpha,
+                        "lda": n,
+                        "incx": 1,
+                        "beta": self.beta,
+                        "incy": 1,
+                        "matrix_layout": "row_major_full",
+                    },
+                )
+            return
+        if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor = _resolve_hipblas_hemv(library, cur_dtype)
             alpha_c = _make_scalar(ctor, self.alpha)
@@ -371,7 +419,10 @@ def test_perf_chemv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.chemv
@@ -385,7 +436,10 @@ def test_perf_chemv_upper():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zhemv
@@ -401,7 +455,10 @@ def test_perf_zhemv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zhemv
@@ -417,4 +474,7 @@ def test_perf_zhemv_upper():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)

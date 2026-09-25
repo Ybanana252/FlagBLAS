@@ -20,7 +20,7 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -33,10 +33,20 @@ from flag_blas.ops import (
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 if IS_HYGON:
     import atexit
-else:
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
+elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -64,6 +74,10 @@ TPMV_SIZES = [
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -167,11 +181,11 @@ if IS_HYGON:
     atexit.register(_destroy_hipblas_handles)
 
 
-_cublas = None if IS_HYGON else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 
 _CUBLAS_TPMV_FUNCS = (
     {}
-    if IS_HYGON
+    if IS_HYGON or IS_ASCEND
     else {
         torch.float32: _cublas.cublasStpmv_v2,
         torch.float64: _cublas.cublasDtpmv_v2,
@@ -245,12 +259,25 @@ gems_ztpmv_wrapper = _gems_wrapper(flag_blas.ztpmv)
 
 
 def _generate_packed_triangular(n, dtype, device):
-    return (
-        torch.randn(n * (n + 1) // 2, dtype=dtype, device=device) * 0.1
-    ).contiguous()
+    if not IS_ASCEND:
+        return (
+            torch.randn(n * (n + 1) // 2, dtype=dtype, device=device) * 0.1
+        ).contiguous()
+    AP = ascend_randn(n * (n + 1) // 2, dtype=dtype, device=device)
+    if dtype.is_complex:
+        torch.view_as_real(AP).mul_(0.1)
+    else:
+        AP.mul_(0.1)
+    return AP.contiguous()
 
 
 class TpmvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "tpmv"
+
+    DEFAULT_SHAPES = [(n,) for n in TPMV_SIZES]
+    DEFAULT_SHAPE_DESC = "N"
+
     def __init__(
         self,
         *args,
@@ -263,7 +290,7 @@ class TpmvBenchmark(Benchmark):
         self.uplo = uplo
         self.trans = trans
         self.diag = diag
-        self.correctness_reference = "hipBLAS" if IS_HYGON else "cuBLAS"
+        self.correctness_reference = "hipBLAS" if IS_HYGON else ("muBLAS" if IS_MTHREADS else "cuBLAS")
 
     def set_more_metrics(self):
         return ["tflops", "gbps"]
@@ -273,6 +300,19 @@ class TpmvBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                AP = _generate_packed_triangular(n, cur_dtype, self.device)
+                x = ascend_randn(n, dtype=cur_dtype, device=self.device)
+                yield AP, x, {
+                    "uplo": self.uplo,
+                    "trans": self.trans,
+                    "diag": self.diag,
+                    "n": n,
+                    "incx": 1,
+                }
+            return
         reference_uplo = (
             CUBLAS_FILL_MODE_LOWER
             if self.uplo == CUBLAS_FILL_MODE_UPPER
@@ -385,6 +425,15 @@ class TpmvBenchmark(Benchmark):
         return ref_args, ref_kwargs, blas_args, kwargs
 
 
+def _run_tpmv_benchmark(bench):
+    if IS_ASCEND:
+        # Correctness is covered separately by tests/test_tpmv.py; this path
+        # times FlagBLAS against the saved H100 cuBLAS reference only.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
+
+
 @pytest.mark.stpmv
 def test_perf_stpmv():
     bench = TpmvBenchmark(
@@ -396,7 +445,7 @@ def test_perf_stpmv():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.stpmv
@@ -410,7 +459,7 @@ def test_perf_stpmv_upper():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.stpmv
@@ -424,7 +473,7 @@ def test_perf_stpmv_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.stpmv
@@ -438,7 +487,7 @@ def test_perf_stpmv_upper_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.stpmv
@@ -452,7 +501,7 @@ def test_perf_stpmv_unit():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.dtpmv
@@ -468,7 +517,7 @@ def test_perf_dtpmv():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.dtpmv
@@ -484,7 +533,7 @@ def test_perf_dtpmv_upper():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.dtpmv
@@ -500,7 +549,7 @@ def test_perf_dtpmv_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.dtpmv
@@ -516,7 +565,7 @@ def test_perf_dtpmv_upper_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.dtpmv
@@ -532,7 +581,7 @@ def test_perf_dtpmv_unit():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -546,7 +595,7 @@ def test_perf_ctpmv():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -560,7 +609,7 @@ def test_perf_ctpmv_upper():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -574,7 +623,7 @@ def test_perf_ctpmv_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -588,7 +637,7 @@ def test_perf_ctpmv_conj():
         trans=CUBLAS_OP_C,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -602,7 +651,7 @@ def test_perf_ctpmv_upper_conj():
         trans=CUBLAS_OP_C,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ctpmv
@@ -616,7 +665,7 @@ def test_perf_ctpmv_unit():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -632,7 +681,7 @@ def test_perf_ztpmv():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -648,7 +697,7 @@ def test_perf_ztpmv_upper():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -664,7 +713,7 @@ def test_perf_ztpmv_trans():
         trans=CUBLAS_OP_T,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -680,7 +729,7 @@ def test_perf_ztpmv_conj():
         trans=CUBLAS_OP_C,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -696,7 +745,7 @@ def test_perf_ztpmv_upper_conj():
         trans=CUBLAS_OP_C,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)
 
 
 @pytest.mark.ztpmv
@@ -712,4 +761,4 @@ def test_perf_ztpmv_unit():
         trans=CUBLAS_OP_N,
         diag=CUBLAS_DIAG_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    _run_tpmv_benchmark(bench)

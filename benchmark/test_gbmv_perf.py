@@ -16,20 +16,31 @@ import ctypes
 import ctypes.util
 from typing import Generator
 
+import flag_blas
 import numpy as np
 import pytest
 import torch
-
-import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_OP_C, CUBLAS_OP_N, CUBLAS_OP_T
 from flag_blas.utils import shape_utils
 
+from benchmark.performance_utils import run_correctness_then_benchmark
+
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 if IS_HYGON:
     import atexit
-else:
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
+elif not IS_ASCEND:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -59,6 +70,10 @@ GBMV_SHAPES = [
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -176,11 +191,11 @@ if IS_HYGON:
     atexit.register(_destroy_hipblas_handles)
 
 
-_cublas = None if IS_HYGON else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 
 _CUBLAS_GBMV_FUNCS = (
     {}
-    if IS_HYGON
+    if IS_HYGON or IS_ASCEND
     else {
         torch.float32: (_cublas.cublasSgbmv_v2, ctypes.c_float, None),
         torch.float64: (_cublas.cublasDgbmv_v2, ctypes.c_double, None),
@@ -292,24 +307,33 @@ gems_zgbmv_wrapper = _gems_wrapper(flag_blas.zgbmv)
 
 def _generate_banded_AB(m, n, kl, ku, lda, dtype, device):
     """Generate equivalent row-major and column-major band storage."""
-    row_AB = torch.zeros((m, lda), dtype=dtype, device=device)
-    column_AB = torch.zeros((n, lda), dtype=dtype, device=device)
+    storage_device = device
+    row_AB = torch.zeros((m, lda), dtype=dtype, device=storage_device)
+    column_AB = torch.zeros((n, lda), dtype=dtype, device=storage_device)
     for d in range(-ku, kl + 1):
         j_min = max(0, -d)
         j_max = min(n, m - d)
         if j_min < j_max:
-            j_idx = torch.arange(j_min, j_max, device=device)
+            j_idx = torch.arange(j_min, j_max, device=storage_device)
             i_idx = j_idx + d
             if dtype.is_complex:
-                vals = torch.randn(len(j_idx), dtype=dtype, device=device)
+                vals = torch.randn(len(j_idx), dtype=dtype, device=storage_device)
             else:
-                vals = torch.randn(len(j_idx), dtype=dtype, device=device) * 0.1
-            row_AB[i_idx, kl - d] = vals
-            column_AB[j_idx, ku + d] = vals
-    return row_AB.contiguous(), column_AB.contiguous()
+                vals = torch.randn(len(j_idx), dtype=dtype, device=storage_device) * 0.1
+            if IS_MTHREADS and dtype.is_complex:
+                # TorchMUSA complex indexing is unsupported; write real views.
+                torch.view_as_real(row_AB)[i_idx, kl - d] = torch.view_as_real(vals)
+                torch.view_as_real(column_AB)[j_idx, ku + d] = torch.view_as_real(vals)
+            else:
+                row_AB[i_idx, kl - d] = vals
+                column_AB[j_idx, ku + d] = vals
+    return row_AB.contiguous().to(device), column_AB.contiguous().to(device)
 
 
 class GbmvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "gbmv"
+
     def __init__(
         self,
         *args,
@@ -323,7 +347,9 @@ class GbmvBenchmark(Benchmark):
         self.alpha = alpha
         self.beta = beta
         self.bands = GBMV_BANDS
-        self.correctness_reference = "hipBLAS" if IS_HYGON else "cuBLAS"
+        self.correctness_reference = (
+            "hipBLAS" if IS_HYGON else ("muBLAS" if IS_MTHREADS else "cuBLAS")
+        )
 
     def set_more_metrics(self):
         return ["tflops", "gbps"]
@@ -333,6 +359,41 @@ class GbmvBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            if cur_dtype not in (torch.float32, torch.complex64):
+                pytest.skip("Ascend GBMV benchmarks support float32 and complex64 only")
+            seen_configs = set()
+            for m, n in self.shapes:
+                for kl, ku in self.bands:
+                    kl, ku = min(kl, max(0, m - 1)), min(ku, max(0, n - 1))
+                    config = (m, n, kl, ku)
+                    if config in seen_configs:
+                        continue
+                    seen_configs.add(config)
+                    lda = kl + ku + 1
+                    AB = (
+                        ascend_randn((m, lda), dtype=cur_dtype, device=self.device)
+                        * 0.1
+                    )
+                    x_len, y_len = (n, m) if self.trans == CUBLAS_OP_N else (m, n)
+                    x = ascend_randn(x_len, dtype=cur_dtype, device=self.device)
+                    y = ascend_randn(y_len, dtype=cur_dtype, device=self.device)
+                    yield AB, x, y, {
+                        "trans": self.trans,
+                        "m": m,
+                        "n": n,
+                        "kl": kl,
+                        "ku": ku,
+                        "alpha": self.alpha,
+                        "beta": self.beta,
+                        "lda": lda,
+                        "incx": 1,
+                        "incy": 1,
+                        "handle": None,
+                        "alpha_ptr": None,
+                        "beta_ptr": None,
+                    }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor, is_complex = _resolve_hipblas_gbmv(library, cur_dtype)
@@ -502,7 +563,10 @@ def test_perf_sgbmv():
         dtypes=[torch.float32],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.sgbmv
@@ -514,7 +578,10 @@ def test_perf_sgbmv_trans():
         dtypes=[torch.float32],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dgbmv
@@ -528,7 +595,10 @@ def test_perf_dgbmv():
         dtypes=[torch.float64],
         trans=CUBLAS_OP_N,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dgbmv
@@ -542,7 +612,10 @@ def test_perf_dgbmv_trans():
         dtypes=[torch.float64],
         trans=CUBLAS_OP_T,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgbmv
@@ -556,7 +629,10 @@ def test_perf_cgbmv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgbmv
@@ -570,7 +646,10 @@ def test_perf_cgbmv_trans():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.cgbmv
@@ -584,7 +663,10 @@ def test_perf_cgbmv_conj():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgbmv
@@ -600,7 +682,10 @@ def test_perf_zgbmv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgbmv
@@ -616,7 +701,10 @@ def test_perf_zgbmv_trans():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.zgbmv
@@ -632,4 +720,7 @@ def test_perf_zgbmv_conj():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)

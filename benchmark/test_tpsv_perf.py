@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_FILL_MODE_LOWER,
@@ -19,6 +19,14 @@ from flag_blas.ops import (
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 TPSV_SIZES = [
     64,
@@ -46,6 +54,10 @@ TPSV_SIZES = [
 
 
 def _load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     names = ["libcublas.so.13"]
     found = ctypes.util.find_library("cublas")
     if found:
@@ -59,11 +71,11 @@ def _load_cublas():
     raise RuntimeError("Unable to find libcublas.so")
 
 
-_cublas = None if IS_HYGON else _load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else _load_cublas()
 _cublas_handle = None
 _CUBLAS_TPSV_FUNCS = (
     {}
-    if IS_HYGON
+    if IS_HYGON or IS_ASCEND
     else {
         torch.float32: _cublas.cublasStpsv_v2,
         torch.float64: _cublas.cublasDtpsv_v2,
@@ -74,6 +86,9 @@ _CUBLAS_TPSV_FUNCS = (
 
 
 def _get_cublas_handle():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import get_mublas_handle
+        return get_mublas_handle()
     global _cublas_handle
     if _cublas_handle is None:
         handle = ctypes.c_void_p()
@@ -228,16 +243,29 @@ def _row_major_diag_offsets(n, uplo, device):
 
 
 def _make_case(n, dtype, uplo, diag, device):
-    AP = torch.randn(n * (n + 1) // 2, dtype=dtype, device=device) * 0.02
+    randn = ascend_randn if IS_ASCEND else torch.randn
+    AP = randn(n * (n + 1) // 2, dtype=dtype, device=device)
+    if IS_ASCEND and dtype.is_complex:
+        # Ascend represents complex tensors as real pairs in these kernels;
+        # scale the real view to avoid a complex device-side multiply.
+        torch.view_as_real(AP).mul_(0.02)
+    else:
+        AP.mul_(0.02)
     if diag == CUBLAS_DIAG_NON_UNIT:
-        AP[_row_major_diag_offsets(n, uplo, device)] = (
-            (2.0 + 0.25j) if dtype.is_complex else 2.0
-        )
-    x = torch.randn(n, dtype=dtype, device=device)
+        offsets = _row_major_diag_offsets(n, uplo, device)
+        if (IS_MTHREADS or IS_ASCEND) and dtype.is_complex:
+            torch.view_as_real(AP)[offsets, 0] = 2.0
+            torch.view_as_real(AP)[offsets, 1] = 0.25
+        else:
+            AP[offsets] = (2.0 + 0.25j) if dtype.is_complex else 2.0
+    x = randn(n, dtype=dtype, device=device)
     return AP.contiguous(), x.contiguous()
 
 
 class TpsvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "tpsv"
+
     DEFAULT_SHAPES = [(n,) for n in TPSV_SIZES]
     DEFAULT_SHAPE_DESC = "N"
 
@@ -262,6 +290,18 @@ class TpsvBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                AP, x = _make_case(n, cur_dtype, self.uplo, self.diag, self.device)
+                yield AP, x, {
+                    "uplo": self.uplo,
+                    "trans": self.trans,
+                    "diag": self.diag,
+                    "n": n,
+                    "incx": 1,
+                }
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func = _resolve_hipblas_tpsv(library, cur_dtype)
@@ -364,7 +404,12 @@ def _run_tpsv(op_name, dtype, uplo, trans, diag=CUBLAS_DIAG_NON_UNIT):
         trans=trans,
         diag=diag,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Correctness is covered separately by tests/test_tpsv.py; this path
+        # times FlagBLAS against the saved H100 cuBLAS reference only.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 TPSV_PERF_CASES = [

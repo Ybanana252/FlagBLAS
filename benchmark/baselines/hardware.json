@@ -1,0 +1,22 @@
+{
+  "vector": {
+    "h100_theoretical": 67,
+    "ascend_measured": 7.24042878,
+    "unit": "TFLOPS"
+  },
+  "tensor_fp16": {
+    "h100_theoretical": 989.5,
+    "ascend_measured": 223.64525945622123,
+    "unit": "TFLOPS"
+  },
+  "tensor_bf16": {
+    "h100_theoretical": 989.5,
+    "ascend_measured": 227.75127747515842,
+    "unit": "TFLOPS"
+  },
+  "memory": {
+    "h100_theoretical": 3.35,
+    "ascend_measured": 1.5295359800119765,
+    "unit": "TB/s"
+  }
+}

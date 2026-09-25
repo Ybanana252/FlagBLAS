@@ -21,7 +21,7 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_FILL_MODE_LOWER,
@@ -33,6 +33,14 @@ from flag_blas.ops import (
 from flag_blas.utils import shape_utils
 
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
+else:
+    from benchmark.performance_utils import Benchmark
 
 STBSV_SIZES = [
     256,
@@ -49,6 +57,10 @@ STBSV_KS = [1, 4, 16, 64, 256]
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -61,11 +73,14 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on this system")
 
 
-_cublas = None if IS_HYGON else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND else load_cublas()
 _cublas_handle = None
 
 
 def _get_cublas_handle():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import get_mublas_handle
+        return get_mublas_handle()
     global _cublas_handle
     if _cublas_handle is None:
         handle = ctypes.c_void_p()
@@ -225,12 +240,19 @@ def _make_triangular_banded(n, k, lda, uplo, dtype, device):
         empty = torch.zeros((n, lda), dtype=dtype, device=device).contiguous()
         return empty, empty.clone()
 
-    A = torch.zeros((n, lda), dtype=dtype, device=device)
-    column_A = torch.zeros((n, lda), dtype=dtype, device=device)
+    build_device = "cpu" if IS_ASCEND and dtype.is_complex else device
+    A = torch.zeros((n, lda), dtype=dtype, device=build_device)
     diag_floor = 2.0 * (k + 1) + 1.0
-    rows = torch.arange(n, device=device).view(n, 1)
-    bands = torch.arange(k + 1, device=device).view(1, k + 1)
-    values = torch.randn((n, k + 1), dtype=dtype, device=device) * 0.1
+    rows = torch.arange(n, device=build_device).view(n, 1)
+    bands = torch.arange(k + 1, device=build_device).view(1, k + 1)
+    randn = ascend_randn if IS_ASCEND else torch.randn
+    values = randn((n, k + 1), dtype=dtype, device=build_device)
+    if IS_ASCEND and dtype.is_complex:
+        # Ascend represents complex tensors as real pairs in these kernels;
+        # scale the real view to avoid a complex device-side multiply.
+        torch.view_as_real(values).mul_(0.1)
+    else:
+        values.mul_(0.1)
     if uplo == CUBLAS_FILL_MODE_UPPER:
         columns = rows + bands
         diag_col = 0
@@ -238,12 +260,29 @@ def _make_triangular_banded(n, k, lda, uplo, dtype, device):
         columns = rows + bands - k
         diag_col = k
     valid = (columns >= 0) & (columns < n)
-    A[:, : k + 1] = values.masked_fill(~valid, 0.0)
-    A[:, diag_col] = diag_floor
+    if (IS_MTHREADS or IS_ASCEND) and dtype.is_complex:
+        torch.view_as_real(A)[:, : k + 1] = torch.view_as_real(values).masked_fill(
+            ~valid.unsqueeze(-1), 0.0
+        )
+    else:
+        A[:, : k + 1] = values.masked_fill(~valid, 0.0)
+    if IS_ASCEND and dtype.is_complex:
+        torch.view_as_real(A)[:, diag_col, 0] = diag_floor
+        torch.view_as_real(A)[:, diag_col, 1] = 0.0
+    else:
+        A[:, diag_col] = diag_floor
+    if IS_ASCEND:
+        return A.to(device).contiguous(), None
+
+    column_A = torch.zeros((n, lda), dtype=dtype, device=device)
     column_bands = (k - bands).expand(n, k + 1)
-    column_A[columns.expand(n, k + 1)[valid], column_bands[valid]] = A[:, : k + 1][
-        valid
-    ]
+    # Use real views for both complex gather and scatter on TorchMUSA.
+    use_real_view = IS_MTHREADS and dtype.is_complex
+    source = torch.view_as_real(A) if use_real_view else A
+    target = torch.view_as_real(column_A) if use_real_view else column_A
+    target[columns.expand(n, k + 1)[valid], column_bands[valid]] = source[
+        :, : k + 1
+    ][valid]
     return A.contiguous(), column_A.contiguous()
 
 
@@ -256,6 +295,9 @@ def _stored_band_nnz(n, k):
 
 
 class StbsvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "tbsv"
+
     def __init__(
         self,
         *args,
@@ -281,7 +323,7 @@ class StbsvBenchmark(Benchmark):
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func = _resolve_hipblas_tbsv(library, cur_dtype)
-        else:
+        elif not IS_ASCEND:
             handle = _get_cublas_handle()
             if cur_dtype == torch.float32:
                 c_func = _cublas.cublasStbsv_v2
@@ -307,7 +349,19 @@ class StbsvBenchmark(Benchmark):
                 A, reference_A = _make_triangular_banded(
                     n, k, lda, self.uplo, cur_dtype, self.device
                 )
-                x = torch.randn(n, dtype=cur_dtype, device=self.device)
+                randn = ascend_randn if IS_ASCEND else torch.randn
+                x = randn(n, dtype=cur_dtype, device=self.device)
+                if IS_ASCEND:
+                    yield A, x, {
+                        "uplo": self.uplo,
+                        "trans": self.trans,
+                        "diag": self.diag,
+                        "n": n,
+                        "k": k,
+                        "lda": lda,
+                        "incx": 1,
+                    }
+                    continue
                 reference_x = x.clone()
                 if IS_HYGON:
                     vendor_args = (
@@ -402,7 +456,12 @@ def _run_tbsv_variant(op_name, dtype, uplo, trans):
         trans=trans,
         diag=CUBLAS_DIAG_NON_UNIT,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        # Correctness is covered separately by tests/test_tbsv.py; this path
+        # times FlagBLAS against the saved H100 cuBLAS reference only.
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 TBSV_PERF_CASES = [
