@@ -9,11 +9,14 @@ from . import accuracy_utils as utils
 from .conftest import TO_CPU
 
 IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_PPU = flag_blas.vendor_name == "thead"
 
 if IS_ASCEND:
     torch_npu = pytest.importorskip("torch_npu")
     torch.npu.matmul.allow_hf32 = True
     torch.npu.matmul.cube_math_type = torch.npu.CubeMathType.USE_HF32
+elif IS_PPU:
+    pass
 else:
     import ctypes
     import ctypes.util
@@ -37,7 +40,7 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on the system.")
 
 
-_cublas = load_cublas() if not IS_ASCEND else None
+_cublas = load_cublas() if not IS_ASCEND and not IS_PPU else None
 
 
 def _cublasGemmGroupedBatchedEx(
@@ -86,7 +89,7 @@ def _cublasGemmGroupedBatchedEx(
     )
 
 
-if not IS_ASCEND:
+if not IS_ASCEND and not IS_PPU:
     cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
 
 
@@ -302,6 +305,28 @@ def test_accuracy_group_gemm(k, e, n):
         )
         return
 
+    if IS_PPU:
+        group_A = torch.randn(total_M, k, dtype=torch.float32, device=device) * scale
+        group_B = torch.randn(e, k, n, dtype=torch.float32, device=device) * scale
+        group_list = torch.tensor(m_list, dtype=torch.int32, device=device).cumsum(0)
+        # torch.mm keeps full fp32 precision on PPU, so the comparison absorbs
+        # the tf32 input rounding of the FlagBLAS kernel via reduce_dim-scaled
+        # atol (1e-3 * k).
+        ref = torch.cat(
+            [
+                torch.mm(group_A[start:end], group_B[group_idx])
+                for group_idx, (start, end) in enumerate(
+                    zip([0] + group_list[:-1].tolist(), group_list.tolist())
+                )
+            ],
+            dim=0,
+        )
+        out = flag_blas.group_tf32gemm(
+            group_A, group_B, group_list, torch.empty_like(ref)
+        )
+        utils.blas_assert_close(out, ref, torch.float32, reduce_dim=k, atol=1e-3)
+        return
+
     total_K = e * k
 
     group_A = (torch.randn(total_M, k, dtype=dtype, device=device) * scale).contiguous()
@@ -342,7 +367,7 @@ def test_accuracy_group_gemm(k, e, n):
 
 
 @pytest.mark.group_gemm
-@pytest.mark.skipif(IS_ASCEND, reason="Hopper-only alpha/beta interface")
+@pytest.mark.skipif(IS_ASCEND or IS_PPU, reason="Hopper-only alpha/beta interface")
 def test_group_gemm_alpha_zero():
     m, k, e, n = 16, 64, 4, 128
     dtype, device = torch.float32, flag_blas.device
@@ -367,7 +392,7 @@ def test_group_gemm_alpha_zero():
 
 
 @pytest.mark.group_gemm
-@pytest.mark.skipif(IS_ASCEND, reason="Hopper-only alpha/beta interface")
+@pytest.mark.skipif(IS_ASCEND or IS_PPU, reason="Hopper-only alpha/beta interface")
 def test_group_gemm_beta_zero():
     m, k, e, n = 8, 64, 3, 64
     dtype, device = torch.float32, flag_blas.device
@@ -393,7 +418,7 @@ def test_group_gemm_beta_zero():
 @pytest.mark.parametrize(
     "alpha,beta", [(1.0, 0.0), (2.0, 0.0), (2.0, 0.5), (0.0, 1.0), (0.5, 1.5)]
 )
-@pytest.mark.skipif(IS_ASCEND, reason="Hopper-only alpha/beta interface")
+@pytest.mark.skipif(IS_ASCEND or IS_PPU, reason="Hopper-only alpha/beta interface")
 def test_group_gemm_alpha_beta(alpha, beta):
     m, k, e, n = 32, 128, 2, 128
     dtype, device = torch.float32, flag_blas.device

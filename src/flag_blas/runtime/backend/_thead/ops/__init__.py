@@ -14,7 +14,7 @@
 
 from .gemv import bfgemv, dgemv, hgemv, sgemv
 from .ger import dger, sger
-from .group_gemm import group_bfgemm
+from .group_gemm import group_bfgemm, group_hgemm, group_tf32gemm
 from .hemv import chemv
 from .spr import dspr, sspr
 from .spr2 import dspr2, sspr2
@@ -32,6 +32,8 @@ __all__ = [
     "sger",
     "dger",
     "group_bfgemm",
+    "group_hgemm",
+    "group_tf32gemm",
     "chemv",
     "sspr",
     "dspr",
