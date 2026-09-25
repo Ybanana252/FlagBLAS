@@ -13,6 +13,7 @@ from flag_blas.utils import shape_utils
 IS_ASCEND = flag_blas.device == "npu"
 IS_ILUVATAR = flag_blas.vendor_name == "iluvatar"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_PPU = flag_blas.vendor_name == "thead"
 
 if IS_ASCEND:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -56,6 +57,12 @@ elif IS_MTHREADS:
         grouped_bfgemm_tma_schedule_m256_kernel,
         grouped_bfgemm_tma_schedule_m256_n128_kernel,
     )
+elif IS_PPU:
+    if flag_blas.device != "cuda" or not torch.cuda.is_available():
+        pytest.skip(
+            "requires FlagBLAS with an available PPU (T-Head) backend",
+            allow_module_level=True,
+        )
 else:
     if flag_blas.device != "cuda":
         pytest.skip(
@@ -74,7 +81,7 @@ else:
     )
 
 
-if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS:
+if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS and not IS_PPU:
 
     def load_cublas():
         lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
@@ -1201,9 +1208,79 @@ class MThreadsGroupGemmBenchmark(GroupGemmBenchmark):
         return io_amount * 1e-9 / (latency * 1e-3)
 
 
+def ppu_group_gemm(
+    group_A,
+    group_B,
+    group_list,
+    group_out,
+    **kwargs,
+):
+    return torch._grouped_mm(group_A, group_B, offs=group_list)
+
+
+def ppu_gems_group_gemm_wrapper(
+    group_A, group_B, group_list, group_out, flag_out, **kwargs
+):
+    return flag_blas.group_bfgemm(group_A, group_B, group_list, flag_out)
+
+
+class PpuGroupGemmBenchmark(GroupGemmBenchmark):
+    correctness_reference = "torch._grouped_mm (PPU native grouped GEMM)"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        random.seed(SEED)
+        for k, e, n in self.shapes:
+            m_list = [random.randint(1, 4096) for _ in range(e)]
+            total_M = sum(m_list)
+            group_A = torch.randn(total_M, k, dtype=cur_dtype, device=self.device)
+            group_B = torch.randn(e, k, n, dtype=cur_dtype, device=self.device)
+            group_list = torch.tensor(
+                m_list, dtype=torch.int32, device=self.device
+            ).cumsum(0, dtype=torch.int32)
+            group_out = torch.empty(total_M, n, dtype=cur_dtype, device=self.device)
+            flag_out = torch.empty_like(group_out)
+
+            yield group_A, group_B, group_list, group_out, {
+                "flag_out": flag_out,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
+            }
+
+    def get_tflops(self, op, *args, **kwargs):
+        group_A, group_B = args[0], args[1]
+        return 2 * group_A.shape[0] * group_B.shape[1] * group_B.shape[2]
+
+    def get_gbps(self, args, latency):
+        group_A, group_B, _, group_out = args[:4]
+        io_amount = (
+            shape_utils.size_in_bytes(group_A)
+            + shape_utils.size_in_bytes(group_B)
+            + 2 * shape_utils.size_in_bytes(group_out)
+        )
+        return io_amount * 1e-9 / (latency * 1e-3)
+
+
 @pytest.mark.group_gemm
 def test_perf_group_gemm_bf16():
-    if IS_ILUVATAR:
+    if IS_PPU:
+        bench = PpuGroupGemmBenchmark(
+            op_name="group_gemm",
+            torch_op=ppu_group_gemm,
+            gems_op=ppu_gems_group_gemm_wrapper,
+            dtypes=[torch.bfloat16],
+        )
+        bench.init_user_config()
+        for cur_dtype in bench.to_bench_dtypes:
+            for A, B, group_list, group_out, kwargs in bench.get_input_iter(cur_dtype):
+                torch_result = ppu_group_gemm(A, B, group_list, group_out, **kwargs)
+                gems_result = ppu_gems_group_gemm_wrapper(
+                    A, B, group_list, group_out, **kwargs
+                )
+                bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
+        bench.run()
+    elif IS_ILUVATAR:
         bench = IluvatarGroupGemmBenchmark(
             op_name="group_gemm",
             torch_op=iluvatar_group_gemm,
