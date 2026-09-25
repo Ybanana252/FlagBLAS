@@ -33,6 +33,12 @@ elif IS_PPU:
             "requires FlagBLAS with an available PPU (T-Head) backend",
             allow_module_level=True,
         )
+    # Mirror the Ascend HF32 / cuBLAS FAST_TF32 reference modes: the PPU
+    # vendor grouped GEMM must run in tf32 mode for a like-for-like
+    # comparison against the FlagBLAS tf32 kernel.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if not torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError("Failed to enable PPU tf32 matmul mode.")
 else:
     if flag_blas.device != "cuda":
         pytest.skip(
@@ -810,11 +816,10 @@ class PpuGroupGemmBenchmark(GroupGemmBenchmark):
         return io_amount * 1e-9 / (latency * 1e-3)
 
     def validate_results(self, torch_result, gems_result, reduce_dim, tolerance=1e-2):
-        # The PPU reference computes full-precision fp32 while the FlagBLAS
-        # kernel rounds inputs to tf32. That rounding shows up as absolute
-        # noise even on near-zero (cancelling) outputs, so the comparison
-        # needs atol at the tf32 noise scale of the randn(0,1) inputs
-        # (measured <0.4 across core shapes) plus a tf32-scaled rtol.
+        # Both sides compute in tf32, but the vendor's tf32 mode rounds and
+        # accumulates differently from the Triton kernel, leaving tf32-scale
+        # noise even on near-zero (cancelling) outputs (measured <0.45 abs
+        # across core shapes), so rtol alone cannot absorb it.
         torch_cpu = torch_result.cpu()
         gems_cpu = gems_result.cpu()
         try:
