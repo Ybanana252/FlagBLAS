@@ -20,11 +20,389 @@ import triton.language as tl
 
 from flag_blas import runtime
 from flag_blas.ops.level2._constants import CUBLAS_OP_C, CUBLAS_OP_N, CUBLAS_OP_T
+from flag_blas.ops.level2.gemv import _float64_to_int
+from flag_blas.ops.level2.gemv import dgemv as _common_dgemv
+from flag_blas.ops.level2.gemv import zgemv as _common_zgemv
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry, libtuner
 from flag_blas.utils import triton_lang_extension as tle
 
 ScalarType = Union[float, int, complex, torch.Tensor]
+
+
+@triton.jit
+def _zgemv_stream(
+    A,
+    X,
+    Y,
+    AR_BITS: tl.int64,
+    AI_BITS: tl.int64,
+    BR_BITS: tl.int64,
+    BI_BITS: tl.int64,
+    OUT: tl.constexpr,
+    RED: tl.constexpr,
+    LDA: tl.constexpr,
+    TRANS: tl.constexpr,
+    CONJ: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    kk = tl.arange(0, BK)
+    acc_r = tl.full((BM, BK), 0.0, tl.float64)
+    acc_i = tl.full((BM, BK), 0.0, tl.float64)
+    for start in range(0, RED, BK):
+        k = start + kk
+        mask = (rows[:, None] < OUT) & (k[None, :] < RED)
+        if TRANS:
+            aoff = (rows[:, None] + k[None, :] * LDA) * 2
+        else:
+            aoff = (rows[:, None] * LDA + k[None, :]) * 2
+        ar = tl.load(A + aoff, mask, 0.0)
+        ai = tl.load(A + aoff + 1, mask, 0.0)
+        if CONJ:
+            ai = -ai
+        xr = tl.load(X + k * 2, k < RED, 0.0)
+        xi = tl.load(X + k * 2 + 1, k < RED, 0.0)
+        acc_r += ar * xr[None, :] - ai * xi[None, :]
+        acc_i += ar * xi[None, :] + ai * xr[None, :]
+    sr = tl.sum(acc_r, 1)
+    si = tl.sum(acc_i, 1)
+    alpha_r = AR_BITS.to(tl.float64, bitcast=True)
+    alpha_i = AI_BITS.to(tl.float64, bitcast=True)
+    rr = alpha_r * sr - alpha_i * si
+    ri = alpha_r * si + alpha_i * sr
+    if not BETA_ZERO:
+        beta_r = BR_BITS.to(tl.float64, bitcast=True)
+        beta_i = BI_BITS.to(tl.float64, bitcast=True)
+        yr = tl.load(Y + rows * 2, rows < OUT, 0.0)
+        yi = tl.load(Y + rows * 2 + 1, rows < OUT, 0.0)
+        rr += beta_r * yr - beta_i * yi
+        ri += beta_r * yi + beta_i * yr
+    tl.store(Y + rows * 2, rr, rows < OUT)
+    tl.store(Y + rows * 2 + 1, ri, rows < OUT)
+
+
+@triton.jit
+def _zgemv_trans_partial(
+    A,
+    X,
+    P,
+    OUT: tl.constexpr,
+    RED: tl.constexpr,
+    LDA: tl.constexpr,
+    CONJ: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    part = tl.program_id(1)
+    size = tl.cdiv(RED, SPLITS)
+    begin = part * size
+    stop = tl.minimum(begin + size, RED)
+    kk = tl.arange(0, BK)
+    acc_r = tl.full((BM, BK), 0.0, tl.float64)
+    acc_i = tl.full((BM, BK), 0.0, tl.float64)
+    for start in range(begin, stop, BK):
+        k = start + kk
+        mask = (rows[:, None] < OUT) & (k[None, :] < stop)
+        aoff = (rows[:, None] + k[None, :] * LDA) * 2
+        ar = tl.load(A + aoff, mask, 0.0)
+        ai = tl.load(A + aoff + 1, mask, 0.0)
+        if CONJ:
+            ai = -ai
+        xr = tl.load(X + k * 2, k < stop, 0.0)
+        xi = tl.load(X + k * 2 + 1, k < stop, 0.0)
+        acc_r += ar * xr[None, :] - ai * xi[None, :]
+        acc_i += ar * xi[None, :] + ai * xr[None, :]
+    tl.store(P + (part * OUT + rows) * 2, tl.sum(acc_r, 1), rows < OUT)
+    tl.store(P + (part * OUT + rows) * 2 + 1, tl.sum(acc_i, 1), rows < OUT)
+
+
+@triton.jit
+def _zgemv_trans_finish(
+    P,
+    Y,
+    AR: tl.int64,
+    AI: tl.int64,
+    BR: tl.int64,
+    BI: tl.int64,
+    OUT: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BS: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+):
+    row = tl.program_id(0)
+    parts = tl.arange(0, BS)
+    pr = tl.load(P + (parts * OUT + row) * 2, parts < SPLITS, 0.0)
+    pi = tl.load(P + (parts * OUT + row) * 2 + 1, parts < SPLITS, 0.0)
+    sr = tl.sum(pr, 0)
+    si = tl.sum(pi, 0)
+    ar = AR.to(tl.float64, bitcast=True)
+    ai = AI.to(tl.float64, bitcast=True)
+    rr = ar * sr - ai * si
+    ri = ar * si + ai * sr
+    if not BETA_ZERO:
+        br = BR.to(tl.float64, bitcast=True)
+        bi = BI.to(tl.float64, bitcast=True)
+        yr = tl.load(Y + row * 2)
+        yi = tl.load(Y + row * 2 + 1)
+        rr += br * yr - bi * yi
+        ri += br * yi + bi * yr
+    tl.store(Y + row * 2, rr)
+    tl.store(Y + row * 2 + 1, ri)
+
+
+def zgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
+    odd_stream = m % 2 == 1 and n % 2 == 1 and m >= 3583 and n >= 1023
+    large_stream = m >= 8192 and n >= 28672
+    row_stream = (
+        trans == CUBLAS_OP_N
+        and m % 2 == 1
+        and n % 2 == 1
+        and 3583 <= m <= 7167
+        and n >= 3583
+    )
+    if (
+        (trans in (CUBLAS_OP_T, CUBLAS_OP_C) and not (odd_stream or large_stream))
+        or (trans == CUBLAS_OP_N and not row_stream)
+        or trans not in (CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_OP_C)
+        or lda != n
+        or incx != 1
+        or incy != 1
+    ):
+        return _common_zgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
+    assert A.is_contiguous() and x.is_contiguous() and y.is_contiguous()
+    assert A.dtype == x.dtype == y.dtype == torch.complex128
+    assert A.device == x.device == y.device
+    alpha_val = complex(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    beta_val = complex(beta.item() if isinstance(beta, torch.Tensor) else beta)
+    if alpha_val == 0:
+        return _common_zgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
+    if row_stream:
+        if n >= 10000:
+            bm, bk, warps = 1, 256, 8
+        elif m >= 6000:
+            bm, bk, warps = 2, 64, 4
+        else:
+            bm, bk, warps = 1, 128, 4
+    elif large_stream:
+        bm, bk, warps = 2, 128, 4
+    elif n <= 1023 or m >= 14335:
+        bm, bk, warps = 4, 64, 8
+    else:
+        bm, bk, warps = 8, 32, 8
+    split = (
+        8
+        if odd_stream and m >= 14335 and n < 8192
+        else (4 if odd_stream and m >= 8191 and n >= 8191 else 1)
+    )
+    with torch_device_fn.device(A.device):
+        out, red = (m, n) if trans == CUBLAS_OP_N else (n, m)
+        ar, ai = _float64_to_int(alpha_val.real), _float64_to_int(alpha_val.imag)
+        br, bi = _float64_to_int(beta_val.real), _float64_to_int(beta_val.imag)
+        af = torch.view_as_real(A)
+        xf = torch.view_as_real(x)
+        yf = torch.view_as_real(y)
+        if split > 1:
+            bm, bk, warps = (4, 32, 4) if split == 8 else (8, 32, 8)
+            partial = torch.empty((split, out, 2), dtype=torch.float64, device=y.device)
+            _zgemv_trans_partial[(triton.cdiv(out, bm), split)](
+                af,
+                xf,
+                partial,
+                out,
+                red,
+                lda,
+                trans == CUBLAS_OP_C,
+                split,
+                bm,
+                bk,
+                num_warps=warps,
+                num_stages=1,
+            )
+            _zgemv_trans_finish[(out,)](
+                partial,
+                yf,
+                ar,
+                ai,
+                br,
+                bi,
+                out,
+                split,
+                triton.next_power_of_2(split),
+                beta_val == 0,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            _zgemv_stream[(triton.cdiv(out, bm),)](
+                af,
+                xf,
+                yf,
+                ar,
+                ai,
+                br,
+                bi,
+                out,
+                red,
+                lda,
+                trans != CUBLAS_OP_N,
+                trans == CUBLAS_OP_C,
+                beta_val == 0,
+                BM=bm,
+                BK=bk,
+                num_warps=warps,
+                num_stages=1,
+            )
+
+
+@triton.jit
+def _dgemv_trans_partial(
+    A,
+    X,
+    P,
+    M,
+    N,
+    LDA,
+    INCX,
+    BK: tl.constexpr,
+):
+    col = tl.program_id(0)
+    part = tl.program_id(1)
+    k = part * BK + tl.arange(0, BK)
+    a = tl.load(A + k * LDA + col, k < M, 0.0)
+    x = tl.load(X + k * INCX, k < M, 0.0)
+    tl.store(P + part * N + col, tl.sum(a * x, 0))
+
+
+@triton.jit
+def _dgemv_trans_finish(
+    P,
+    Y,
+    AR_BITS: tl.int64,
+    BR_BITS: tl.int64,
+    N,
+    INCY,
+    SPLITS: tl.constexpr,
+    BS: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+):
+    col = tl.program_id(0)
+    parts = tl.arange(0, BS)
+    value = tl.load(P + parts * N + col, parts < SPLITS, 0.0)
+    alpha = AR_BITS.to(tl.float64, bitcast=True)
+    beta = BR_BITS.to(tl.float64, bitcast=True)
+    result = alpha * tl.sum(value, 0)
+    if not BETA_ZERO:
+        result += beta * tl.load(Y + col * INCY)
+    tl.store(Y + col * INCY, result)
+
+
+@triton.jit
+def _dgemv_trans_odd(
+    A,
+    X,
+    Y,
+    AR_BITS: tl.int64,
+    BR_BITS: tl.int64,
+    OUT: tl.constexpr,
+    RED: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    kk = tl.arange(0, BK)
+    acc = tl.full((BM, BK), 0.0, tl.float64)
+    for start in range(0, RED, BK):
+        k = start + kk
+        av = tl.load(
+            A + rows[:, None] + k[None, :] * LDA,
+            (rows[:, None] < OUT) & (k[None, :] < RED),
+            0.0,
+        )
+        xv = tl.load(X + k * INCX, k < RED, 0.0)
+        acc += av * xv[None, :]
+    alpha = AR_BITS.to(tl.float64, bitcast=True)
+    result = alpha * tl.sum(acc, 1)
+    if not BETA_ZERO:
+        beta = BR_BITS.to(tl.float64, bitcast=True)
+        result += beta * tl.load(Y + rows * INCY, rows < OUT, 0.0)
+    tl.store(Y + rows * INCY, result, rows < OUT)
+
+
+def dgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
+    skinny = 65536 <= m <= 131072 and (1 <= n <= 4 or n == 64)
+    odd = 4095 <= m <= 14335 and 4095 <= n <= 8191 and m % 2 == 1 and n % 2 == 1
+    if trans != CUBLAS_OP_T or not (skinny or odd):
+        return _common_dgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
+    assert A.is_contiguous() and x.is_contiguous() and y.is_contiguous()
+    assert A.dtype == torch.float64 == x.dtype == y.dtype
+    assert A.device == x.device == y.device
+    assert lda >= n and incx > 0 and incy > 0
+    assert x.numel() >= 1 + (m - 1) * incx
+    assert y.numel() >= 1 + (n - 1) * incy
+    alpha_val = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    beta_val = float(beta.item() if isinstance(beta, torch.Tensor) else beta)
+    if alpha_val == 0.0:
+        return _common_dgemv(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
+    if odd:
+        bk, warps = (256, 8) if m > 2 * n else (128, 4)
+        with torch_device_fn.device(A.device):
+            _dgemv_trans_odd[(triton.cdiv(n, 16),)](
+                A,
+                x,
+                y,
+                _float64_to_int(alpha_val),
+                _float64_to_int(beta_val),
+                n,
+                m,
+                lda,
+                incx,
+                incy,
+                BM=16,
+                BK=bk,
+                BETA_ZERO=beta_val == 0.0,
+                num_warps=warps,
+                num_stages=1,
+            )
+        return
+    bk = 512 if n <= 4 else 2048
+    warps = 8 if n <= 4 else 4
+    splits = triton.cdiv(m, bk)
+    partial = torch.empty((splits * n,), dtype=torch.float64, device=A.device)
+    with torch_device_fn.device(A.device):
+        _dgemv_trans_partial[(n, splits)](
+            A,
+            x,
+            partial,
+            m,
+            n,
+            lda,
+            incx,
+            BK=bk,
+            num_warps=warps,
+            num_stages=1,
+        )
+        _dgemv_trans_finish[(n,)](
+            partial,
+            y,
+            _float64_to_int(alpha_val),
+            _float64_to_int(beta_val),
+            n,
+            incy,
+            SPLITS=splits,
+            BS=triton.next_power_of_2(splits),
+            BETA_ZERO=beta_val == 0.0,
+            num_warps=4,
+            num_stages=1,
+        )
 
 
 _GEMV_KEY = [

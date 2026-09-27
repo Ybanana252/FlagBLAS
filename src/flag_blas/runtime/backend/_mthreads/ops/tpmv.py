@@ -17,7 +17,11 @@ import triton
 import triton.language as tl
 
 from flag_blas import runtime
-from flag_blas.ops.level2.tpmv import _check_tpmv, _row_major_tpmv_args
+from flag_blas.ops.level2._constants import CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_C
+from flag_blas.ops.level2.tpmv import _check_tpmv, _mode_key, _row_major_tpmv_args
+from flag_blas.ops.level2.tpmv import dtpmv as _public_dtpmv
+from flag_blas.ops.level2.tpmv import ztpmv as _public_ztpmv
+from flag_blas.ops.level2.tpmv import ztpmv_kernel as _public_ztpmv_kernel
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -382,3 +386,59 @@ def stpmv(uplo, trans, diag, n, AP, x, incx):
 
 def ctpmv(uplo, trans, diag, n, AP, x, incx):
     return _tpmv(uplo, trans, diag, n, AP, x, incx, True)
+
+
+def dtpmv(uplo, trans, diag, n, AP, x, incx):
+    assert AP.dtype == x.dtype == torch.float64
+    _check_tpmv(AP, x, uplo, trans, diag, n, incx, complex_ok=False)
+    assert AP.device.type == "musa"
+    if n == 0:
+        return
+    if n > 32:
+        return _public_dtpmv(uplo, trans, diag, n, AP, x, incx)
+    physical_uplo, physical_trans, _ = _row_major_tpmv_args(uplo, trans)
+    with torch_device_fn.device(AP.device):
+        # A single CTA reads all of x before its in-place stores.
+        mthreads_stpmv_small_kernel.jit_function[(1,)](
+            AP,
+            x,
+            n,
+            incx,
+            UPLO=physical_uplo,
+            TRANS=physical_trans,
+            UNIT=diag,
+            B=32,
+            num_warps=16,
+            num_stages=1,
+        )
+
+
+def ztpmv(uplo, trans, diag, n, AP, x, incx):
+    assert AP.dtype == x.dtype == torch.complex128
+    _check_tpmv(AP, x, uplo, trans, diag, n, incx, complex_ok=True)
+    assert AP.device.type == "musa"
+    if n == 0:
+        return
+    if n < 16384 or trans != CUBLAS_OP_C or uplo != CUBLAS_FILL_MODE_UPPER:
+        return _public_ztpmv(uplo, trans, diag, n, AP, x, incx)
+    physical_uplo, physical_trans, conj = _row_major_tpmv_args(uplo, trans)
+    trans_flag = int(physical_trans != 0)
+    unit = int(bool(diag))
+    with torch_device_fn.device(AP.device):
+        xin = x.as_strided((n,), (incx,)).clone()
+        _public_ztpmv_kernel.jit_function[(triton.cdiv(n, 4),)](
+            torch.view_as_real(AP),
+            torch.view_as_real(xin),
+            torch.view_as_real(x),
+            n,
+            incx,
+            _mode_key(physical_uplo, trans_flag, unit) | (conj << 8),
+            UPLO=physical_uplo,
+            TRANS=trans_flag,
+            UNIT=unit,
+            CONJ=conj,
+            BLOCK_SIZE_M=4,
+            BLOCK_K=128,
+            num_warps=4,
+            num_stages=1,
+        )

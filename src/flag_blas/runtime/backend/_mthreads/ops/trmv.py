@@ -17,7 +17,8 @@ import triton
 import triton.language as tl
 
 from flag_blas import runtime
-from flag_blas.ops.level2.trmv import _check_trmv
+from flag_blas.ops.level2.trmv import _check_trmv, _mode_key
+from flag_blas.ops.level2.trmv import ztrmv_kernel as _public_ztrmv_kernel
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry, libtuner
 
@@ -268,3 +269,206 @@ def strmv(uplo, trans, diag, n, A, lda, x, incx):
 
 def ctrmv(uplo, trans, diag, n, A, lda, x, incx):
     return _trmv(uplo, trans, diag, n, A, lda, x, incx, True)
+
+
+@triton.jit
+def mthreads_dtrmv_small_kernel(
+    A,
+    X,
+    N,
+    LDA,
+    INCX,
+    UPPER: tl.constexpr,
+    TRANS: tl.constexpr,
+    UNIT: tl.constexpr,
+    B: tl.constexpr,
+):
+    r = tl.arange(0, B)
+    k = tl.arange(0, B)
+    lower: tl.constexpr = UPPER == TRANS
+    tri = k[None, :] <= r[:, None] if lower else k[None, :] >= r[:, None]
+    mask = (r[:, None] < N) & (k[None, :] < N) & tri
+    if UNIT:
+        mask &= r[:, None] != k[None, :]
+    off = (
+        k[None, :].to(tl.int64) * LDA + r[:, None]
+        if TRANS
+        else r[:, None].to(tl.int64) * LDA + k[None, :]
+    )
+    av = tl.load(A + off, mask, 0)
+    xv = tl.load(X + k * INCX, k < N, 0)
+    y = tl.sum(av * xv[None, :], 1)
+    if UNIT:
+        y += tl.load(X + r * INCX, r < N, 0)
+    tl.debug_barrier()
+    tl.store(X + r * INCX, y, r < N)
+
+
+@triton.jit
+def mthreads_ztrmv_copy_kernel(X, Y, N, SX, B: tl.constexpr):
+    r = tl.program_id(0) * B + tl.arange(0, B)
+    source = 2 * r.to(tl.int64) * SX
+    target = 2 * r.to(tl.int64)
+    tl.store(Y + target, tl.load(X + source, r < N, 0), r < N)
+    tl.store(Y + target + 1, tl.load(X + source + 1, r < N, 0), r < N)
+
+
+@triton.jit
+def mthreads_trmv_fp64_kernel(
+    A,
+    X,
+    Y,
+    N,
+    LDA,
+    INCX,
+    UPPER: tl.constexpr,
+    TRANS: tl.constexpr,
+    CONJ: tl.constexpr,
+    UNIT: tl.constexpr,
+    COMPLEX: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    r = tl.program_id(0) * BM + tl.arange(0, BM)
+    ks = tl.arange(0, BK)
+    lower: tl.constexpr = UPPER == TRANS
+    begin = 0 if lower else tl.program_id(0) * BM // BK * BK
+    end = tl.minimum(N, (tl.program_id(0) + 1) * BM) if lower else N
+    if TRANS:
+        sr = tl.full((BK, BM), 0, tl.float64)
+        si = tl.full((BK, BM), 0, tl.float64)
+    else:
+        sr = tl.full((BM, BK), 0, tl.float64)
+        si = tl.full((BM, BK), 0, tl.float64)
+    for start in range(begin, end, BK):
+        k = start + ks
+        if TRANS:
+            tri = k[:, None] <= r[None, :] if lower else k[:, None] >= r[None, :]
+            mask = (k[:, None] < N) & (r[None, :] < N) & tri
+            off = k[:, None].to(tl.int64) * LDA + r[None, :]
+        else:
+            tri = k[None, :] <= r[:, None] if lower else k[None, :] >= r[:, None]
+            mask = (r[:, None] < N) & (k[None, :] < N) & tri
+            off = r[:, None].to(tl.int64) * LDA + k[None, :]
+        if UNIT:
+            mask &= (k[:, None] != r[None, :]) if TRANS else (k[None, :] != r[:, None])
+        if COMPLEX:
+            ar = tl.load(A + 2 * off, mask, 0)
+            ai = tl.load(A + 2 * off + 1, mask, 0)
+            xr = tl.load(X + 2 * k, k < N, 0)
+            xi = tl.load(X + 2 * k + 1, k < N, 0)
+            if CONJ:
+                ai = -ai
+            if TRANS:
+                sr += ar * xr[:, None] - ai * xi[:, None]
+                si += ar * xi[:, None] + ai * xr[:, None]
+            else:
+                sr += ar * xr[None, :] - ai * xi[None, :]
+                si += ar * xi[None, :] + ai * xr[None, :]
+        else:
+            av = tl.load(A + off, mask, 0)
+            xv = tl.load(X + k, k < N, 0)
+            sr += av * (xv[:, None] if TRANS else xv[None, :])
+    if TRANS:
+        rr, ri = tl.sum(sr, 0), tl.sum(si, 0)
+    else:
+        rr, ri = tl.sum(sr, 1), tl.sum(si, 1)
+    if UNIT:
+        if COMPLEX:
+            rr += tl.load(X + 2 * r, r < N, 0)
+            ri += tl.load(X + 2 * r + 1, r < N, 0)
+        else:
+            rr += tl.load(X + r, r < N, 0)
+    if COMPLEX:
+        tl.store(Y + 2 * r * INCX, rr, r < N)
+        tl.store(Y + 2 * r * INCX + 1, ri, r < N)
+    else:
+        tl.store(Y + r * INCX, rr, r < N)
+
+
+def _trmv_fp64(uplo, trans, diag, n, A, lda, x, incx, is_complex):
+    assert A.dtype == x.dtype == (torch.complex128 if is_complex else torch.float64)
+    _check_trmv(A, x, uplo, trans, diag, n, lda, incx, complex_ok=is_complex)
+    assert A.device.type == "musa"
+    if n == 0:
+        return
+    if not is_complex and n <= 32:
+        with torch_device_fn.device(A.device):
+            mthreads_dtrmv_small_kernel[(1,)](
+                A,
+                x,
+                n,
+                lda,
+                incx,
+                UPPER=bool(uplo),
+                TRANS=bool(trans),
+                UNIT=bool(diag),
+                B=32,
+                num_warps=16,
+                num_stages=1,
+            )
+        return
+    with torch_device_fn.device(A.device):
+        temp = torch.empty((n,), device=x.device, dtype=x.dtype)
+        if is_complex:
+            av, xv, tv = (torch.view_as_real(v) for v in (A, x, temp))
+            mthreads_ztrmv_copy_kernel[(triton.cdiv(n, 256),)](
+                xv, tv, n, incx, 256, num_warps=4
+            )
+            if n <= 32:
+                trans_flag = int(trans != 0)
+                conj = int(trans == 2)
+                unit = int(bool(diag))
+                _public_ztrmv_kernel.jit_function[(triton.cdiv(n, 16),)](
+                    av,
+                    tv,
+                    xv,
+                    n,
+                    lda,
+                    incx,
+                    _mode_key(uplo, trans_flag, unit) | (conj << 8),
+                    UPLO=uplo,
+                    TRANS=trans_flag,
+                    UNIT=unit,
+                    CONJ=conj,
+                    BLOCK_SIZE_M=16,
+                    BLOCK_K=16,
+                    num_warps=8,
+                    num_stages=1,
+                )
+                return
+            if n >= 8192 and not uplo and trans:
+                bm, bk, warps = 4, 32, 4
+            else:
+                bm, bk, warps = (2, 128, 4) if n <= 2048 else (2, 64, 4)
+        else:
+            av, xv, tv = A, x, temp
+            mthreads_trmv_copy_kernel.jit_function[(triton.cdiv(n, 256),)](
+                xv, tv, n, incx, 1, 256, num_warps=4
+            )
+            bm, bk, warps = (2, 128, 4) if n <= 2048 else (4, 128, 4)
+        mthreads_trmv_fp64_kernel[(triton.cdiv(n, bm),)](
+            av,
+            tv,
+            xv,
+            n,
+            lda,
+            incx,
+            UPPER=bool(uplo),
+            TRANS=bool(trans),
+            CONJ=trans == 2,
+            UNIT=bool(diag),
+            COMPLEX=is_complex,
+            BM=bm,
+            BK=bk,
+            num_warps=warps,
+            num_stages=1,
+        )
+
+
+def dtrmv(uplo, trans, diag, n, A, lda, x, incx):
+    return _trmv_fp64(uplo, trans, diag, n, A, lda, x, incx, False)
+
+
+def ztrmv(uplo, trans, diag, n, A, lda, x, incx):
+    return _trmv_fp64(uplo, trans, diag, n, A, lda, x, incx, True)

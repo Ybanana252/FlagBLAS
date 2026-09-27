@@ -17,7 +17,13 @@ import triton
 import triton.language as tl
 
 from flag_blas import runtime
-from flag_blas.ops.level2.symv import ScalarType, _check_common, _complex_scalars
+from flag_blas.ops.level2.symv import (
+    ScalarType,
+    _check_common,
+    _complex_scalars,
+    _f64_to_i64,
+)
+from flag_blas.ops.level2.symv import dsymv as _public_dsymv
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry, libtuner
 
@@ -134,6 +140,50 @@ def mthreads_symv_kernel(
         tl.store(Y + r.to(tl.int64) * INCY, vr, r < N)
 
 
+@triton.jit
+def _dsymv_small_kernel(
+    A,
+    X,
+    Y,
+    ALPHA_BITS,
+    BETA_BITS,
+    N: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    UPLO: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    ks = tl.arange(0, BK)
+    acc = tl.full((BM, BK), 0, tl.float64)
+    for block in range(tl.cdiv(N, BK)):
+        cols = block * BK + ks
+        if UPLO == 0:
+            direct = rows[:, None] >= cols[None, :]
+        else:
+            direct = rows[:, None] <= cols[None, :]
+        off = tl.where(
+            direct,
+            rows[:, None].to(tl.int64) * LDA + cols[None, :],
+            cols[None, :].to(tl.int64) * LDA + rows[:, None],
+        )
+        mask = (rows[:, None] < N) & (cols[None, :] < N)
+        av = tl.load(A + off, mask, 0)
+        xv = tl.load(X + cols.to(tl.int64) * INCX, cols < N, 0)
+        acc += av * xv[None, :]
+    result = tl.sum(acc, 1)
+    alpha = ALPHA_BITS.to(tl.float64, bitcast=True)
+    out = alpha * result
+    yp = Y + rows.to(tl.int64) * INCY
+    if not BETA_ZERO:
+        beta = BETA_BITS.to(tl.float64, bitcast=True)
+        out += beta * tl.load(yp, rows < N, 0)
+    tl.store(yp, out, rows < N)
+
+
 def _symv(uplo, n, alpha, A, lda, x, incx, beta, y, incy):
     _check_common(A, x, y, uplo, n, lda, incx, incy)
     assert A.device.type == "musa"
@@ -224,3 +274,51 @@ def csymv(
 ) -> None:
     assert A.dtype == x.dtype == y.dtype == torch.complex64
     _symv(uplo, n, alpha, A, lda, x, incx, beta, y, incy)
+
+
+def dsymv(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    A: torch.Tensor,
+    lda: int,
+    x: torch.Tensor,
+    incx: int,
+    beta: ScalarType,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    if n > 1024:
+        return _public_dsymv(uplo, n, alpha, A, lda, x, incx, beta, y, incy)
+    assert A.dtype == x.dtype == y.dtype == torch.float64
+    _check_common(A, x, y, uplo, n, lda, incx, incy)
+    if n == 0:
+        return
+    alpha = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    beta = float(beta.item() if isinstance(beta, torch.Tensor) else beta)
+    if alpha == 0.0:
+        return _public_dsymv(uplo, n, alpha, A, lda, x, incx, beta, y, incy)
+    if n <= 256:
+        bm, bk = 1, 128
+    elif n <= 512:
+        bm, bk = 2, 128
+    else:
+        bm, bk = 4, 64
+    with torch_device_fn.device(A.device):
+        _dsymv_small_kernel[(triton.cdiv(n, bm),)](
+            A,
+            x,
+            y,
+            _f64_to_i64(alpha),
+            _f64_to_i64(beta),
+            N=n,
+            LDA=lda,
+            INCX=incx,
+            INCY=incy,
+            UPLO=uplo,
+            BETA_ZERO=beta == 0.0,
+            BM=bm,
+            BK=bk,
+            num_warps=8,
+            num_stages=1,
+        )

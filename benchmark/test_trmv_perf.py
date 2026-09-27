@@ -252,11 +252,21 @@ def _generate_triangular_A(n, lda, uplo, dtype, device):
     A = torch.zeros((n, lda), dtype=dtype, device=device)
     column_A = torch.zeros((n, lda), dtype=dtype, device=device)
     vals = torch.randn(n, n, dtype=dtype, device=device) * 0.1
-    triangular = (
-        torch.triu(vals) if uplo == CUBLAS_FILL_MODE_UPPER else torch.tril(vals)
-    )
-    A[:, :n] = triangular
-    column_A[:, :n] = triangular.T
+    if IS_MTHREADS and dtype == torch.complex128:
+        rows = torch.arange(n, device=device).view(n, 1)
+        columns = torch.arange(n, device=device).view(1, n)
+        valid = rows <= columns if uplo == CUBLAS_FILL_MODE_UPPER else rows >= columns
+        triangular_real = torch.view_as_real(vals).masked_fill(
+            ~valid.unsqueeze(-1), 0.0
+        )
+        torch.view_as_real(A)[:, :n] = triangular_real
+        torch.view_as_real(column_A)[:, :n] = triangular_real.transpose(0, 1)
+    else:
+        triangular = (
+            torch.triu(vals) if uplo == CUBLAS_FILL_MODE_UPPER else torch.tril(vals)
+        )
+        A[:, :n] = triangular
+        column_A[:, :n] = triangular.T
     return A.contiguous(), column_A.contiguous()
 
 
@@ -295,9 +305,7 @@ class TrmvBenchmark(Benchmark):
             for shape in self.shapes:
                 n = shape[0] if isinstance(shape, (tuple, list)) else shape
                 lda = n
-                A, _ = _generate_triangular_A(
-                    n, lda, self.uplo, cur_dtype, self.device
-                )
+                A, _ = _generate_triangular_A(n, lda, self.uplo, cur_dtype, self.device)
                 yield A, make_randn(n, dtype=cur_dtype, device=self.device), {
                     "uplo": self.uplo,
                     "trans": self.trans,

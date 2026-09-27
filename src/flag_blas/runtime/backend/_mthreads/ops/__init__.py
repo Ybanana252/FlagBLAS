@@ -11,33 +11,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .gbmv import cgbmv, sgbmv
-from .gemv import bfgemv, cgemv, hgemv, sgemv
+from .gbmv import cgbmv, dgbmv, sgbmv, zgbmv
+from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import cgerc, cgeru, sger
-from .hbmv import chbmv
+from .hbmv import chbmv, zhbmv
 from .hemv import chemv
 from .her import cher
 from .her2 import cher2
-from .hpmv import chpmv
+from .hpmv import chpmv, zhpmv
 from .hpr import chpr
 from .hpr2 import chpr2
-from .sbmv import ssbmv
-from .spmv import sspmv
+from .sbmv import dsbmv, ssbmv
+from .spmv import dspmv, sspmv
 from .spr import sspr
 from .spr2 import sspr2
-from .symv import csymv, ssymv
+from .symv import csymv, dsymv, ssymv
 from .syr import csyr, ssyr
 from .syr2 import ssyr2
-from .tbmv import ctbmv, stbmv
+from .tbmv import ctbmv, dtbmv, stbmv, ztbmv
 from .tbsv import ctbsv, stbsv
-from .tpmv import ctpmv, stpmv
+from .tpmv import ctpmv, dtpmv, stpmv, ztpmv
 from .tpsv import ctpsv
-from .trmv import ctrmv, strmv
+from .trmv import ctrmv, dtrmv, strmv, ztrmv
 from .trsv import ctrsv, strsv
 
 __all__ = [
     "bfgemv",
     "cgbmv",
+    "dgbmv",
+    "dspmv",
+    "dsymv",
+    "dsbmv",
+    "dgemv",
     "cgemv",
     "cgerc",
     "cgeru",
@@ -56,9 +61,13 @@ __all__ = [
     "ctpsv",
     "ctrmv",
     "ctrsv",
+    "dtrmv",
+    "dtbmv",
+    "dtpmv",
     "hgemv",
     "sgbmv",
     "sgemv",
+    "zgemv",
     "sger",
     "ssbmv",
     "sspmv",
@@ -72,4 +81,10 @@ __all__ = [
     "stpmv",
     "strmv",
     "strsv",
+    "zgbmv",
+    "zhpmv",
+    "zhbmv",
+    "ztbmv",
+    "ztpmv",
+    "ztrmv",
 ]
