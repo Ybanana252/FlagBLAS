@@ -312,3 +312,229 @@ def cgbmv(
     incy: int,
 ) -> None:
     _gbmv(trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy, True)
+
+
+@triton.jit
+def mthreads_dgbmv_2d_kernel(
+    A,
+    X,
+    Y,
+    alpha_int: tl.int64,
+    beta_int: tl.int64,
+    M,
+    N,
+    LDA,
+    INCX,
+    INCY,
+    KL,
+    KU,
+    BAND,
+    TRANS: tl.constexpr,
+    ZERO_BETA: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    t = tl.arange(0, BK)
+    alpha = alpha_int.to(tl.float64, bitcast=True)
+    beta = beta_int.to(tl.float64, bitcast=True)
+    acc = tl.zeros((BM,), tl.float64)
+    if TRANS:
+        out = N
+        for start in tl.range(0, BAND, BK):
+            e_idx = start + t
+            i = rows[:, None] + e_idx[None, :] - KU
+            mask = (rows[:, None] < out) & (e_idx[None, :] < BAND) & (i >= 0) & (i < M)
+            safe_i = tl.where(mask, i, 0)
+            av = tl.load(A + rows[:, None] * LDA + e_idx[None, :], mask, 0.0)
+            xv = tl.load(X + safe_i * INCX, mask, 0.0)
+            acc += tl.sum(av * xv, 1)
+    else:
+        out = M
+        for start in tl.range(0, BAND, BK):
+            d_idx = start + t
+            d = d_idx - KL
+            j = rows[:, None] + d[None, :]
+            mask = (rows[:, None] < out) & (d_idx[None, :] < BAND) & (j >= 0) & (j < N)
+            safe_j = tl.where(mask, j, 0)
+            av = tl.load(A + safe_j * LDA + (KU - d)[None, :], mask, 0.0)
+            xv = tl.load(X + safe_j * INCX, mask, 0.0)
+            acc += tl.sum(av * xv, 1)
+    result = alpha * acc
+    if not ZERO_BETA:
+        result += beta * tl.load(Y + rows * INCY, rows < out, 0.0)
+    tl.store(Y + rows * INCY, result, rows < out)
+
+
+def _use_common_gbmv(m, n, kl, ku, lda, incx, incy, trans, is_complex):
+    out = m if trans == CUBLAS_OP_N else n
+    red = n if trans == CUBLAS_OP_N else m
+    width = 2 if is_complex else 1
+    wide = width * max(m * lda, red * incx, out * incy) >= 2**31
+    return kl + ku + 1 < (5 if is_complex else 11) or wide
+
+
+def dgbmv(
+    trans: int,
+    m: int,
+    n: int,
+    kl: int,
+    ku: int,
+    alpha: ScalarType,
+    A: torch.Tensor,
+    lda: int,
+    x: torch.Tensor,
+    incx: int,
+    beta: ScalarType,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    from flag_blas.ops.level2 import gbmv as common
+
+    assert A.dtype == x.dtype == y.dtype == torch.float64
+    assert A.device.type == "musa"
+    common._check_common(A, x, y, trans, m, n, kl, ku, lda, incx, incy, False)
+    alpha_value = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    beta_value = float(beta.item() if isinstance(beta, torch.Tensor) else beta)
+    if (
+        m == 0
+        or n == 0
+        or alpha_value == 0
+        or _use_common_gbmv(m, n, kl, ku, lda, incx, incy, trans, False)
+    ):
+        return common.dgbmv(trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy)
+
+    physical, pm, pn, pkl, pku, _ = common._row_major_gbmv_args(trans, m, n, kl, ku)
+    out = pm if physical == CUBLAS_OP_N else pn
+    bm, bk = (4, 32) if out <= 2048 else (8, 16)
+    with torch_device_fn.device(A.device):
+        mthreads_dgbmv_2d_kernel[(triton.cdiv(out, bm),)](
+            A,
+            x,
+            y,
+            common._f64_to_i64(alpha_value),
+            common._f64_to_i64(beta_value),
+            pm,
+            pn,
+            lda,
+            incx,
+            incy,
+            pkl,
+            pku,
+            pkl + pku + 1,
+            TRANS=physical != CUBLAS_OP_N,
+            ZERO_BETA=beta_value == 0,
+            BM=bm,
+            BK=bk,
+            num_warps=4,
+            num_stages=1,
+        )
+
+
+def zgbmv(
+    trans: int,
+    m: int,
+    n: int,
+    kl: int,
+    ku: int,
+    alpha: ScalarType,
+    A: torch.Tensor,
+    lda: int,
+    x: torch.Tensor,
+    incx: int,
+    beta: ScalarType,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    from flag_blas.ops.level2 import gbmv as common
+
+    assert A.dtype == x.dtype == y.dtype == torch.complex128
+    assert A.device.type == "musa"
+    common._check_common(A, x, y, trans, m, n, kl, ku, lda, incx, incy, True)
+    ar, ai, br, bi = common._complex_scalars(alpha, beta)
+    if (
+        m == 0
+        or n == 0
+        or (ar == 0 and ai == 0)
+        or _use_common_gbmv(m, n, kl, ku, lda, incx, incy, trans, True)
+    ):
+        return common.zgbmv(trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy)
+
+    physical, pm, pn, pkl, pku, conj = common._row_major_gbmv_args(trans, m, n, kl, ku)
+    band = pkl + pku + 1
+    out = pm if physical == CUBLAS_OP_N else pn
+    if band >= 32 and out <= 2048 and (incy != 1 or y.numel() != out):
+        return common.zgbmv(trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy)
+    a_real = triton.reinterpret(A, tl.float64)
+    x_real = triton.reinterpret(x, tl.float64)
+    y_real = triton.reinterpret(y, tl.float64)
+    alpha_r, alpha_i, beta_r, beta_i = (common._f64_to_i64(v) for v in (ar, ai, br, bi))
+    with torch_device_fn.device(A.device):
+        if band >= 32 and out <= 2048:
+            if br == 0 and bi == 0:
+                y.zero_()
+            elif br != 1 or bi != 0:
+                y.mul_(complex(br, bi))
+            kernel = (
+                common.zgbmv_n_split_band_kernel.fn
+                if physical == CUBLAS_OP_N
+                else common.zgbmv_t_split_band_kernel.fn
+            )
+            kernel[(triton.cdiv(out, 8), 8)](
+                a_real,
+                x_real,
+                y_real,
+                alpha_r,
+                alpha_i,
+                pm,
+                pn,
+                lda,
+                incx,
+                incy,
+                pkl,
+                pku,
+                band,
+                8,
+                out,
+                common._band_bucket(band),
+                CONJ=conj,
+                BLOCK_SIZE_M=8,
+                BAND_TILE=8,
+                num_warps=2,
+                num_stages=1,
+            )
+        else:
+            if band < 32:
+                bm, bt = 4, triton.next_power_of_2(band)
+            else:
+                bm, bt = (8, 8) if out >= 8192 else (4, 16)
+            kernel = (
+                common.zgbmv_n_kernel.fn
+                if physical == CUBLAS_OP_N
+                else common.zgbmv_t_kernel.fn
+            )
+            kernel[(triton.cdiv(out, bm),)](
+                a_real,
+                x_real,
+                y_real,
+                alpha_r,
+                alpha_i,
+                beta_r,
+                beta_i,
+                pm,
+                pn,
+                lda,
+                incx,
+                incy,
+                pkl,
+                pku,
+                band,
+                out,
+                common._band_bucket(band),
+                CONJ=conj,
+                BETA_IS_ZERO=br == 0 and bi == 0,
+                BLOCK_SIZE_M=bm,
+                BAND_TILE=bt,
+                num_warps=2,
+                num_stages=1,
+            )

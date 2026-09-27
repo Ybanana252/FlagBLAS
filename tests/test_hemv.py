@@ -52,9 +52,7 @@ def load_cublas():
 
 
 _cublas = (
-    None
-    if flag_blas.vendor_name in {"ascend", "hygon", "mthreads"}
-    else load_cublas()
+    None if flag_blas.vendor_name in {"ascend", "hygon", "mthreads"} else load_cublas()
 )
 
 
@@ -229,14 +227,17 @@ STRIDES = [(1, 1), (2, 1), (1, 2), (2, 2)]
 
 
 def hemv_randn(*shape, dtype, device):
-    if flag_blas.vendor_name in ("ascend", "mthreads") and dtype == torch.complex64:
+    if (flag_blas.vendor_name == "ascend" and dtype == torch.complex64) or (
+        flag_blas.vendor_name == "mthreads" and dtype.is_complex
+    ):
         # Build complex inputs from real-valued random tensors on non-CUDA backends.
         normalized = (
             tuple(shape[0])
             if len(shape) == 1 and isinstance(shape[0], (tuple, torch.Size))
             else shape
         )
-        values = torch.randn((*normalized, 2), dtype=torch.float32, device=device)
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        values = torch.randn((*normalized, 2), dtype=real_dtype, device=device)
         return torch.view_as_complex(values)
     return torch.randn(*shape, dtype=dtype, device=device)
 
@@ -466,7 +467,9 @@ def test_hemv_ignored_triangle(dtype, op, alpha, beta, uplo):
     tri_upper = torch.triu_indices(n, n, offset=1, device=flag_blas.device)
     tri_lower = torch.tril_indices(n, n, offset=-1, device=flag_blas.device)
     dirty_index = tri_lower if uplo == CUBLAS_FILL_MODE_UPPER else tri_upper
-    if flag_blas.vendor_name in ("ascend", "mthreads") and dtype == torch.complex64:
+    if (flag_blas.vendor_name == "ascend" and dtype == torch.complex64) or (
+        flag_blas.vendor_name == "mthreads" and dtype.is_complex
+    ):
         dirty_parts = torch.view_as_real(A_dirty)
         dirty_parts[dirty_index[0], dirty_index[1], 0] = float("nan")
         dirty_parts[dirty_index[0], dirty_index[1], 1] = float("nan")
@@ -527,7 +530,7 @@ def test_hemv_diagonal_imag_ignored(dtype, op, alpha, beta, uplo):
     A_clean = create_hemv_data(n, lda, dtype, flag_blas.device)
     A_dirty = A_clean.clone()
     diag_imag_noise = hemv_randn(n, dtype=dtype, device=flag_blas.device).imag
-    if flag_blas.vendor_name == "mthreads" and dtype == torch.complex64:
+    if flag_blas.vendor_name == "mthreads" and dtype.is_complex:
         diag_idx = torch.arange(n, device=flag_blas.device)
         torch.view_as_real(A_dirty)[diag_idx, diag_idx, 1] = diag_imag_noise
     else:

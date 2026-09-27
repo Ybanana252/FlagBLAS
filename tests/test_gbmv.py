@@ -310,10 +310,13 @@ STRIDES = [(1, 1), (2, 1), (1, 2), (2, 2)]
 
 
 def randn_tensor(shape, dtype, device):
-    if (IS_ASCEND or IS_MTHREADS) and dtype == torch.complex64:
+    if (IS_ASCEND and dtype == torch.complex64) or (
+        IS_MTHREADS and dtype in (torch.complex64, torch.complex128)
+    ):
         if isinstance(shape, int):
             shape = (shape,)
-        real = torch.randn((*shape, 2), dtype=torch.float32, device=device)
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        real = torch.randn((*shape, 2), dtype=real_dtype, device=device)
         return torch.view_as_complex(real)
     return torch.randn(shape, dtype=dtype, device=device)
 
@@ -339,8 +342,11 @@ def row_to_column_band(AB, m, n, kl, ku, lda):
 
 
 def create_banded_data(m, n, kl, ku, lda, dtype, device):
-    if dtype == torch.complex64 and (IS_ASCEND or IS_MTHREADS):
-        AB_real = torch.zeros((m, lda, 2), dtype=torch.float32, device=device)
+    if (IS_ASCEND and dtype == torch.complex64) or (
+        IS_MTHREADS and dtype in (torch.complex64, torch.complex128)
+    ):
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        AB_real = torch.zeros((m, lda, 2), dtype=real_dtype, device=device)
         for d in range(-ku, kl + 1):
             j_min = max(0, -d)
             j_max = min(n, m - d)
@@ -348,7 +354,7 @@ def create_banded_data(m, n, kl, ku, lda, dtype, device):
                 j_idx = torch.arange(j_min, j_max, device=device)
                 i_idx = j_idx + d
                 AB_real[i_idx, kl - d] = torch.randn(
-                    (j_max - j_min, 2), dtype=torch.float32, device=device
+                    (j_max - j_min, 2), dtype=real_dtype, device=device
                 )
         return torch.view_as_complex(AB_real).contiguous()
 

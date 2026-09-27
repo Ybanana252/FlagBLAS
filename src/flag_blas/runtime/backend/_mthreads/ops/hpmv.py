@@ -20,6 +20,7 @@ from flag_blas.ops.level2.hpmv import (
     ScalarType,
     _check_common,
     _complex_scalars,
+    _f64_to_i64,
     _strided_y,
 )
 from flag_blas.runtime import torch_device_fn
@@ -145,6 +146,120 @@ def _chpmv_finish(
     tl.store(Y + yo + 1, ri, rows < N)
 
 
+@triton.jit
+def _zhpmv_partial(
+    AP,
+    X,
+    Y,
+    P,
+    AR_BITS,
+    AI_BITS,
+    BR_BITS,
+    BI_BITS,
+    N: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    UPLO: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    rows = tl.program_id(0) * M + tl.arange(0, M)
+    split = tl.program_id(1)
+    chunk: tl.constexpr = triton.cdiv(N, SPLITS * K) * K
+    ks = tl.arange(0, K)
+    INDEX32: tl.constexpr = triton.cdiv(N, M) * M <= 32768 and chunk * SPLITS <= 32768
+    r = rows if INDEX32 else rows.to(tl.int64)
+    if UPLO == 0:
+        row_base = r * (r + 1) // 2
+    else:
+        row_base = r * (2 * N - r - 1) // 2
+    acc_r = tl.full((M, K), 0, tl.float64)
+    acc_i = tl.full((M, K), 0, tl.float64)
+    for kb in range(chunk // K):
+        cols = split * chunk + kb * K + ks
+        c = cols if INDEX32 else cols.to(tl.int64)
+        lower = rows[:, None] >= cols[None, :]
+        if UPLO == 0:
+            col_base = c * (c + 1) // 2
+            off = tl.where(
+                lower, row_base[:, None] + c[None, :], col_base[None, :] + r[:, None]
+            )
+            conj = ~lower
+        else:
+            col_base = c * (2 * N - c - 1) // 2
+            off = tl.where(
+                lower, col_base[None, :] + r[:, None], row_base[:, None] + c[None, :]
+            )
+            conj = lower
+        mask = (rows[:, None] < N) & (cols[None, :] < N)
+        off = off.to(tl.int64) * 2
+        ar = tl.load(AP + off, mask, 0)
+        ai = tl.load(AP + off + 1, mask, 0)
+        ai = tl.where(conj, -ai, ai)
+        ai = tl.where(rows[:, None] == cols[None, :], 0.0, ai)
+        xo = cols.to(tl.int64) * INCX * 2
+        xr = tl.load(X + xo, cols < N, 0)
+        xi = tl.load(X + xo + 1, cols < N, 0)
+        acc_r += ar * xr[None, :] - ai * xi[None, :]
+        acc_i += ar * xi[None, :] + ai * xr[None, :]
+    sr, si = tl.sum(acc_r, 1), tl.sum(acc_i, 1)
+    if SPLITS == 1:
+        alpha_r = AR_BITS.to(tl.float64, bitcast=True)
+        alpha_i = AI_BITS.to(tl.float64, bitcast=True)
+        rr, ri = alpha_r * sr - alpha_i * si, alpha_r * si + alpha_i * sr
+        yo = rows.to(tl.int64) * INCY * 2
+        if not BETA_ZERO:
+            beta_r = BR_BITS.to(tl.float64, bitcast=True)
+            beta_i = BI_BITS.to(tl.float64, bitcast=True)
+            yr = tl.load(Y + yo, rows < N, 0)
+            yi = tl.load(Y + yo + 1, rows < N, 0)
+            rr += beta_r * yr - beta_i * yi
+            ri += beta_r * yi + beta_i * yr
+        tl.store(Y + yo, rr, rows < N)
+        tl.store(Y + yo + 1, ri, rows < N)
+    else:
+        po = (split.to(tl.int64) * N + rows) * 2
+        tl.store(P + po, sr, rows < N)
+        tl.store(P + po + 1, si, rows < N)
+
+
+@triton.jit
+def _zhpmv_finish(
+    P,
+    Y,
+    AR_BITS,
+    AI_BITS,
+    BR_BITS,
+    BI_BITS,
+    N: tl.constexpr,
+    INCY: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    splits = tl.arange(0, triton.next_power_of_2(SPLITS))
+    off = (splits[:, None].to(tl.int64) * N + rows[None, :]) * 2
+    mask = (splits[:, None] < SPLITS) & (rows[None, :] < N)
+    sr = tl.sum(tl.load(P + off, mask, 0), 0)
+    si = tl.sum(tl.load(P + off + 1, mask, 0), 0)
+    alpha_r = AR_BITS.to(tl.float64, bitcast=True)
+    alpha_i = AI_BITS.to(tl.float64, bitcast=True)
+    rr, ri = alpha_r * sr - alpha_i * si, alpha_r * si + alpha_i * sr
+    yo = rows.to(tl.int64) * INCY * 2
+    if not BETA_ZERO:
+        beta_r = BR_BITS.to(tl.float64, bitcast=True)
+        beta_i = BI_BITS.to(tl.float64, bitcast=True)
+        yr = tl.load(Y + yo, rows < N, 0)
+        yi = tl.load(Y + yo + 1, rows < N, 0)
+        rr += beta_r * yr - beta_i * yi
+        ri += beta_r * yi + beta_i * yr
+    tl.store(Y + yo, rr, rows < N)
+    tl.store(Y + yo + 1, ri, rows < N)
+
+
 def chpmv(
     uplo: int,
     n: int,
@@ -218,4 +333,76 @@ def chpmv(
                 splits,
                 128,
                 num_warps=4,
+            )
+
+
+def zhpmv(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    AP: torch.Tensor,
+    x: torch.Tensor,
+    incx: int,
+    beta: ScalarType,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    assert AP.dtype == torch.complex128 == x.dtype == y.dtype
+    _check_common(AP, x, y, uplo, n, incx, incy)
+    if n == 0:
+        return
+    ar, ai, br, bi = _complex_scalars(alpha, beta)
+    if ar == 0.0 and ai == 0.0:
+        y_view = _strided_y(y, n, incy)
+        if br == 0.0 and bi == 0.0:
+            y_view.zero_()
+        elif br != 1.0 or bi != 0.0:
+            y_view.mul_(complex(br, bi))
+        return
+    if n <= 512:
+        m, k, splits = 1, 256, 1
+    elif n <= 1024:
+        m, k, splits = 2, 64, 1
+    elif n <= 2048:
+        m, k, splits = 4, 64, 1
+    elif n <= 4096:
+        m, k, splits = 8, 64, 1
+    else:
+        m, k, splits = 4, 64, 4
+    bits = tuple(_f64_to_i64(v) for v in (ar, ai, br, bi))
+    with torch_device_fn.device(AP.device):
+        partial = (
+            torch.empty((splits, n, 2), device=AP.device, dtype=torch.float64)
+            if splits > 1
+            else torch.view_as_real(y)
+        )
+        _zhpmv_partial[(triton.cdiv(n, m), splits)](
+            torch.view_as_real(AP),
+            torch.view_as_real(x),
+            torch.view_as_real(y),
+            partial,
+            *bits,
+            n,
+            incx,
+            incy,
+            uplo,
+            br == 0.0 and bi == 0.0,
+            m,
+            k,
+            splits,
+            num_warps=4,
+            num_stages=1,
+        )
+        if splits > 1:
+            _zhpmv_finish[(triton.cdiv(n, 128),)](
+                partial,
+                torch.view_as_real(y),
+                *bits,
+                n,
+                incy,
+                br == 0.0 and bi == 0.0,
+                splits,
+                128,
+                num_warps=4,
+                num_stages=1,
             )

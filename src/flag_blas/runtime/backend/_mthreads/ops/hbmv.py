@@ -20,9 +20,11 @@ from flag_blas.ops.level2.hbmv import (
     ScalarType,
     _check_common,
     _complex_scalars,
+    _f64_to_i64,
     _strided_y,
 )
 from flag_blas.ops.level2.hbmv import chbmv as _common_chbmv
+from flag_blas.ops.level2.hbmv import zhbmv as _common_zhbmv
 from flag_blas.runtime import torch_device_fn
 
 
@@ -152,6 +154,148 @@ def chbmv(
             ai,
             br,
             bi,
+            n,
+            K=effective_k,
+            STORED_K=k,
+            LDA=lda,
+            INCX=incx,
+            INCY=incy,
+            UPLO=uplo,
+            BETA_ZERO=br == 0.0 and bi == 0.0,
+            M=rows_per_program,
+            B=band,
+            num_warps=4,
+            num_stages=1,
+        )
+
+
+@triton.jit
+def _zhbmv_band(
+    A,
+    X,
+    Y,
+    AR_BITS,
+    AI_BITS,
+    BR_BITS,
+    BI_BITS,
+    N,
+    K: tl.constexpr,
+    STORED_K: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    UPLO: tl.constexpr,
+    BETA_ZERO: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+):
+    rows = tl.program_id(0) * M + tl.arange(0, M)
+    rm = rows < N
+    row_base = rows.to(tl.int64) * LDA
+    ds = tl.arange(0, B) + 1
+    acc_r = tl.full((M, B), 0.0, tl.float64)
+    acc_i = tl.full((M, B), 0.0, tl.float64)
+    for block in range(triton.cdiv(K, B)):
+        d = block * B + ds
+        if UPLO == 1:
+            direct_col = rows[:, None] + d[None, :]
+            reflected_col = rows[:, None] - d[None, :]
+            direct_off = row_base[:, None] + d[None, :]
+            reflected_off = reflected_col.to(tl.int64) * LDA + d[None, :]
+        else:
+            direct_col = rows[:, None] - d[None, :]
+            reflected_col = rows[:, None] + d[None, :]
+            direct_off = row_base[:, None] + STORED_K - d[None, :]
+            reflected_off = reflected_col.to(tl.int64) * LDA + STORED_K - d[None, :]
+        dm = rm[:, None] & (d[None, :] <= K)
+        direct_mask = dm & (direct_col >= 0) & (direct_col < N)
+        reflected_mask = dm & (reflected_col >= 0) & (reflected_col < N)
+        ar = tl.load(A + 2 * direct_off, direct_mask, 0)
+        ai = tl.load(A + 2 * direct_off + 1, direct_mask, 0)
+        xo = direct_col.to(tl.int64) * (2 * INCX)
+        xr = tl.load(X + xo, direct_mask, 0)
+        xi = tl.load(X + xo + 1, direct_mask, 0)
+        acc_r += ar * xr - ai * xi
+        acc_i += ar * xi + ai * xr
+        ar = tl.load(A + 2 * reflected_off, reflected_mask, 0)
+        ai = tl.load(A + 2 * reflected_off + 1, reflected_mask, 0)
+        xo = reflected_col.to(tl.int64) * (2 * INCX)
+        xr = tl.load(X + xo, reflected_mask, 0)
+        xi = tl.load(X + xo + 1, reflected_mask, 0)
+        acc_r += ar * xr + ai * xi
+        acc_i += ar * xi - ai * xr
+    diag_off = row_base
+    if UPLO == 0:
+        diag_off += STORED_K
+    diag = tl.load(A + 2 * diag_off, rm, 0)
+    xo = rows.to(tl.int64) * (2 * INCX)
+    xr = tl.load(X + xo, rm, 0)
+    xi = tl.load(X + xo + 1, rm, 0)
+    sr = tl.sum(acc_r, axis=1) + diag * xr
+    si = tl.sum(acc_i, axis=1) + diag * xi
+    AR = AR_BITS.to(tl.float64, bitcast=True)
+    AI = AI_BITS.to(tl.float64, bitcast=True)
+    BR = BR_BITS.to(tl.float64, bitcast=True)
+    BI = BI_BITS.to(tl.float64, bitcast=True)
+    rr = AR * sr - AI * si
+    ri = AR * si + AI * sr
+    yo = rows.to(tl.int64) * (2 * INCY)
+    if not BETA_ZERO:
+        yr = tl.load(Y + yo, rm, 0)
+        yi = tl.load(Y + yo + 1, rm, 0)
+        rr += BR * yr - BI * yi
+        ri += BR * yi + BI * yr
+    tl.store(Y + yo, rr, rm)
+    tl.store(Y + yo + 1, ri, rm)
+
+
+def zhbmv(
+    uplo: int,
+    n: int,
+    k: int,
+    alpha: ScalarType,
+    A: torch.Tensor,
+    lda: int,
+    x: torch.Tensor,
+    incx: int,
+    beta: ScalarType,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    if n > 2048 or k < 64 or k > 256:
+        _common_zhbmv(uplo, n, k, alpha, A, lda, x, incx, beta, y, incy)
+        return
+    assert A.dtype == torch.complex128 == x.dtype == y.dtype
+    _check_common(A, x, y, uplo, n, k, lda, incx, incy)
+    if n == 0:
+        return
+    ar, ai, br, bi = _complex_scalars(alpha, beta)
+    if ar == 0.0 and ai == 0.0:
+        y_view = _strided_y(y, n, incy)
+        if br == 0.0 and bi == 0.0:
+            y_view.zero_()
+        elif br != 1.0 or bi != 0.0:
+            y_view.mul_(complex(br, bi))
+        return
+
+    effective_k = min(k, n - 1)
+    if n <= 512:
+        rows_per_program, band = 1, min(128, triton.next_power_of_2(effective_k))
+    elif n <= 1024:
+        rows_per_program, band = 2, 64
+    elif effective_k <= 128:
+        rows_per_program, band = 8, 16
+    else:
+        rows_per_program, band = 2, 64
+    with torch_device_fn.device(A.device):
+        _zhbmv_band[(triton.cdiv(n, rows_per_program),)](
+            torch.view_as_real(A),
+            torch.view_as_real(x),
+            torch.view_as_real(y),
+            _f64_to_i64(ar),
+            _f64_to_i64(ai),
+            _f64_to_i64(br),
+            _f64_to_i64(bi),
             n,
             K=effective_k,
             STORED_K=k,
