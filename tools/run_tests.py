@@ -421,6 +421,16 @@ def run_cmd(op, cmd, cwd=None, env=None, timeout=600, flavor=None):
             stderr.close()
 
 
+FP64_UNSUPPORTED_MARKERS = ("fp64", "float64")
+FP64_SKIP_AS_PASS_VENDORS = ("iluvatar", "ascend")
+
+
+def _is_fp64_unsupported(reason):
+    """Return True if a skip reason indicates the device lacks fp64 support."""
+    reason = (reason or "").lower()
+    return any(marker in reason for marker in FP64_UNSUPPORTED_MARKERS)
+
+
 def parse_accuracy_data(result_file):
     raw_data = {}
     try:
@@ -455,14 +465,14 @@ def parse_accuracy_data(result_file):
             passed.append(param_str)
             num_passed += 1
         elif result == "skipped":
-            reason = item.get("reason", "Unknown")
+            reason = item.get("skipped_reason") or item.get("reason", "Unknown")
             if "Issue" in reason:
                 skipped_with_issue = True
             skipped.setdefault(reason, set())
             skipped[reason].add(param_str)
             num_skipped += 1
         else:
-            reason = item.get("reason", "Unknown")
+            reason = item.get("skipped_reason") or item.get("reason", "Unknown")
             failed.setdefault(reason, set())
             failed[reason].add(param_str)
             num_failed += 1
@@ -491,6 +501,11 @@ def parse_accuracy_data(result_file):
 
     if skipped_with_issue:
         result["status"] = "Failed"
+    elif flag_blas.vendor_name in FP64_SKIP_AS_PASS_VENDORS and all(
+        _is_fp64_unsupported(reason) for reason in skipped
+    ):
+        # Only fp64-unsupported skips remain on a vendor without fp64: passed.
+        result["status"] = "Passed"
     else:
         result["status"] = "Skipped"
 
