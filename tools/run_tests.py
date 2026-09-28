@@ -818,14 +818,16 @@ def worker_proc(gpu_id, work_queue, display_queue):
             if not perf.get("data"):
                 # No measurement exists because fp64 is unsupported; report a
                 # neutral 1.0 speedup so the final statistics keep a value.
+                # Keep the entry identical in shape to a measured one.
                 perf["data"] = {
                     _default_dtype_for_op(op): {
                         "result": "OK",
                         "details": {},
                         "speedup": 1.0,
-                        "default": True,
                     }
                 }
+        # Internal signal only; never persisted to the result file.
+        perf.pop("fp64_only_skips", None)
         display_queue.put(
             (
                 "done",
