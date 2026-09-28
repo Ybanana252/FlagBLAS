@@ -16,30 +16,31 @@ from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import cgerc, cgeru, sger
 from .hbmv import chbmv, zhbmv
 from .hemv import chemv
-from .her import cher
-from .her2 import cher2
+from .her import cher, zher
+from .her2 import cher2, zher2
 from .hpmv import chpmv, zhpmv
-from .hpr import chpr
-from .hpr2 import chpr2
+from .hpr import chpr, zhpr
+from .hpr2 import chpr2, zhpr2
 from .sbmv import dsbmv, ssbmv
 from .spmv import dspmv, sspmv
 from .spr import sspr
-from .spr2 import sspr2
+from .spr2 import dspr2, sspr2
 from .symv import csymv, dsymv, ssymv
-from .syr import csyr, ssyr
+from .syr import csyr, ssyr, zsyr
 from .syr2 import ssyr2
 from .tbmv import ctbmv, dtbmv, stbmv, ztbmv
-from .tbsv import ctbsv, stbsv
+from .tbsv import ctbsv, stbsv, ztbsv
 from .tpmv import ctpmv, dtpmv, stpmv, ztpmv
-from .tpsv import ctpsv
+from .tpsv import ctpsv, dtpsv
 from .trmv import ctrmv, dtrmv, strmv, ztrmv
-from .trsv import ctrsv, strsv
+from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
 __all__ = [
     "bfgemv",
     "cgbmv",
     "dgbmv",
     "dspmv",
+    "dspr2",
     "dsymv",
     "dsbmv",
     "dgemv",
@@ -62,8 +63,10 @@ __all__ = [
     "ctrmv",
     "ctrsv",
     "dtrmv",
+    "dtrsv",
     "dtbmv",
     "dtpmv",
+    "dtpsv",
     "hgemv",
     "sgbmv",
     "sgemv",
@@ -82,9 +85,16 @@ __all__ = [
     "strmv",
     "strsv",
     "zgbmv",
+    "zhpr",
+    "zhpr2",
     "zhpmv",
     "zhbmv",
+    "zher",
+    "zher2",
+    "zsyr",
     "ztbmv",
+    "ztbsv",
     "ztpmv",
     "ztrmv",
+    "ztrsv",
 ]

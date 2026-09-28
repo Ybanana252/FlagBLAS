@@ -38,6 +38,7 @@ def _prepare_inverse(
     CONJ: tl.constexpr,
     FORWARD: tl.constexpr,
     COMPLEX: tl.constexpr,
+    IS_DOUBLE: tl.constexpr,
     B: tl.constexpr,
 ):
     block = tl.program_id(0)
@@ -58,7 +59,7 @@ def _prepare_inverse(
             UNIT,
             CONJ,
             FORWARD,
-            False,
+            IS_DOUBLE,
             B,
         )
         tl.store(inverse + out, real)
@@ -248,6 +249,7 @@ def _tbsv(uplo, trans, diag, n, k, A, lda, x, incx, complex_):
             CONJ=conj,
             FORWARD=forward,
             COMPLEX=complex_,
+            IS_DOUBLE=False,
             B=block,
             num_warps=4,
             num_stages=1,
@@ -297,3 +299,117 @@ def stbsv(uplo, trans, diag, n, k, A, lda, x, incx):
 def ctbsv(uplo, trans, diag, n, k, A, lda, x, incx):
     """Solve a complex single-precision triangular banded system in-place."""
     return _tbsv(uplo, trans, diag, n, k, A, lda, x, incx, True)
+
+
+@triton.jit
+def _ztbsv_persistent(
+    A,
+    X,
+    inverse,
+    n,
+    k,
+    lda,
+    UPLO: tl.constexpr,
+    TRANS: tl.constexpr,
+    CONJ: tl.constexpr,
+    FORWARD: tl.constexpr,
+    B: tl.constexpr,
+    BAND: tl.constexpr,
+):
+    offs = tl.arange(0, B)
+    band_offs = tl.arange(0, BAND)
+    count = tl.cdiv(n, B)
+    for step in range(count):
+        block = step if FORWARD else count - 1 - step
+        start = block * B
+        end = tl.minimum(start + B, n)
+        rows = start + offs
+        row_mask = rows < end
+        inv_off = block * 2 * B * B + offs[:, None] * B + offs[None, :]
+        inv_r = tl.load(inverse + inv_off)
+        inv_i = tl.load(inverse + inv_off + B * B)
+        rhs_r = tl.load(X + rows * 2, row_mask, 0)
+        rhs_i = tl.load(X + rows * 2 + 1, row_mask, 0)
+        if FORWARD:
+            first = tl.maximum(0, start - k)
+            last = start
+        else:
+            first = end
+            last = tl.minimum(n, end + k)
+        cols = first + band_offs
+        col_mask = cols < last
+        solved_r = tl.load(X + cols * 2, col_mask, 0)
+        solved_i = tl.load(X + cols * 2 + 1, col_mask, 0)
+        if TRANS == 0:
+            a_off = 2 * _common._tbsv_band_offset(
+                rows[:, None], cols[None, :], k, lda, UPLO
+            )
+        else:
+            a_off = 2 * _common._tbsv_band_offset(
+                cols[None, :], rows[:, None], k, lda, UPLO
+            )
+        distance = tl.abs(rows[:, None] - cols[None, :])
+        matrix_mask = row_mask[:, None] & col_mask[None, :] & (distance <= k)
+        matrix_r = tl.load(A + a_off, matrix_mask, 0)
+        matrix_i = tl.load(A + a_off + 1, matrix_mask, 0)
+        if CONJ:
+            matrix_i = -matrix_i
+        rhs_r -= tl.sum(matrix_r * solved_r[None, :] - matrix_i * solved_i[None, :], 1)
+        rhs_i -= tl.sum(matrix_r * solved_i[None, :] + matrix_i * solved_r[None, :], 1)
+        result_r = tl.sum(inv_r * rhs_r[None, :] - inv_i * rhs_i[None, :], 1)
+        result_i = tl.sum(inv_r * rhs_i[None, :] + inv_i * rhs_r[None, :], 1)
+        tl.store(X + rows * 2, result_r, row_mask)
+        tl.store(X + rows * 2 + 1, result_i, row_mask)
+
+
+def ztbsv(uplo, trans, diag, n, k, A, lda, x, incx):
+    if not (incx == 1 and diag == 0 and k in (255, 256) and n >= 256):
+        return _common.ztbsv(uplo, trans, diag, n, k, A, lda, x, incx)
+    assert A.dtype == torch.complex128 == x.dtype
+    _common._check_tbsv(A, x, uplo, trans, diag, n, k, lda, incx, complex_ok=True)
+    physical_uplo, physical_trans, conj = _common._row_major_tbsv_args(uplo, trans)
+    trans_flag = int(physical_trans != 0)
+    forward = int((physical_uplo == 0) ^ (trans_flag == 1))
+    block = 8
+    panel_count = triton.cdiv(n, block)
+    inverse = torch.empty(
+        (panel_count * 2 * block * block,),
+        dtype=torch.float64,
+        device=A.device,
+    )
+    with torch_device_fn.device(A.device):
+        A_real = torch.view_as_real(A)
+        x_real = torch.view_as_real(x)
+        _prepare_inverse[(panel_count,)](
+            A_real,
+            inverse,
+            n,
+            k,
+            lda,
+            UPLO=physical_uplo,
+            TRANS=trans_flag,
+            UNIT=False,
+            CONJ=conj,
+            FORWARD=forward,
+            COMPLEX=True,
+            IS_DOUBLE=True,
+            B=block,
+            num_warps=4,
+            num_stages=1,
+        )
+        _ztbsv_persistent[(1,)](
+            A_real,
+            x_real,
+            inverse,
+            n,
+            k,
+            lda,
+            UPLO=physical_uplo,
+            TRANS=trans_flag,
+            CONJ=conj,
+            FORWARD=forward,
+            B=block,
+            BAND=triton.next_power_of_2(k),
+            num_warps=4,
+            num_stages=1,
+        )

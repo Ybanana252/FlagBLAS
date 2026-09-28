@@ -16,7 +16,12 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas.ops.level2.her2 import ScalarType, _check_her2_args, _complex_scalar
+from flag_blas.ops.level2.her2 import (
+    ScalarType,
+    _check_her2_args,
+    _complex_scalar,
+    _f64_to_i64,
+)
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -146,6 +151,66 @@ def _cher2_tiled_jit(
     tl.store(ptr, tl.join(ar + update_r, out_i), mask[:, :, None])
 
 
+@triton.jit
+def _zher2_tiled_jit(
+    a_ptr,
+    x_ptr,
+    y_ptr,
+    alpha_r_bits,
+    alpha_i_bits,
+    N: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    UPLO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row_start = tl.program_id(0) * BLOCK_M
+    col_start = tl.program_id(1) * BLOCK_N
+    if UPLO == 0:
+        if row_start + BLOCK_M <= col_start:
+            return
+    else:
+        if col_start + BLOCK_N <= row_start:
+            return
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+    r64, c64 = rows.to(tl.int64), cols.to(tl.int64)
+    xr = tl.load(x_ptr + r64 * INCX * 2, rows < N, 0)
+    xi = tl.load(x_ptr + r64 * INCX * 2 + 1, rows < N, 0)
+    yr = tl.load(y_ptr + r64 * INCY * 2, rows < N, 0)
+    yi = tl.load(y_ptr + r64 * INCY * 2 + 1, rows < N, 0)
+    xcr = tl.load(x_ptr + c64 * INCX * 2, cols < N, 0)
+    xci = tl.load(x_ptr + c64 * INCX * 2 + 1, cols < N, 0)
+    ycr = tl.load(y_ptr + c64 * INCY * 2, cols < N, 0)
+    yci = tl.load(y_ptr + c64 * INCY * 2 + 1, cols < N, 0)
+    alpha_r = alpha_r_bits.to(tl.float64, bitcast=True)
+    alpha_i = alpha_i_bits.to(tl.float64, bitcast=True)
+    axr = alpha_r * xr - alpha_i * xi
+    axi = alpha_r * xi + alpha_i * xr
+    ayr = alpha_r * yr + alpha_i * yi
+    ayi = alpha_r * yi - alpha_i * yr
+    update_r = axr[:, None] * ycr[None, :] + axi[:, None] * yci[None, :]
+    update_r += ayr[:, None] * xcr[None, :] + ayi[:, None] * xci[None, :]
+    update_i = axi[:, None] * ycr[None, :] - axr[:, None] * yci[None, :]
+    update_i += ayi[:, None] * xcr[None, :] - ayr[:, None] * xci[None, :]
+    mask = (rows[:, None] < N) & (cols[None, :] < N)
+    if UPLO == 0:
+        mask &= rows[:, None] >= cols[None, :]
+    else:
+        mask &= rows[:, None] <= cols[None, :]
+    off = (r64[:, None] * LDA + c64[None, :]) * 2
+    ar = tl.load(a_ptr + off, mask, 0)
+    ai = tl.load(a_ptr + off + 1, mask, 0)
+    tl.store(a_ptr + off, ar + update_r, mask)
+    tl.store(
+        a_ptr + off + 1,
+        tl.where(rows[:, None] == cols[None, :], 0.0, ai + update_i),
+        mask,
+    )
+
+
 cher2_mthreads_kernel = libentry()(
     triton.autotune(
         configs=_CHER2_CONFIGS,
@@ -197,4 +262,46 @@ def cher2(
             INCX=incx,
             INCY=incy,
             UPLO=uplo,
+        )
+
+
+def zher2(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    x: torch.Tensor,
+    incx: int,
+    y: torch.Tensor,
+    incy: int,
+    A: torch.Tensor,
+    lda: int,
+) -> None:
+    _check_her2_args(torch.complex128, uplo, n, x, incx, y, incy, A, lda)
+    if n == 0:
+        return
+    alpha_r, alpha_i = _complex_scalar(alpha)
+    if alpha_r == 0.0 and alpha_i == 0.0:
+        return
+    if n <= 512:
+        bm, bn = 1, 128
+    elif n <= 2048:
+        bm, bn = 2, 64
+    else:
+        bm, bn = 1, 128
+    with torch_device_fn.device(A.device):
+        _zher2_tiled_jit[(triton.cdiv(n, bm), triton.cdiv(n, bn))](
+            torch.view_as_real(A),
+            torch.view_as_real(x),
+            torch.view_as_real(y),
+            _f64_to_i64(alpha_r),
+            _f64_to_i64(alpha_i),
+            N=n,
+            LDA=lda,
+            INCX=incx,
+            INCY=incy,
+            UPLO=uplo,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            num_warps=4,
+            num_stages=1,
         )

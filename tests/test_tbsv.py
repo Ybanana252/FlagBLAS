@@ -20,8 +20,6 @@ import torch
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
-
-from .vendor_blas_reference import check_hipblas_status, get_hipblas_context
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -34,6 +32,7 @@ from flag_blas.ops import (
 
 from .accuracy_utils import blas_assert_close, to_cpu_blas_tensor
 from .conftest import TO_CPU
+from .vendor_blas_reference import check_hipblas_status, get_hipblas_context
 
 
 def load_cublas():
@@ -238,7 +237,11 @@ def make_triangular_banded(n, k, lda, uplo, dtype, device, unit_diag=False):
 
     build_device = (
         "cpu"
-        if flag_blas.vendor_name == "ascend" and dtype == torch.complex64
+        if (flag_blas.vendor_name == "ascend" and dtype == torch.complex64)
+        or (
+            flag_blas.vendor_name == "mthreads"
+            and dtype in (torch.float64, torch.complex128)
+        )
         else device
     )
     A = tbsv_randn(n, lda, dtype=dtype, device=build_device) * 0.1

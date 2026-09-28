@@ -139,7 +139,12 @@ def _make_her_inputs(dtype, n, incx, seed):
     real_dtype = torch.float32 if dtype is torch.complex64 else torch.float64
     device = flag_blas.device
     x_len = 1 + (n - 1) * incx
-    build_device = "cpu" if flag_blas.vendor_name == "ascend" else device
+    build_device = (
+        "cpu"
+        if flag_blas.vendor_name == "ascend"
+        or (flag_blas.vendor_name == "mthreads" and dtype == torch.complex128)
+        else device
+    )
     x = her_randn(x_len, dtype=dtype, device=build_device)
     A = her_randn(n, n, dtype=dtype, device=build_device)
     A = torch.tril(A) + torch.tril(A, -1).mH
