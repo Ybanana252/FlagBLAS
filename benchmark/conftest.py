@@ -268,6 +268,26 @@ def pytest_collection_modifyitems(items):
     items[:] = [item for item in items if keep_thead_l2_perf_node(item.nodeid)]
 
 
+def _get_skipped_reason(report):
+    if hasattr(report.longrepr, "reprcrash"):
+        return report.longrepr.reprcrash.message
+    elif isinstance(report.longrepr, tuple):
+        return report.longrepr[2]
+    else:
+        return str(report.longrepr)
+
+
+def pytest_runtest_logreport(report):
+    # Record why a benchmark case was skipped so the caller (e.g.
+    # tools/run_tests.py) can tell "all cases skipped" apart from
+    # "no benchmark data collected".
+    if not Config.record_log or report.outcome != "skipped":
+        return
+    if report.when not in ("setup", "call"):
+        return
+    emit_record_logger(json.dumps({"skip_reason": _get_skipped_reason(report)}))
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_once(request):
     if request.config.getoption("--query"):
