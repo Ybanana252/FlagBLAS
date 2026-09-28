@@ -33,7 +33,11 @@ registrar = Register
 current_work_registerar = None
 runtime.replace_customized_ops(globals())
 
-__version__ = "0.1.0"
+from importlib.metadata import version, PackageNotFoundError
+try:
+    __version__ = version("flag_blas")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 _FULL_CONFIG = ()
 
