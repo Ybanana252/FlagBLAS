@@ -557,7 +557,7 @@ def parse_benchmark_log(log_file, op):
         pass
 
     if not records:
-        result = {"status": "NotFound"}
+        result = {"status": "NotFound", "test_case": op}
         if skip_reasons and all(
             _is_fp64_unsupported(reason) for reason in skip_reasons
         ):
