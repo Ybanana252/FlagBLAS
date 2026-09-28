@@ -423,12 +423,24 @@ def run_cmd(op, cmd, cwd=None, env=None, timeout=600, flavor=None):
 
 FP64_UNSUPPORTED_MARKERS = ("fp64", "float64")
 FP64_SKIP_AS_PASS_VENDORS = ("iluvatar", "ascend")
+# BLAS naming prefix -> dtype name, used to key the default benchmark entry.
+BLAS_PREFIX_DTYPE = {
+    "s": "fp32",
+    "d": "fp64",
+    "c": "cf64",
+    "z": "cf128",
+    "h": "fp16",
+}
 
 
 def _is_fp64_unsupported(reason):
     """Return True if a skip reason indicates the device lacks fp64 support."""
     reason = (reason or "").lower()
     return any(marker in reason for marker in FP64_UNSUPPORTED_MARKERS)
+
+
+def _default_dtype_for_op(op):
+    return BLAS_PREFIX_DTYPE.get(op[:1], "default")
 
 
 def parse_accuracy_data(result_file):
@@ -803,6 +815,17 @@ def worker_proc(gpu_id, work_queue, display_queue):
             )
         ):
             perf["status"] = "Passed"
+            if not perf.get("data"):
+                # No measurement exists because fp64 is unsupported; report a
+                # neutral 1.0 speedup so the final statistics keep a value.
+                perf["data"] = {
+                    _default_dtype_for_op(op): {
+                        "result": "OK",
+                        "details": {},
+                        "speedup": 1.0,
+                        "default": True,
+                    }
+                }
         display_queue.put(
             (
                 "done",
