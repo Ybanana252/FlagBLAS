@@ -69,3 +69,31 @@ def ctpsv(uplo, trans, diag, n, AP, x, incx):
             num_warps=4,
         )
     return x
+
+
+def dtpsv(uplo, trans, diag, n, AP, x, incx):
+    if not (incx == 1 and uplo == 1 and trans == 1 and diag == 0 and 64 <= n <= 96):
+        return _common.dtpsv(uplo, trans, diag, n, AP, x, incx)
+    _common._check_common(uplo, trans, diag, n, AP, x, incx)
+    assert AP.dtype is torch.float64 and x.dtype is torch.float64
+    physical_uplo, physical_trans, _ = _common._row_major_tpsv_args(uplo, trans)
+    lower_eff = int(
+        (physical_uplo == CUBLAS_FILL_MODE_LOWER) ^ (physical_trans != CUBLAS_OP_N)
+    )
+    with torch_device_fn.device(AP.device):
+        _common._real_tpsv_blocked_kernel[(triton.cdiv(n, 8),)](
+            AP,
+            x,
+            _common._tpsv_flags(AP.device),
+            n,
+            UPLO=physical_uplo,
+            TRANS=physical_trans,
+            UNIT=False,
+            LOWER_EFF=lower_eff,
+            FORWARD=bool(lower_eff),
+            IS_DOUBLE=True,
+            BLOCK_N=8,
+            CHUNK=1,
+            num_warps=4,
+        )
+    return x

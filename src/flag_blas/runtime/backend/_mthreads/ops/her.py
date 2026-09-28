@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas.ops.level2.her import ScalarType, _check_her_args
+from flag_blas.ops.level2.her import ScalarType, _check_her_args, _f64_to_i64
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -100,6 +100,69 @@ def _cher_kernel(
     tl.store(ptr, tl.join(ar + update_r, out_i), mask[:, :, None])
 
 
+@triton.jit
+def _zher_kernel(
+    a_ptr,
+    x_ptr,
+    alpha_bits,
+    N: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    UPLO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    TRIANGULAR: tl.constexpr,
+):
+    if TRIANGULAR:
+        tile = tl.program_id(0)
+        row_slice = tl.program_id(1)
+        major = ((tl.sqrt(8.0 * tile + 1.0) - 1.0) * 0.5).to(tl.int32)
+        base = major * (major + 1) // 2
+        major = tl.where(base > tile, major - 1, major)
+        next_base = (major + 1) * (major + 2) // 2
+        major = tl.where(next_base <= tile, major + 1, major)
+        minor = tile - major * (major + 1) // 2
+        if UPLO == 0:
+            row_tile, col_tile = major, minor
+        else:
+            row_tile, col_tile = minor, major
+        row_start = row_tile * BLOCK_N + row_slice * BLOCK_M
+        col_start = col_tile * BLOCK_N
+    else:
+        row_start = tl.program_id(0) * BLOCK_M
+        col_start = tl.program_id(1) * BLOCK_N
+        if UPLO == 0:
+            if row_start + BLOCK_M <= col_start:
+                return
+        else:
+            if col_start + BLOCK_N <= row_start:
+                return
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+    r64, c64 = rows.to(tl.int64), cols.to(tl.int64)
+    xr = tl.load(x_ptr + r64 * INCX * 2, rows < N, 0)
+    xi = tl.load(x_ptr + r64 * INCX * 2 + 1, rows < N, 0)
+    yr = tl.load(x_ptr + c64 * INCX * 2, cols < N, 0)
+    yi = tl.load(x_ptr + c64 * INCX * 2 + 1, cols < N, 0)
+    alpha = alpha_bits.to(tl.float64, bitcast=True)
+    update_r = alpha * (xr[:, None] * yr[None, :] + xi[:, None] * yi[None, :])
+    update_i = alpha * (xi[:, None] * yr[None, :] - xr[:, None] * yi[None, :])
+    mask = (rows[:, None] < N) & (cols[None, :] < N)
+    if UPLO == 0:
+        mask &= rows[:, None] >= cols[None, :]
+    else:
+        mask &= rows[:, None] <= cols[None, :]
+    off = (r64[:, None] * LDA + c64[None, :]) * 2
+    ar = tl.load(a_ptr + off, mask, 0)
+    ai = tl.load(a_ptr + off + 1, mask, 0)
+    tl.store(a_ptr + off, ar + update_r, mask)
+    tl.store(
+        a_ptr + off + 1,
+        tl.where(rows[:, None] == cols[None, :], 0.0, ai + update_i),
+        mask,
+    )
+
+
 def _cher_config(n, uplo):
     # S5000 measurements: (rows, columns, triangular grid, adjacent slices, warps).
     # Small matrices benefit from avoiding triangular-index inversion.
@@ -161,4 +224,55 @@ def cher(
     return A
 
 
-__all__ = ["cher"]
+def zher(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    x: torch.Tensor,
+    incx: int,
+    A: torch.Tensor,
+    lda: int,
+):
+    _check_her_args(
+        "zher", uplo, n, alpha, x, incx, A, lda, torch.complex128, torch.float64
+    )
+    if n == 0:
+        return A
+    alpha_value = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    if n <= 512:
+        bm, bn, triangular, warps = 1, 128, False, 4
+    elif n <= 1024:
+        bm, bn, triangular, warps = 2, 64, True, 8
+    elif n <= 1536:
+        bm, bn, triangular, warps = 1, 128, False, 8
+    elif n <= 2048:
+        bm, bn, triangular, warps = 1, 128, True, 8
+    elif uplo == 0:
+        bm, bn, triangular, warps = 2, 64, True, 8
+    else:
+        bm, bn, triangular, warps = 1, 128, False, 4
+    tiles = triton.cdiv(n, bn)
+    grid = (
+        (tiles * (tiles + 1) // 2, triton.cdiv(min(n, bn), bm))
+        if triangular
+        else (triton.cdiv(n, bm), tiles)
+    )
+    with torch_device_fn.device(A.device):
+        _zher_kernel[grid](
+            torch.view_as_real(A),
+            torch.view_as_real(x),
+            _f64_to_i64(alpha_value),
+            N=n,
+            LDA=lda,
+            INCX=incx,
+            UPLO=uplo,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            TRIANGULAR=triangular,
+            num_warps=warps,
+            num_stages=1,
+        )
+    return A
+
+
+__all__ = ["cher", "zher"]

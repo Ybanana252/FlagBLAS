@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas.ops.level2.hpr import ScalarType, _check_hpr_args
+from flag_blas.ops.level2.hpr import ScalarType, _check_hpr_args, _f64_to_i64
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -87,6 +87,59 @@ def _chpr_tiled_jit(
     tl.store(ap_ptr + offsets * 2 + 1, out_i, mask)
 
 
+@triton.jit
+def _zhpr_tiled_jit(
+    ap_ptr,
+    x_ptr,
+    alpha_bits,
+    N: tl.constexpr,
+    INCX: tl.constexpr,
+    UPLO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    major = ((tl.sqrt(8.0 * tile + 1.0) - 1.0) * 0.5).to(tl.int32)
+    base = major * (major + 1) // 2
+    major = tl.where(base > tile, major - 1, major)
+    next_base = (major + 1) * (major + 2) // 2
+    major = tl.where(next_base <= tile, major + 1, major)
+    minor = tile - major * (major + 1) // 2
+    if UPLO == 0:
+        row_tile, col_tile = major, minor
+    else:
+        row_tile, col_tile = minor, major
+
+    rows = row_tile * BLOCK_N + tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = col_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    r64, c64 = rows.to(tl.int64), cols.to(tl.int64)
+    xr = tl.load(x_ptr + r64 * INCX * 2, rows < N, 0)
+    xi = tl.load(x_ptr + r64 * INCX * 2 + 1, rows < N, 0)
+    xcr = tl.load(x_ptr + c64 * INCX * 2, cols < N, 0)
+    xci = tl.load(x_ptr + c64 * INCX * 2 + 1, cols < N, 0)
+    alpha = alpha_bits.to(tl.float64, bitcast=True)
+    update_r = alpha * (xr[:, None] * xcr[None, :] + xi[:, None] * xci[None, :])
+    update_i = alpha * (xi[:, None] * xcr[None, :] - xr[:, None] * xci[None, :])
+
+    mask = (rows[:, None] < N) & (cols[None, :] < N)
+    if UPLO == 0:
+        row_base = r64 * (r64 + 1) // 2
+        offsets = row_base[:, None] + c64[None, :]
+        mask &= rows[:, None] >= cols[None, :]
+    else:
+        row_base = r64 * (2 * N - r64 + 1) // 2
+        offsets = row_base[:, None] + c64[None, :] - r64[:, None]
+        mask &= rows[:, None] <= cols[None, :]
+    ar = tl.load(ap_ptr + offsets * 2, mask, 0)
+    ai = tl.load(ap_ptr + offsets * 2 + 1, mask, 0)
+    tl.store(ap_ptr + offsets * 2, ar + update_r, mask)
+    tl.store(
+        ap_ptr + offsets * 2 + 1,
+        tl.where(rows[:, None] == cols[None, :], 0.0, ai + update_i),
+        mask,
+    )
+
+
 chpr_mthreads_kernel = libentry()(
     triton.autotune(
         configs=_CHPR_CONFIGS,
@@ -129,4 +182,43 @@ def chpr(
             N=n,
             INCX=incx,
             UPLO=uplo,
+        )
+
+
+def zhpr(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    x: torch.Tensor,
+    incx: int,
+    AP: torch.Tensor,
+) -> None:
+    _check_hpr_args(torch.complex128, uplo, n, x, incx, AP)
+    if n == 0:
+        return
+    alpha = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    if alpha == 0.0:
+        return
+    if n <= 256:
+        block_m, block_n, warps = 1, 128, 4
+    elif n <= 512:
+        block_m, block_n, warps = 1, 256, 8
+    elif n <= 4096:
+        block_m, block_n, warps = 2, 64, 8
+    else:
+        block_m, block_n, warps = 4, 64, 8
+    tiles = triton.cdiv(n, block_n)
+    row_slices = triton.cdiv(min(n, block_n), block_m)
+    with torch_device_fn.device(AP.device):
+        _zhpr_tiled_jit[(tiles * (tiles + 1) // 2, row_slices)](
+            torch.view_as_real(AP),
+            torch.view_as_real(x),
+            _f64_to_i64(alpha),
+            N=n,
+            INCX=incx,
+            UPLO=uplo,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=warps,
+            num_stages=1,
         )
