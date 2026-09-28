@@ -133,7 +133,7 @@ group_hgemm:
     num_stages: 5
 group_tf32gemm:
   # TF32 stages buffer fp32 tiles (2x BF16 bytes); pipeline depths kept
-  # within the 256KB shared-memory budget of PPU-ZW810E. The 128x128 w4
+  # within the 256KB shared-memory budget of PPU-ZW810E. The 128x128 w4/w8
   # family wins the few-expert compute-bound shapes; the 256x128 and
   # 128x256 families win the many-expert bandwidth-bound shapes.
   - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, NUM_WM: 8}
@@ -145,6 +145,12 @@ group_tf32gemm:
   - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, NUM_WM: 4}
     num_warps: 4
     num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, NUM_WM: 8}
+    num_warps: 8
+    num_stages: 4
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, NUM_WM: 16}
+    num_warps: 8
+    num_stages: 4
   - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, NUM_WM: 2}
     num_warps: 8
     num_stages: 3

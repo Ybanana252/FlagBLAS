@@ -788,11 +788,12 @@ class PpuGroupGemmBenchmark(GroupGemmBenchmark):
         return 2 * group_A.shape[0] * group_B.shape[1] * group_B.shape[2]
 
     def get_gbps(self, args, latency):
-        group_A, group_B, _, group_out = args[:4]
+        group_A, group_B, group_list, group_out = args[:4]
         io_amount = (
             shape_utils.size_in_bytes(group_A)
             + shape_utils.size_in_bytes(group_B)
-            + 2 * shape_utils.size_in_bytes(group_out)
+            + shape_utils.size_in_bytes(group_list)
+            + shape_utils.size_in_bytes(group_out)
         )
         return io_amount * 1e-9 / (latency * 1e-3)
 
