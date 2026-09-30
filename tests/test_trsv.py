@@ -57,9 +57,7 @@ def load_cublas():
 
 
 _cublas = (
-    None
-    if flag_blas.vendor_name in {"ascend", "hygon", "mthreads"}
-    else load_cublas()
+    None if flag_blas.vendor_name in {"ascend", "hygon", "mthreads"} else load_cublas()
 )
 
 
@@ -286,8 +284,9 @@ COMPLEX_TRANS = [CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_OP_C]
 
 
 def trsv_randn(shape, dtype, device):
-    if (IS_ASCEND or IS_MTHREADS) and dtype == torch.complex64:
-        values = torch.randn((*shape, 2), dtype=torch.float32, device=device)
+    if (IS_ASCEND and dtype == torch.complex64) or (IS_MTHREADS and dtype.is_complex):
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        values = torch.randn((*shape, 2), dtype=real_dtype, device=device)
         return torch.view_as_complex(values)
     return torch.randn(shape, dtype=dtype, device=device)
 
@@ -317,7 +316,7 @@ def make_triangular(n, lda, uplo, diag, dtype, device):
         valid = row_idx >= col_idx
     if diag == CUBLAS_DIAG_UNIT:
         valid = valid & (row_idx != col_idx)
-    if (IS_ASCEND or IS_MTHREADS) and dtype == torch.complex64:
+    if (IS_ASCEND and dtype == torch.complex64) or (IS_MTHREADS and dtype.is_complex):
         vals_real = torch.view_as_real(vals)
         if diag == CUBLAS_DIAG_NON_UNIT:
             diag_real = torch.diagonal(vals_real, dim1=0, dim2=1)

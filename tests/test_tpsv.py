@@ -6,8 +6,6 @@ import torch
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
-
-from .vendor_blas_reference import check_hipblas_status, get_hipblas_context
 from flag_blas.ops import (
     CUBLAS_DIAG_NON_UNIT,
     CUBLAS_DIAG_UNIT,
@@ -20,6 +18,7 @@ from flag_blas.ops import (
 
 from .accuracy_utils import blas_assert_close, to_cpu_blas_tensor
 from .conftest import TO_CPU
+from .vendor_blas_reference import check_hipblas_status, get_hipblas_context
 
 pytestmark = pytest.mark.tpsv
 
@@ -199,7 +198,10 @@ def _make_case(n, dtype, uplo, diag, incx, device):
     torch.manual_seed(n + 17 * int(uplo) + 31 * int(diag) + 43 * int(incx))
     build_device = (
         "cpu"
-        if flag_blas.vendor_name in {"ascend", "mthreads"} and dtype == torch.complex64
+        if (
+            (flag_blas.vendor_name == "ascend" and dtype == torch.complex64)
+            or (flag_blas.vendor_name == "mthreads" and dtype.is_complex)
+        )
         else device
     )
     AP = tpsv_randn(n * (n + 1) // 2, dtype=dtype, device=build_device) * 0.05
@@ -502,7 +504,10 @@ def test_tpsv_unit_diag_ignores_stored_diagonal(op, dtype, uplo):
     AP, x = _make_case(n, dtype, uplo, CUBLAS_DIAG_UNIT, 1, flag_blas.device)
     build_device = (
         "cpu"
-        if flag_blas.vendor_name in {"ascend", "mthreads"} and dtype == torch.complex64
+        if (
+            (flag_blas.vendor_name == "ascend" and dtype == torch.complex64)
+            or (flag_blas.vendor_name == "mthreads" and dtype.is_complex)
+        )
         else flag_blas.device
     )
     dirty = AP.to(build_device).clone()

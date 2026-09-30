@@ -16,7 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas.ops.level2.spr2 import ScalarType, _check_spr2_args
+from flag_blas.ops.level2.spr2 import ScalarType, _check_spr2_args, _f64_to_i64
+from flag_blas.ops.level2.spr2 import dspr2 as _public_dspr2
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -83,6 +84,42 @@ def sspr2_mthreads_kernel(
     tl.store(ap_ptr + offsets, ap + update, mask)
 
 
+@triton.jit
+def _dspr2_upper(
+    ap_ptr,
+    x_ptr,
+    y_ptr,
+    alpha_bits,
+    N: tl.constexpr,
+    INCX: tl.constexpr,
+    INCY: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    major = ((tl.sqrt(8.0 * tile + 1.0) - 1.0) * 0.5).to(tl.int32)
+    base = major * (major + 1) // 2
+    major = tl.where(base > tile, major - 1, major)
+    next_base = (major + 1) * (major + 2) // 2
+    major = tl.where(next_base <= tile, major + 1, major)
+    minor = tile - major * (major + 1) // 2
+    rows = minor * BLOCK_N + tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = major * BLOCK_N + tl.arange(0, BLOCK_N)
+    r64, c64 = rows.to(tl.int64), cols.to(tl.int64)
+    xr = tl.load(x_ptr + r64 * INCX, rows < N, 0)
+    yr = tl.load(y_ptr + r64 * INCY, rows < N, 0)
+    xc = tl.load(x_ptr + c64 * INCX, cols < N, 0)
+    yc = tl.load(y_ptr + c64 * INCY, cols < N, 0)
+    row_base = r64 * (2 * N - r64 + 1) // 2
+    offsets = row_base[:, None] + c64[None, :] - r64[:, None]
+    mask = (rows[:, None] < N) & (cols[None, :] < N)
+    mask &= rows[:, None] <= cols[None, :]
+    ap = tl.load(ap_ptr + offsets, mask, 0)
+    alpha = alpha_bits.to(tl.float64, bitcast=True)
+    update = alpha * (xr[:, None] * yc[None, :] + yr[:, None] * xc[None, :])
+    tl.store(ap_ptr + offsets, ap + update, mask)
+
+
 def _sspr2_grid(n):
     def grid(meta):
         tiles = triton.cdiv(n, meta["BLOCK_N"])
@@ -111,4 +148,46 @@ def sspr2(
     with torch_device_fn.device(AP.device):
         sspr2_mthreads_kernel[_sspr2_grid(n)](
             AP, x, y, alpha, N=n, INCX=incx, INCY=incy, UPLO=uplo
+        )
+
+
+def dspr2(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    x: torch.Tensor,
+    incx: int,
+    y: torch.Tensor,
+    incy: int,
+    AP: torch.Tensor,
+) -> None:
+    if uplo == 0:
+        return _public_dspr2(uplo, n, alpha, x, incx, y, incy, AP)
+    _check_spr2_args(torch.float64, uplo, n, x, incx, y, incy, AP)
+    if n == 0:
+        return
+    alpha = float(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    if alpha == 0.0:
+        return
+    if n <= 256:
+        bm, bn, warps = 1, 256, 8
+    elif n <= 2048:
+        bm, bn, warps = 2, 64, 4
+    else:
+        bm, bn, warps = 4, 128, 8
+    tiles = triton.cdiv(n, bn)
+    slices = triton.cdiv(min(n, bn), bm)
+    with torch_device_fn.device(AP.device):
+        _dspr2_upper[(tiles * (tiles + 1) // 2, slices)](
+            AP,
+            x,
+            y,
+            _f64_to_i64(alpha),
+            N=n,
+            INCX=incx,
+            INCY=incy,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            num_warps=warps,
+            num_stages=1,
         )

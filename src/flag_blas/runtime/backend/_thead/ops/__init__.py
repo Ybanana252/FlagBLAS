@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .gemv import bfgemv, dgemv, hgemv, sgemv
-from .ger import dger, sger
+from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
+from .ger import dger, sger, zgerc, zgeru
 from .group_gemm import group_bfgemm, group_hgemm, group_tf32gemm
-from .hemv import chemv
+from .hemv import chemv, zhemv
+from .spmv import dspmv, sspmv
 from .spr import dspr, sspr
 from .spr2 import dspr2, sspr2
 from .syr import dsyr, ssyr
 from .syr2 import dsyr2, ssyr2
 from .tbsv import ctbsv, dtbsv, stbsv, ztbsv
+from .tpmv import dtpmv
 from .tpsv import ctpsv, dtpsv, stpsv, ztpsv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
@@ -29,12 +31,19 @@ __all__ = [
     "dgemv",
     "hgemv",
     "bfgemv",
+    "zgemv",
+    "cgemv",
     "sger",
     "dger",
     "group_bfgemm",
     "group_hgemm",
     "group_tf32gemm",
+    "zgeru",
+    "zgerc",
     "chemv",
+    "zhemv",
+    "sspmv",
+    "dspmv",
     "sspr",
     "dspr",
     "sspr2",
@@ -47,6 +56,7 @@ __all__ = [
     "dtbsv",
     "ctbsv",
     "ztbsv",
+    "dtpmv",
     "stpsv",
     "dtpsv",
     "ctpsv",

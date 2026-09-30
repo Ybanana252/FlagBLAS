@@ -28,7 +28,6 @@ UNSUPPORT_FP64 = [
     vendors.CAMBRICON,
     vendors.ILUVATAR,
     vendors.KUNLUNXIN,
-    vendors.MTHREADS,
     vendors.AIPU,
     vendors.ASCEND,
     vendors.TSINGMICRO,

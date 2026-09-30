@@ -11,34 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .gbmv import cgbmv, sgbmv
-from .gemv import bfgemv, cgemv, hgemv, sgemv
+from .gbmv import cgbmv, dgbmv, sgbmv, zgbmv
+from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import cgerc, cgeru, sger
 from .group_gemm import group_bfgemm, group_hgemm, group_mm, group_tf32gemm
-from .hbmv import chbmv
+from .hbmv import chbmv, zhbmv
 from .hemv import chemv
-from .her import cher
-from .her2 import cher2
-from .hpmv import chpmv
-from .hpr import chpr
-from .hpr2 import chpr2
-from .sbmv import ssbmv
-from .spmv import sspmv
+from .her import cher, zher
+from .her2 import cher2, zher2
+from .hpmv import chpmv, zhpmv
+from .hpr import chpr, zhpr
+from .hpr2 import chpr2, zhpr2
+from .sbmv import dsbmv, ssbmv
+from .spmv import dspmv, sspmv
 from .spr import sspr
-from .spr2 import sspr2
-from .symv import csymv, ssymv
-from .syr import csyr, ssyr
+from .spr2 import dspr2, sspr2
+from .symv import csymv, dsymv, ssymv
+from .syr import csyr, ssyr, zsyr
 from .syr2 import ssyr2
-from .tbmv import ctbmv, stbmv
-from .tbsv import ctbsv, stbsv
-from .tpmv import ctpmv, stpmv
-from .tpsv import ctpsv
-from .trmv import ctrmv, strmv
-from .trsv import ctrsv, strsv
+from .tbmv import ctbmv, dtbmv, stbmv, ztbmv
+from .tbsv import ctbsv, stbsv, ztbsv
+from .tpmv import ctpmv, dtpmv, stpmv, ztpmv
+from .tpsv import ctpsv, dtpsv
+from .trmv import ctrmv, dtrmv, strmv, ztrmv
+from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
 __all__ = [
     "bfgemv",
     "cgbmv",
+    "dgbmv",
+    "dspmv",
+    "dspr2",
+    "dsymv",
+    "dsbmv",
+    "dgemv",
     "cgemv",
     "cgerc",
     "cgeru",
@@ -61,9 +67,15 @@ __all__ = [
     "group_hgemm",
     "group_mm",
     "group_tf32gemm",
+    "dtrmv",
+    "dtrsv",
+    "dtbmv",
+    "dtpmv",
+    "dtpsv",
     "hgemv",
     "sgbmv",
     "sgemv",
+    "zgemv",
     "sger",
     "ssbmv",
     "sspmv",
@@ -77,4 +89,17 @@ __all__ = [
     "stpmv",
     "strmv",
     "strsv",
+    "zgbmv",
+    "zhpr",
+    "zhpr2",
+    "zhpmv",
+    "zhbmv",
+    "zher",
+    "zher2",
+    "zsyr",
+    "ztbmv",
+    "ztbsv",
+    "ztpmv",
+    "ztrmv",
+    "ztrsv",
 ]

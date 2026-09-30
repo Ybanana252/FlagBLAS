@@ -16,7 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_blas.ops.level2.syr import ScalarType, _check_syr_args
+from flag_blas.ops.level2.syr import ScalarType, _check_syr_args, _f64_to_i64
+from flag_blas.ops.level2.syr import zsyr as _common_zsyr
 from flag_blas.runtime import torch_device_fn
 from flag_blas.utils import libentry
 
@@ -261,4 +262,93 @@ def csyr(
                 num_warps=4,
                 num_stages=1,
             )
+    return A
+
+
+@triton.jit
+def _zsyr_rows_kernel(
+    A,
+    X,
+    AR_BITS,
+    AI_BITS,
+    N: tl.constexpr,
+    LDA: tl.constexpr,
+    INCX: tl.constexpr,
+    UPLO: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    row_start = tl.program_id(0) * BM
+    col_start = tl.program_id(1) * BN
+    if UPLO == 0:
+        if row_start + BM <= col_start:
+            return
+    else:
+        if col_start + BN <= row_start:
+            return
+    rows = row_start + tl.arange(0, BM)
+    cols = col_start + tl.arange(0, BN)
+    r64, c64 = rows.to(tl.int64), cols.to(tl.int64)
+    xr = tl.load(X + r64 * INCX * 2, rows < N, 0)
+    xi = tl.load(X + r64 * INCX * 2 + 1, rows < N, 0)
+    yr = tl.load(X + c64 * INCX * 2, cols < N, 0)
+    yi = tl.load(X + c64 * INCX * 2 + 1, cols < N, 0)
+    pr = xr[:, None] * yr[None, :] - xi[:, None] * yi[None, :]
+    pi = xr[:, None] * yi[None, :] + xi[:, None] * yr[None, :]
+    ar = AR_BITS.to(tl.float64, bitcast=True)
+    ai = AI_BITS.to(tl.float64, bitcast=True)
+    dr = ar * pr - ai * pi
+    di = ar * pi + ai * pr
+    mask = (rows[:, None] < N) & (cols[None, :] < N)
+    if UPLO == 0:
+        mask &= rows[:, None] >= cols[None, :]
+    else:
+        mask &= rows[:, None] <= cols[None, :]
+    off = (r64[:, None] * LDA + c64[None, :]) * 2
+    old_r = tl.load(A + off, mask, 0)
+    old_i = tl.load(A + off + 1, mask, 0)
+    tl.store(A + off, old_r + dr, mask)
+    tl.store(A + off + 1, old_i + di, mask)
+
+
+def zsyr(
+    uplo: int,
+    n: int,
+    alpha: ScalarType,
+    x: torch.Tensor,
+    incx: int,
+    A: torch.Tensor,
+    lda: int,
+):
+    if n < 129 or n > 4096:
+        return _common_zsyr(uplo, n, alpha, x, incx, A, lda)
+    _check_syr_args(uplo, n, x, incx, A, lda, torch.complex128)
+    alpha_value = complex(alpha.item() if isinstance(alpha, torch.Tensor) else alpha)
+    if n <= 257:
+        bm, bn, warps = 1, 128, 4
+    elif n <= 511:
+        bm, bn, warps = 2, 64, 4
+    elif n == 512:
+        bm, bn, warps = 1, 128, 8
+    elif n <= 1025:
+        bm, bn, warps = 2, 128, 8
+    elif n <= 2048:
+        bm, bn, warps = 1, 128, 8
+    else:
+        bm, bn, warps = 1, 128, 4
+    with torch_device_fn.device(A.device):
+        _zsyr_rows_kernel[(triton.cdiv(n, bm), triton.cdiv(n, bn))](
+            torch.view_as_real(A),
+            torch.view_as_real(x),
+            _f64_to_i64(alpha_value.real),
+            _f64_to_i64(alpha_value.imag),
+            n,
+            lda,
+            incx,
+            uplo,
+            bm,
+            bn,
+            num_warps=warps,
+            num_stages=1,
+        )
     return A

@@ -148,6 +148,73 @@ def strsv(uplo, trans, diag, n, A, lda, x, incx):
         )
 
 
+def dtrsv(uplo, trans, diag, n, A, lda, x, incx):
+    small = n == 64 and (diag == 0 or (uplo == 0 and trans == 0))
+    medium = n in (256, 512) and (
+        (diag == 0 and (trans == 0 or uplo == 0))
+        or (diag == 1 and uplo == 0 and trans == 0)
+    )
+    if incx != 1 or lda != n or not (small or medium):
+        return _common.dtrsv(uplo, trans, diag, n, A, lda, x, incx)
+    assert A.dtype == torch.float64 == x.dtype
+    _common._check_trsv(A, x, uplo, trans, diag, n, lda, incx, complex_ok=False)
+    if medium:
+        internal_uplo, trans_flag, _ = _common._row_major_dispatch(uplo, trans)
+        forward = bool(_common._forward(internal_uplo, trans_flag))
+        lower_eff = int((internal_uplo == 0) ^ (trans_flag == 1))
+        mode_key = _common._mode_key(internal_uplo, trans_flag, diag)
+        if n == 256 and trans != 0:
+            block_n, warps, rowload = 8, 8, 1
+        elif n == 256 and diag == 1:
+            block_n, warps, rowload = 16, 8, 0
+        elif n == 256:
+            block_n, warps, rowload = 16, 4, 1
+        elif diag == 1:
+            block_n, warps, rowload = 16, 8, 0
+        elif trans != 0:
+            block_n, warps, rowload = 16, 8, 1
+        else:
+            block_n, warps, rowload = 16, 4, 0
+        kernel = (
+            _common.dtrsv_fwd_fused_kernel
+            if forward
+            else _common.dtrsv_bwd_fused_kernel
+        )
+        with torch_device_fn.device(A.device):
+            kernel[(triton.cdiv(n, block_n),)](
+                A,
+                x,
+                _common._trsv_flags(A.device),
+                n,
+                lda,
+                mode_key,
+                TRANS=trans_flag,
+                UNIT=diag,
+                LOWER_EFF=lower_eff,
+                BLOCK_N=block_n,
+                CHUNK=1,
+                ROWLOAD=rowload,
+                num_warps=warps,
+            )
+        return
+    forward = (uplo == 0) if trans == 0 else (uplo == 1)
+    with torch_device_fn.device(A.device):
+        _trsv_small_kernel[(1,)](
+            A,
+            x,
+            lda,
+            incx,
+            N=n,
+            TRANS=trans,
+            UNIT=diag == 1,
+            FORWARD=forward,
+            COMPLEX=False,
+            BLOCK_N=64,
+            num_warps=2,
+            num_stages=1,
+        )
+
+
 def ctrsv(uplo, trans, diag, n, A, lda, x, incx):
     # A single predecessor panel per chunk avoids the large complex update
     # tiles and the scalar-expanded n=256/512 path in the common dispatch.
@@ -221,4 +288,62 @@ def ctrsv(uplo, trans, diag, n, A, lda, x, incx):
             INV_DOT=0,
             VEC64=int(n >= 1024),
             num_warps=4,
+        )
+
+
+def ztrsv(uplo, trans, diag, n, A, lda, x, incx):
+    small = n == 64 and diag == 1
+    medium = (
+        n == 1024
+        and diag == 0
+        and ((uplo == 0 and trans != 0) or (uplo == 1 and trans == 0))
+    )
+    if incx != 1 or lda != n or not (small or medium):
+        return _common.ztrsv(uplo, trans, diag, n, A, lda, x, incx)
+    assert A.dtype == torch.complex128 == x.dtype
+    _common._check_trsv(A, x, uplo, trans, diag, n, lda, incx, complex_ok=True)
+    if medium:
+        internal_uplo, trans_flag, conj = _common._row_major_dispatch(uplo, trans)
+        forward = bool(_common._forward(internal_uplo, trans_flag))
+        lower_eff = int((internal_uplo == 0) ^ (trans_flag == 1))
+        mode_key = _common._mode_key(internal_uplo, trans_flag, diag) | (conj << 8)
+        kernel = (
+            _common.ztrsv_fwd_fused_kernel
+            if forward
+            else _common.ztrsv_bwd_fused_kernel
+        )
+        with torch_device_fn.device(A.device):
+            kernel[(triton.cdiv(n, 16),)](
+                torch.view_as_real(A),
+                torch.view_as_real(x),
+                _common._trsv_flags(A.device),
+                n,
+                lda,
+                mode_key,
+                TRANS=trans_flag,
+                UNIT=0,
+                CONJ=conj,
+                LOWER_EFF=lower_eff,
+                BLOCK_N=16,
+                CHUNK=1,
+                ROWLOAD=int(uplo == 0),
+                INV_DOT=0,
+                num_warps=8,
+            )
+        return
+    forward = (uplo == 0) if trans == 0 else (uplo == 1)
+    with torch_device_fn.device(A.device):
+        _trsv_small_kernel[(1,)](
+            torch.view_as_real(A),
+            torch.view_as_real(x),
+            lda,
+            incx,
+            N=n,
+            TRANS=trans,
+            UNIT=True,
+            FORWARD=forward,
+            COMPLEX=True,
+            BLOCK_N=64,
+            num_warps=4,
+            num_stages=1,
         )
