@@ -14,6 +14,7 @@ IS_ASCEND = flag_blas.device == "npu"
 IS_ILUVATAR = flag_blas.vendor_name == "iluvatar"
 IS_MTHREADS = flag_blas.vendor_name == "mthreads"
 IS_PPU = flag_blas.vendor_name == "thead"
+IS_HYGPON = flag_blas.vendor_name == "hygon"
 
 if IS_ASCEND:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -63,6 +64,8 @@ elif IS_PPU:
             "requires FlagBLAS with an available PPU (T-Head) backend",
             allow_module_level=True,
         )
+elif IS_HYGPON:
+    pass
 else:
     if flag_blas.device != "cuda":
         pytest.skip(
@@ -81,7 +84,7 @@ else:
     )
 
 
-if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS and not IS_PPU:
+if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS and not IS_PPU and not IS_HYGPON:
 
     def load_cublas():
         lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
@@ -876,6 +879,84 @@ class IluvatarGroupGemmBenchmark(GroupGemmBenchmark):
         return io_amount * 1e-9 / (latency * 1e-3)
 
 
+def hygon_group_gemm(
+    group_A,
+    group_B,
+    group_list,
+    group_out,
+    m_list,
+    group_C=None,
+    alpha=1.0,
+    beta=0.0,
+    **kwargs,
+):
+    start = 0
+    for i, m in enumerate(m_list):
+        end = start + m
+        out_e = torch.matmul(group_A[start:end], group_B[i])
+        if alpha != 1.0:
+            out_e = out_e * alpha
+        if beta != 0.0:
+            out_e = out_e + beta * group_C[start:end]
+        group_out[start:end] = out_e
+        start = end
+    return group_out
+
+
+def hygon_gems_group_gemm_wrapper(group_A, group_B, group_list, group_out, **kwargs):
+    return flag_blas.group_bfgemm(group_A, group_B, group_list, group_out)
+
+
+class HygonGroupGemmBenchmark(GroupGemmBenchmark):
+    correctness_reference = "torch per-expert matmul loop (hipBLAS)"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        scale = 1.0
+        random.seed(SEED)
+        for k, e, n in self.shapes:
+            m_list = [random.randint(1, 4096) for _ in range(e)]
+            total_M = sum(m_list)
+
+            group_A = (
+                torch.randn(total_M, k, dtype=cur_dtype, device=self.device) * scale
+            )
+            group_B = torch.randn(e, k, n, dtype=cur_dtype, device=self.device) * scale
+            if self.beta != 0.0:
+                group_C = (
+                    torch.randn(total_M, n, dtype=cur_dtype, device=self.device) * scale
+                )
+            else:
+                group_C = torch.empty(total_M, n, dtype=cur_dtype, device=self.device)
+            group_list = torch.tensor(
+                m_list, dtype=torch.int32, device=self.device
+            ).cumsum(0)
+            group_out = torch.empty(total_M, n, dtype=cur_dtype, device=self.device)
+
+            yield group_A, group_B, group_list, group_out, {
+                "m_list": m_list,
+                "group_C": group_C,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
+                "alpha": self.alpha,
+                "beta": self.beta,
+            }
+
+    def get_tflops(self, op, *args, **kwargs):
+        group_A, group_B = args[0], args[1]
+        return 2 * group_A.shape[0] * group_B.shape[1] * group_B.shape[2]
+
+    def get_gbps(self, args, latency):
+        group_A, group_B, _, group_out = args[:4]
+        io_amount = (
+            shape_utils.size_in_bytes(group_A)
+            + shape_utils.size_in_bytes(group_B)
+            + 2 * shape_utils.size_in_bytes(group_out)
+        )
+        return io_amount * 1e-9 / (latency * 1e-3)
+
+
 def mthreads_group_gemm(
     group_A,
     group_B,
@@ -1328,6 +1409,24 @@ def test_perf_group_gemm_bf16():
             for A, B, group_list, kwargs in bench.get_input_iter(cur_dtype):
                 torch_result = aclnn_group_gemm(A, B, group_list, **kwargs)
                 gems_result = ascend_gems_group_gemm_wrapper(A, B, group_list, **kwargs)
+                bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
+        bench.run()
+    elif IS_HYGPON:
+        bench = HygonGroupGemmBenchmark(
+            op_name="group_gemm",
+            torch_op=hygon_group_gemm,
+            gems_op=hygon_gems_group_gemm_wrapper,
+            dtypes=[torch.bfloat16],
+        )
+        bench.init_user_config()
+        for cur_dtype in bench.to_bench_dtypes:
+            for A, B, group_list, group_out, kwargs in bench.get_input_iter(cur_dtype):
+                torch_result = hygon_group_gemm(
+                    A, B, group_list, group_out.clone(), **kwargs
+                )
+                gems_result = hygon_gems_group_gemm_wrapper(
+                    A, B, group_list, group_out.clone(), **kwargs
+                )
                 bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
         bench.run()
     else:

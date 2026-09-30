@@ -9,12 +9,13 @@ from . import accuracy_utils as utils
 from .conftest import TO_CPU
 
 IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_HYGPON = flag_blas.vendor_name == "hygon"
 
 if IS_ASCEND:
     torch_npu = pytest.importorskip("torch_npu")
     torch.npu.matmul.allow_hf32 = True
     torch.npu.matmul.cube_math_type = torch.npu.CubeMathType.USE_HF32
-else:
+elif not IS_HYGPON:
     import ctypes
     import ctypes.util
 
@@ -37,7 +38,7 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on the system.")
 
 
-_cublas = load_cublas() if not IS_ASCEND else None
+_cublas = load_cublas() if not (IS_ASCEND or IS_HYGPON) else None
 
 
 def _cublasGemmGroupedBatchedEx(
@@ -86,7 +87,7 @@ def _cublasGemmGroupedBatchedEx(
     )
 
 
-if not IS_ASCEND:
+if not (IS_ASCEND or IS_HYGPON):
     cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
 
 
@@ -267,6 +268,42 @@ def cublas_group_gemm_reference(group_A, group_B, group_C, offs_table, alpha, be
     return out
 
 
+def torch_group_gemm_reference(group_A, group_B, group_C, offs_table, alpha, beta):
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    ref = group_C.to(torch.float32).clone()
+    A32 = group_A.to(torch.float32)
+    B32 = group_B.to(torch.float32)
+    for m_g, n_g, k_g, start_M, start_K, start_C in offs_table:
+        res = torch.matmul(
+            A32[start_M : start_M + m_g, :k_g], B32[start_K : start_K + k_g, :n_g]
+        )
+        if beta == 0.0:
+            ref[start_C : start_C + m_g, :n_g] = alpha * res
+        else:
+            ref[start_C : start_C + m_g, :n_g] = (
+                alpha * res + beta * ref[start_C : start_C + m_g, :n_g]
+            )
+    torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+    return ref.to(group_A.dtype)
+
+
+def hygon_group_tf32gemm(group_A, group_B_T, group_C, offs_table, alpha, beta):
+    m_list = [entry[0] for entry in offs_table]
+    group_list = torch.tensor(m_list, dtype=torch.int32, device=group_A.device).cumsum(
+        0
+    )
+    return flag_blas.group_tf32gemm(
+        group_A,
+        group_B_T,
+        group_C,
+        group_list,
+        torch.empty_like(group_C),
+        alpha=alpha,
+        beta=beta,
+    )
+
+
 @pytest.mark.group_gemm
 @pytest.mark.parametrize("k,e,n", utils.GROUP_GEMM_SHAPES)
 def test_accuracy_group_gemm(k, e, n):
@@ -326,17 +363,24 @@ def test_accuracy_group_gemm(k, e, n):
                     alpha * res + beta * ref_C[start_C : start_C + m_g, :n_g]
                 )
         ref = ref_C.to(dtype)
+    elif IS_HYGPON:
+        ref = torch_group_gemm_reference(
+            group_A, group_B, group_C, offs_table, alpha, beta
+        )
     else:
         ref = cublas_group_gemm_reference(
             group_A, group_B, group_C, offs_table, alpha, beta
         )
 
     group_B_T = _build_transposed_group_b(group_B, offs_table)
-    out = flag_blas.group_tf32gemm(
-        *_build_triton_arrays(group_A, group_B_T, group_C, offs_table),
-        alpha=alpha,
-        beta=beta,
-    )
+    if IS_HYGPON:
+        out = hygon_group_tf32gemm(group_A, group_B_T, group_C, offs_table, alpha, beta)
+    else:
+        out = flag_blas.group_tf32gemm(
+            *_build_triton_arrays(group_A, group_B_T, group_C, offs_table),
+            alpha=alpha,
+            beta=beta,
+        )
 
     utils.blas_assert_close(out, ref, dtype, reduce_dim=k, atol=1e-3)
 
@@ -354,9 +398,12 @@ def test_group_gemm_alpha_zero():
     offs_table = _build_offs_table(k, e, n, m_list)
     B_T = _build_transposed_group_b(B, offs_table)
 
-    out = flag_blas.group_tf32gemm(
-        *_build_triton_arrays(A, B_T, C, offs_table), alpha=0.0, beta=2.0
-    )
+    if IS_HYGPON:
+        out = hygon_group_tf32gemm(A, B_T, C, offs_table, 0.0, 2.0)
+    else:
+        out = flag_blas.group_tf32gemm(
+            *_build_triton_arrays(A, B_T, C, offs_table), alpha=0.0, beta=2.0
+        )
 
     if TO_CPU:
         utils.blas_assert_close(
@@ -377,11 +424,17 @@ def test_group_gemm_beta_zero():
     m_list = [m] * e
     offs_table = _build_offs_table(k, e, n, m_list)
 
-    ref = cublas_group_gemm_reference(A, B, C_zeros, offs_table, 1.0, 0.0)
+    if IS_HYGPON:
+        ref = torch_group_gemm_reference(A, B, C_zeros, offs_table, 1.0, 0.0)
+    else:
+        ref = cublas_group_gemm_reference(A, B, C_zeros, offs_table, 1.0, 0.0)
     B_T = _build_transposed_group_b(B, offs_table)
-    out = flag_blas.group_tf32gemm(
-        *_build_triton_arrays(A, B_T, C_zeros, offs_table), alpha=1.0, beta=0.0
-    )
+    if IS_HYGPON:
+        out = hygon_group_tf32gemm(A, B_T, C_zeros, offs_table, 1.0, 0.0)
+    else:
+        out = flag_blas.group_tf32gemm(
+            *_build_triton_arrays(A, B_T, C_zeros, offs_table), alpha=1.0, beta=0.0
+        )
 
     if TO_CPU:
         utils.blas_assert_close(out, ref.to("cpu"), dtype, reduce_dim=k, atol=1e-3)
@@ -404,11 +457,17 @@ def test_group_gemm_alpha_beta(alpha, beta):
     m_list = [m] * e
     offs_table = _build_offs_table(k, e, n, m_list)
 
-    ref = cublas_group_gemm_reference(A, B, C, offs_table, alpha, beta)
+    if IS_HYGPON:
+        ref = torch_group_gemm_reference(A, B, C, offs_table, alpha, beta)
+    else:
+        ref = cublas_group_gemm_reference(A, B, C, offs_table, alpha, beta)
     B_T = _build_transposed_group_b(B, offs_table)
-    out = flag_blas.group_tf32gemm(
-        *_build_triton_arrays(A, B_T, C, offs_table), alpha=alpha, beta=beta
-    )
+    if IS_HYGPON:
+        out = hygon_group_tf32gemm(A, B_T, C, offs_table, alpha, beta)
+    else:
+        out = flag_blas.group_tf32gemm(
+            *_build_triton_arrays(A, B_T, C, offs_table), alpha=alpha, beta=beta
+        )
 
     if TO_CPU:
         utils.blas_assert_close(out, ref.to("cpu"), dtype, reduce_dim=k, atol=1e-3)
