@@ -100,15 +100,23 @@ def _lt_matrix_layout(type_code, rows, cols, ld):
 
 
 _musart_last_error_fn = None
+_musart_loaded = False
 
 
 def _clear_musa_sticky_error():
     """Consume the sticky error muBLAS leaves on the MUSA context."""
-    global _musart_last_error_fn
-    if _musart_last_error_fn is None:
-        _musart_last_error_fn = ctypes.cdll.LoadLibrary("libmusart.so.5")
-        _musart_last_error_fn.musaGetLastError.restype = ctypes.c_int
-    _musart_last_error_fn.musaGetLastError()
+    global _musart_last_error_fn, _musart_loaded
+    if not _musart_loaded:
+        # MUSA 5.x 提供 libmusart.so.5，4.3.x 提供 libmusart.so.4。
+        _musart_last_error_fn = _load_lib(
+            ("libmusart.so.5", "libmusart.so.4", "libmusart.so"),
+            os.path.join(os.environ.get("MUSA_HOME", "/usr/local/musa"), "lib"),
+        )
+        if _musart_last_error_fn is not None:
+            _musart_last_error_fn.musaGetLastError.restype = ctypes.c_int
+        _musart_loaded = True
+    if _musart_last_error_fn is not None:
+        _musart_last_error_fn.musaGetLastError()
 
 
 def _mublaslt_bfgemm_reference(

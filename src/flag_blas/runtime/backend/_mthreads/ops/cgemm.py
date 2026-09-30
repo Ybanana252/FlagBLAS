@@ -86,6 +86,26 @@ def _lib_dir():
     return os.path.join(os.environ.get("MUSA_HOME", "/usr/local/musa"), "lib")
 
 
+_MUSART_SONAMES = ("libmusart.so.5", "libmusart.so.4", "libmusart.so")
+
+
+def _load_musart():
+    """Load libmusart from the MUSA toolkit (soname differs by MUSA version)."""
+    for name in _MUSART_SONAMES:
+        path = os.path.join(_lib_dir(), name)
+        if os.path.exists(path):
+            try:
+                return ctypes.cdll.LoadLibrary(path)
+            except OSError:
+                continue
+    for name in _MUSART_SONAMES:
+        try:
+            return ctypes.cdll.LoadLibrary(name)
+        except OSError:
+            continue
+    return None
+
+
 def _ensure_mublas():
     """Load libmublas + libmusart once and configure the Cgemm binding."""
     if _mublas["cgemm"] is not None:
@@ -133,12 +153,11 @@ def _ensure_mublas():
     if create(ctypes.byref(handle)) != 0:
         return False
 
-    try:
-        musart = ctypes.cdll.LoadLibrary("libmusart.so.5")
+    musart = _load_musart()
+    clear = None
+    if musart is not None:
         clear = musart.musaGetLastError
         clear.restype = ctypes.c_int
-    except OSError:
-        clear = None
 
     _mublas.update(lib=lib, handle=handle.value, cgemm=cgemm, clear=clear)
     return True

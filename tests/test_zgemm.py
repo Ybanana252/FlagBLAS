@@ -210,6 +210,7 @@ def zgemm_reference(
 
 
 _musart_last_error_fn = None
+_musart_loaded = False
 
 
 def _clear_musa_sticky_error():
@@ -221,11 +222,18 @@ def _clear_musa_sticky_error():
     to the *next* torch_musa API call (e.g. a clone), which would otherwise
     fail spuriously. Reading musaGetLastError clears it.
     """
-    global _musart_last_error_fn
-    if _musart_last_error_fn is None:
-        _musart_last_error_fn = ctypes.cdll.LoadLibrary("libmusart.so.5")
-        _musart_last_error_fn.musaGetLastError.restype = ctypes.c_int
-    _musart_last_error_fn.musaGetLastError()
+    global _musart_last_error_fn, _musart_loaded
+    if not _musart_loaded:
+        # MUSA 5.x 提供 libmusart.so.5，4.3.x 提供 libmusart.so.4。
+        _musart_last_error_fn = _load_lib(
+            ("libmusart.so.5", "libmusart.so.4", "libmusart.so"),
+            os.path.join(os.environ.get("MUSA_HOME", "/usr/local/musa"), "lib"),
+        )
+        if _musart_last_error_fn is not None:
+            _musart_last_error_fn.musaGetLastError.restype = ctypes.c_int
+        _musart_loaded = True
+    if _musart_last_error_fn is not None:
+        _musart_last_error_fn.musaGetLastError()
 
 
 @pytest.mark.zgemm
