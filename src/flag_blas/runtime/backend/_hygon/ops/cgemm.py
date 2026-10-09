@@ -104,10 +104,20 @@ def _cgemm_kernel(
 
         a_mask = mask_m[:, None] & mask_k[None, :]
         b_mask = mask_k[:, None] & mask_n[None, :]
-        ar = tl.load(a_ptr + 2 * a_elem, mask=a_mask, other=0.0)
-        ai = tl.load(a_ptr + 2 * a_elem + 1, mask=a_mask, other=0.0)
-        br = tl.load(b_ptr + 2 * b_elem, mask=b_mask, other=0.0)
-        bi = tl.load(b_ptr + 2 * b_elem + 1, mask=b_mask, other=0.0)
+        # 打包成对 (re,im) 加载 (末维连续 2 x fp32 -> 8B 向量化), 再 split 成 re/im,
+        # 避免 stride-2 标量 gather。
+        a2 = tl.load(
+            a_ptr + (2 * a_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
+            mask=a_mask[:, :, None],
+            other=0.0,
+        )
+        ar, ai = tl.split(a2)
+        b2 = tl.load(
+            b_ptr + (2 * b_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
+            mask=b_mask[:, :, None],
+            other=0.0,
+        )
+        br, bi = tl.split(b2)
         # 共轭转置: 虚部取反
         if TRANS_A == 2:
             ai = -ai
@@ -132,13 +142,22 @@ def _cgemm_kernel(
     c_elem = offs_m[:, None] * ldc + offs_n[None, :]
     c_mask = mask_m[:, None] & mask_n[None, :]
     if not BETA_IS_ZERO:
-        cr = tl.load(c_ptr + 2 * c_elem, mask=c_mask, other=0.0)
-        ci = tl.load(c_ptr + 2 * c_elem + 1, mask=c_mask, other=0.0)
+        c2 = tl.load(
+            c_ptr + (2 * c_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
+            mask=c_mask[:, :, None],
+            other=0.0,
+        )
+        cr, ci = tl.split(c2)
         out_r += beta_r * cr - beta_i * ci
         out_i += beta_r * ci + beta_i * cr
 
-    tl.store(c_ptr + 2 * c_elem, out_r, mask=c_mask)
-    tl.store(c_ptr + 2 * c_elem + 1, out_i, mask=c_mask)
+    # 打包成对存储 (末维连续 2 x fp32 -> 8B 向量化)
+    out2 = tl.join(out_r, out_i)
+    tl.store(
+        c_ptr + (2 * c_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
+        out2,
+        mask=c_mask[:, :, None],
+    )
 
 
 @triton.jit
@@ -162,14 +181,22 @@ def _cgemm_trans_kernel(
     offs_c = pc * BC + tl.arange(0, BC)  # 0..Cc-1
     msk = (offs_r[:, None] < R) & (offs_c[None, :] < Cc)
     idx = offs_r[:, None] * sr + offs_c[None, :]
-    re = tl.load(src + 2 * idx, mask=msk, other=0.0)
-    im = tl.load(src + 2 * idx + 1, mask=msk, other=0.0)
+    v2 = tl.load(
+        src + (2 * idx)[:, :, None] + tl.arange(0, 2)[None, None, :],
+        mask=msk[:, :, None],
+        other=0.0,
+    )
+    re, im = tl.split(v2)
     if CONJ:
         im = -im
     didx = offs_c[:, None] * R + offs_r[None, :]
     dmsk = tl.trans(msk)
-    tl.store(dst + 2 * didx, tl.trans(re), mask=dmsk)
-    tl.store(dst + 2 * didx + 1, tl.trans(im), mask=dmsk)
+    o2 = tl.join(tl.trans(re), tl.trans(im))
+    tl.store(
+        dst + (2 * didx)[:, :, None] + tl.arange(0, 2)[None, None, :],
+        o2,
+        mask=dmsk[:, :, None],
+    )
 
 
 def _select_cgemm_config_hygon(m, n, k):
