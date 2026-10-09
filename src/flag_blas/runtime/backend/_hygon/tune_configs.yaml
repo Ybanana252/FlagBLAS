@@ -2303,3 +2303,14 @@ bfgemm_nt: *bfgemm_nn_hygon_configs
 # level3 内核 (仅 A tile 读法不同: transa=T 时 A 物理 (k,m)), 直接共享 bfgemm_nn 池;
 # libtuner 每 shape 从并集自选最优, 池扩大无回归风险 (只增选择)。
 bfgemm_tn: *bfgemm_nn_hygon_configs
+
+# hgemm_nn / hgemm_nt / hgemm_tn: Hygon gfx936 hgemm 专用池。
+# 此前 hygon 无 hgemm_* 段, 回落 NVIDIA 缺省池, TN/TT 变体绝对吞吐偏低
+# (hgemm 报告 2026-09-03: 8192^3 tn ~62 / tt ~76 TFLOPS, nn 105 / nt 154)。
+# hgemm 与 bfgemm 同为 2B dtype、共用同一套通用 level3 内核与 gfx936 资源约束
+# (smem/VGPR), 故初始池直接复用 bfgemm_*_hygon 池 (该池含 NVIDIA 原 9 config
+# 作为超集, libtuner 每 shape 自选最优, 相对缺省池无回退风险)。后续可在真机按
+# fp16 专项扫描增补/收敛。
+hgemm_nn: *bfgemm_nn_hygon_configs
+hgemm_nt: *bfgemm_nn_hygon_configs
+hgemm_tn: *bfgemm_nn_hygon_configs

@@ -7,6 +7,7 @@ from .hbmv import chbmv, zhbmv
 from .hemv import chemv, zhemv
 from .her import cher, zher
 from .her2 import cher2, zher2
+from .hgemm import hgemm
 from .hpmv import chpmv, zhpmv
 from .hpr import chpr, zhpr
 from .hpr2 import zhpr2
@@ -21,6 +22,7 @@ from .trmv import ctrmv, dtrmv, strmv, ztrmv
 __all__ = [
     "bfgemm",
     "dgemm",
+    "hgemm",
     "cgemv",
     "cgerc",
     "cgeru",
