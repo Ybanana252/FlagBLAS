@@ -1,4 +1,5 @@
 from .bfgemm import bfgemm
+from .cgemm import cgemm
 from .dgemm import dgemm
 from .gbmv import cgbmv, dgbmv, zgbmv
 from .gemv import cgemv, zgemv
@@ -21,6 +22,7 @@ from .trmv import ctrmv, dtrmv, strmv, ztrmv
 
 __all__ = [
     "bfgemm",
+    "cgemm",
     "dgemm",
     "hgemm",
     "cgemv",

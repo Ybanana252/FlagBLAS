@@ -45,6 +45,10 @@ if IS_HYGON:
     _HIPBLAS_LIBRARY = None
     _HIPBLAS_HANDLES = {}
 
+    class _HipComplex(ctypes.Structure):
+        # hipblasComplex (host scalar for hipblasCgemm's alpha/beta)
+        _fields_ = [("real", ctypes.c_float), ("imag", ctypes.c_float)]
+
     def _check_hipblas_status(status, operation):
         if status != 0:
             raise RuntimeError(f"{operation} failed with hipBLAS status {status}")
@@ -91,6 +95,11 @@ if IS_HYGON:
             # beta, C, ldc) signature as hipblasSgemm.
             library.hipblasHgemm.argtypes = library.hipblasSgemm.argtypes
             library.hipblasHgemm.restype = ctypes.c_int
+            # hipblasCgemm (complex64 in/out) shares the same (handle, transa,
+            # transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc) signature as
+            # hipblasSgemm; alpha/beta point to hipblasComplex host structs.
+            library.hipblasCgemm.argtypes = library.hipblasSgemm.argtypes
+            library.hipblasCgemm.restype = ctypes.c_int
             # hipblasGemmEx_v2: like cuBLAS gemmEx, alpha/beta are scalars in
             # the compute type and the A/B/C types are selected via hipDataType.
             library.hipblasGemmEx_v2.argtypes = [
@@ -960,6 +969,10 @@ class GemmBenchmark(Benchmark):
                 # hipblasDgemm reads alpha/beta as fp64 host scalars.
                 alpha_np = ctypes.c_double(float(self.alpha))
                 beta_np = ctypes.c_double(float(self.beta))
+            elif self.alpha_dtype == np.complex64:
+                # hipblasCgemm reads alpha/beta as hipblasComplex host structs.
+                alpha_np = _HipComplex(float(self.alpha.real), float(self.alpha.imag))
+                beta_np = _HipComplex(float(self.beta.real), float(self.beta.imag))
             else:
                 alpha_np = ctypes.c_float(float(self.alpha))
                 beta_np = ctypes.c_float(float(self.beta))
