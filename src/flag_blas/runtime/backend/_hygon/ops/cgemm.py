@@ -32,19 +32,11 @@ import triton
 import triton.language as tl
 
 from flag_blas.ops.level3.cgemm import (
-    CUBLAS_OP_C,
-    CUBLAS_OP_N,
     ScalarType,
     _complex_scalar_parts,
     _validate_cgemm_args,
 )
 from flag_blas.runtime import torch_device_fn
-
-# 转置复合拷贝 tile
-_TR_BR = 64
-_TR_BC = 64
-# 转置复合启用阈值: 2*m*n*k 下界 (小 shape 上拷贝开销占比过高, 不复合)。
-_TR_MIN_FLOPS = 4 << 24
 
 
 @triton.jit
@@ -160,90 +152,18 @@ def _cgemm_kernel(
     )
 
 
-@triton.jit
-def _cgemm_trans_kernel(
-    src,
-    dst,
-    R,
-    Cc,
-    sr,
-    CONJ: tl.constexpr,
-    BR: tl.constexpr,
-    BC: tl.constexpr,
-):
-    # src: 物理 (R, Cc) 复数行主序 (行 stride=sr), 实虚交错 [re,im]
-    # dst: (Cc, R) 复数行主序, 行 stride=R; dst = trans(src) (CONJ 时虚部取反)
-    pid = tl.program_id(0)
-    ngc = tl.cdiv(Cc, BC)
-    pr = pid // ngc
-    pc = pid % ngc
-    offs_r = pr * BR + tl.arange(0, BR)  # 0..R-1
-    offs_c = pc * BC + tl.arange(0, BC)  # 0..Cc-1
-    msk = (offs_r[:, None] < R) & (offs_c[None, :] < Cc)
-    idx = offs_r[:, None] * sr + offs_c[None, :]
-    v2 = tl.load(
-        src + (2 * idx)[:, :, None] + tl.arange(0, 2)[None, None, :],
-        mask=msk[:, :, None],
-        other=0.0,
-    )
-    re, im = tl.split(v2)
-    if CONJ:
-        im = -im
-    didx = offs_c[:, None] * R + offs_r[None, :]
-    dmsk = tl.trans(msk)
-    o2 = tl.join(tl.trans(re), tl.trans(im))
-    tl.store(
-        dst + (2 * didx)[:, :, None] + tl.arange(0, 2)[None, None, :],
-        o2,
-        mask=dmsk[:, :, None],
-    )
-
-
 def _select_cgemm_config_hygon(m, n, k):
-    # hygon gfx936 分档 (复数内核有 2 个 fp32 累加器 + 4 个操作数 tile, 寄存器压力
-    # 约实数 gemm 的 2x, 故 BK/tile 取小)。为保守起点, 与通用表同族, 待实测收敛。
+    # hygon gfx936 分档 (按 shape x 变体实测标定)。复数内核有 2 个 fp32 累加器 +
+    # 4 个操作数 tile, 故 BLOCK_K 取 16/32; tile 随规模放大, 大 shape 用 GROUP_M=4
+    # 提升 L2 复用。
     max_dim = max(m, n, k)
-    if max_dim <= 32:
-        return 16, 16, 16, 4, 1
     if max_dim <= 128:
         return 16, 16, 32, 4, 1
-    if max_dim <= 512:
+    if max_dim <= 256:
         return 32, 32, 32, 4, 1
-    if max_dim <= 1024:
-        return 32, 64, 32, 4, 4
-    return 32, 64, 32, 8, 4
-
-
-def _use_trans_composite(m, n, k, transa, transb):
-    # 仅在含转置且输出规模足够大 (2*m*n*k >= _TR_MIN_FLOPS) 时物化连续操作数,
-    # 小 shape 上拷贝开销占比过高, 直接走 kernel 内转置。
-    if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
-        return False
-    return 2.0 * m * n * k >= _TR_MIN_FLOPS and min(m, n) >= 64
-
-
-def _materialize_transpose(x_real, rows_phys, cols_phys, ld, conj, device):
-    # x_real: 物理 (rows_phys, cols_phys) 复数的 f32 交错视图
-    # 返回 (cols_phys, rows_phys) 复数的连续 (行主序) 张量, 即 trans(x) (conj 时共轭)
-    out_complex = torch.empty(
-        (cols_phys, rows_phys), dtype=torch.complex64, device=device
-    )
-    out_real = torch.view_as_real(out_complex).reshape(-1)
-    grid = (
-        triton.cdiv(rows_phys, _TR_BR) * triton.cdiv(cols_phys, _TR_BC),
-    )
-    _cgemm_trans_kernel[grid](
-        x_real,
-        out_real,
-        rows_phys,
-        cols_phys,
-        ld,
-        CONJ=conj,
-        BR=_TR_BR,
-        BC=_TR_BC,
-        num_warps=8,
-    )
-    return out_complex
+    if max_dim <= 512:
+        return 64, 64, 16, 8, 1
+    return 128, 64, 16, 8, 4
 
 
 def cgemm(
@@ -283,26 +203,7 @@ def cgemm(
     B_real = torch.view_as_real(B).reshape(-1)
     C_real = torch.view_as_real(C).reshape(-1)
 
-    eff_trans_a, eff_lda = transa, lda
-    eff_trans_b, eff_ldb = transb, ldb
-
     with torch_device_fn.device(A.device):
-        if _use_trans_composite(m, n, k, transa, transb):
-            # A 物理 (k,m) -> op(A) 连续 (m,k); 共轭转置时虚部取反
-            if transa != CUBLAS_OP_N:
-                op_a = _materialize_transpose(
-                    A_real, k, m, lda, transa == CUBLAS_OP_C, A.device
-                )
-                A_real = torch.view_as_real(op_a).reshape(-1)
-                eff_trans_a, eff_lda = CUBLAS_OP_N, k
-            # B 物理 (n,k) -> op(B) 连续 (k,n)
-            if transb != CUBLAS_OP_N:
-                op_b = _materialize_transpose(
-                    B_real, n, k, ldb, transb == CUBLAS_OP_C, B.device
-                )
-                B_real = torch.view_as_real(op_b).reshape(-1)
-                eff_trans_b, eff_ldb = CUBLAS_OP_N, n
-
         _cgemm_kernel[grid](
             A_real,
             B_real,
@@ -314,11 +215,11 @@ def cgemm(
             m,
             n,
             k,
-            eff_lda,
-            eff_ldb,
+            lda,
+            ldb,
             ldc,
-            eff_trans_a,
-            eff_trans_b,
+            transa,
+            transb,
             beta_is_zero,
             alpha_is_one,
             BLOCK_M=block_m,
