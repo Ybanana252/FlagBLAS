@@ -19,12 +19,14 @@ from .symv import csymv, zsymv
 from .syr import csyr, dsyr, ssyr, zsyr
 from .syr2 import dsyr2, ssyr2
 from .trmv import ctrmv, dtrmv, strmv, ztrmv
+from .zgemm import zgemm
 
 __all__ = [
     "bfgemm",
     "cgemm",
     "dgemm",
     "hgemm",
+    "zgemm",
     "cgemv",
     "cgerc",
     "cgeru",

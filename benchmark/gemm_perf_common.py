@@ -49,6 +49,10 @@ if IS_HYGON:
         # hipblasComplex (host scalar for hipblasCgemm's alpha/beta)
         _fields_ = [("real", ctypes.c_float), ("imag", ctypes.c_float)]
 
+    class _HipDoubleComplex(ctypes.Structure):
+        # hipblasDoubleComplex (host scalar for hipblasZgemm's alpha/beta)
+        _fields_ = [("real", ctypes.c_double), ("imag", ctypes.c_double)]
+
     def _check_hipblas_status(status, operation):
         if status != 0:
             raise RuntimeError(f"{operation} failed with hipBLAS status {status}")
@@ -100,6 +104,10 @@ if IS_HYGON:
             # hipblasSgemm; alpha/beta point to hipblasComplex host structs.
             library.hipblasCgemm.argtypes = library.hipblasSgemm.argtypes
             library.hipblasCgemm.restype = ctypes.c_int
+            # hipblasZgemm (complex128 in/out) shares the same signature; alpha/
+            # beta point to hipblasDoubleComplex host structs.
+            library.hipblasZgemm.argtypes = library.hipblasSgemm.argtypes
+            library.hipblasZgemm.restype = ctypes.c_int
             # hipblasGemmEx_v2: like cuBLAS gemmEx, alpha/beta are scalars in
             # the compute type and the A/B/C types are selected via hipDataType.
             library.hipblasGemmEx_v2.argtypes = [
@@ -973,6 +981,15 @@ class GemmBenchmark(Benchmark):
                 # hipblasCgemm reads alpha/beta as hipblasComplex host structs.
                 alpha_np = _HipComplex(float(self.alpha.real), float(self.alpha.imag))
                 beta_np = _HipComplex(float(self.beta.real), float(self.beta.imag))
+            elif self.alpha_dtype == np.complex128:
+                # hipblasZgemm reads alpha/beta as hipblasDoubleComplex host
+                # structs.
+                alpha_np = _HipDoubleComplex(
+                    float(self.alpha.real), float(self.alpha.imag)
+                )
+                beta_np = _HipDoubleComplex(
+                    float(self.beta.real), float(self.beta.imag)
+                )
             else:
                 alpha_np = ctypes.c_float(float(self.alpha))
                 beta_np = ctypes.c_float(float(self.beta))

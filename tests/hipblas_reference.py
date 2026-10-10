@@ -66,7 +66,12 @@ def _configure_library(library):
         ctypes.c_void_p,  # C
         ctypes.c_int,  # ldc
     ]
-    for symbol in ("hipblasSgemm", "hipblasDgemm", "hipblasCgemm"):
+    for symbol in (
+        "hipblasSgemm",
+        "hipblasDgemm",
+        "hipblasCgemm",
+        "hipblasZgemm",
+    ):
         func = getattr(library, symbol)
         func.argtypes = _gemm_argtypes
         func.restype = ctypes.c_int
@@ -225,5 +230,52 @@ def hipblas_cgemm(
             ldc,
         ),
         "hipblasCgemm",
+    )
+    return C
+
+
+def hipblas_zgemm(
+    handle,
+    transa,
+    transb,
+    m,
+    n,
+    k,
+    alpha,
+    A,
+    lda,
+    B,
+    ldb,
+    beta,
+    C,
+    ldc,
+):
+    """complex128 GEMM reference via hipBLAS (pointer mode: host scalars).
+
+    ``alpha``/``beta`` are Python complex numbers, packed into the
+    ``hipblasDoubleComplex`` host struct. ``transa``/``transb`` are
+    cuBLAS-style enums (0/1/2); the mapping to the hipBLAS op enum happens here.
+    """
+    library = get_hipblas_library()
+    alpha_c = HipDoubleComplex(float(alpha.real), float(alpha.imag))
+    beta_c = HipDoubleComplex(float(beta.real), float(beta.imag))
+    check_hipblas_status(
+        library.hipblasZgemm(
+            handle,
+            to_hipblas_op(transa),
+            to_hipblas_op(transb),
+            m,
+            n,
+            k,
+            ctypes.byref(alpha_c),
+            ctypes.c_void_p(A.data_ptr()),
+            lda,
+            ctypes.c_void_p(B.data_ptr()),
+            ldb,
+            ctypes.byref(beta_c),
+            ctypes.c_void_p(C.data_ptr()),
+            ldc,
+        ),
+        "hipblasZgemm",
     )
     return C
