@@ -1012,10 +1012,14 @@ def mthreads_gems_group_gemm_wrapper(
     schedule_block_m,
     **kwargs,
 ):
-    if K >= 64 and (N % 256 == 0 or N in (192, 384)) and 16 <= group_size <= 128:
+    if (
+        K >= 64
+        and (N % 256 == 0 or N in (192, 384))
+        and (16 <= group_size <= 128 or (group_size == 512 and K > 64 and N % 256 == 0))
+    ):
         block_k = 32
         if N == 192:
-            pipeline_stages = 6
+            pipeline_stages = 5
             grouped_bfgemm_tle_ws_n192_kernel[(schedule_blocks,)](
                 M,
                 K,
@@ -1048,6 +1052,7 @@ def mthreads_gems_group_gemm_wrapper(
                 c_row_ends,
                 c_row_starts,
                 schedule_blocks,
+                EVICT_C=1 if group_size >= 256 and K > 512 else 0,
             )
     elif group_size <= 17:
         tiles_per_expert = triton.cdiv(M, group_size * 256)
@@ -1243,7 +1248,11 @@ class MThreadsGroupGemmBenchmark(GroupGemmBenchmark):
                 BLOCK_K=64,
                 num_warps=8,
             )
-            if k >= 64 and (n % 256 == 0 or n in (192, 384)) and 16 <= e <= 128:
+            if (
+                k >= 64
+                and (n % 256 == 0 or n in (192, 384))
+                and (16 <= e <= 128 or (e == 512 and k > 64 and n % 256 == 0))
+            ):
                 packed_a_desc.block_shape = [block_m, 32]
                 if n == 192:
                     b_desc.block_shape = [32, 128]
