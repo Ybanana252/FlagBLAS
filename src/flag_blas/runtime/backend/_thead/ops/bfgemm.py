@@ -3715,6 +3715,4 @@ def bfgemm(
                 )
 
 
-bgemm = bfgemm
-
-__all__ = ["bfgemm", "bgemm"]
+__all__ = ["bfgemm"]

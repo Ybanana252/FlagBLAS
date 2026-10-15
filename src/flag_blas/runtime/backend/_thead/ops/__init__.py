@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .bfgemm import bfgemm, bgemm
+from .bfgemm import bfgemm
 from .cgemm import cgemm
 from .dgemm import dgemm
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
@@ -37,7 +37,6 @@ __all__ = [
     "dgemm",
     "hgemm",
     "bfgemm",
-    "bgemm",
     "cgemm",
     "zgemm",
     "sgemv",
