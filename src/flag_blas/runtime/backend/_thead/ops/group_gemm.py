@@ -381,14 +381,6 @@ def grouped_tf32gemm_tn_kernel(
     BLOCK_K: tl.constexpr,
     EXPERTS_PER_CTA: tl.constexpr,
 ):
-    # Block-pointer addressing: raw int64 pointer tiles push the register
-    # allocator to its 256-thread limit on wide-BLOCK_N tiles (measured
-    # spills), while block pointers defer address arithmetic to the load
-    # and keep the wide tiles viable.
-    # EXPERTS_PER_CTA > 1 makes a CTA walk several experts' M-tiles, so the
-    # per-tile CTA prologue amortizes across tiles (few-expert shapes have
-    # ~1 tile per window otherwise); EXPERTS_PER_CTA = 1 keeps one CTA per
-    # expert (grid z axis = group_size).
     tile_n = tl.program_id(0)
     window = tl.program_id(1)
     e_lo = tl.program_id(2) * EXPERTS_PER_CTA
@@ -452,18 +444,8 @@ def group_tf32gemm(group_A, group_B, group_list, group_out):
     assert group_out.shape == (M, N)
     if group_size == 0 or M == 0 or N == 0:
         return group_out
-    # The n-major B layout feeds the tf32 MMA noticeably better than the
-    # k-major direct path on wide-N shapes; transposing B first is a net
-    # win there (measured on core shapes), so keep the direct path for
-    # narrow-N and tiny-K shapes. (A side-stream strip-pipelined transpose
-    # was measured slower on PPU: the DRAM contention costs more than the
-    # overlap saves.) A B tensor whose K axis is already contiguous is
-    # n-major storage already and is consumed directly, skipping the
-    # transpose entirely.
     if (2048 <= K <= 4096 and N >= 1024) or (K >= 512 and N >= 2048):
         if group_B.stride(1) == 1:
-            # n-major storage viewed as [E, K, N]: the kernel's [E, N, K]
-            # strides need the K/N axes swapped.
             group_B_t = group_B
             b_strides = (group_B.stride(0), group_B.stride(2), group_B.stride(1))
         else:

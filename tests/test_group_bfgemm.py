@@ -47,7 +47,11 @@ def load_cublas():
 
 _cublas = (
     load_cublas()
-if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS and not IS_PPU and not IS_HYGPON
+    if not IS_ASCEND
+    and not IS_ILUVATAR
+    and not IS_MTHREADS
+    and not IS_PPU
+    and not IS_HYGPON
     else None
 )
 
@@ -98,7 +102,13 @@ def _cublasGemmGroupedBatchedEx(
     )
 
 
-if not IS_ASCEND and not IS_ILUVATAR and not IS_MTHREADS and not IS_PPU and not IS_HYGPON:
+if (
+    not IS_ASCEND
+    and not IS_ILUVATAR
+    and not IS_MTHREADS
+    and not IS_PPU
+    and not IS_HYGPON
+):
     cublas.cublasGemmGroupedBatchedEx = _cublasGemmGroupedBatchedEx
 
 
@@ -474,7 +484,7 @@ def test_accuracy_group_gemm(k, e, n):
 
 @pytest.mark.group_gemm
 @pytest.mark.skipif(
-IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
     reason="Hopper-only alpha/beta interface",
 )
 def test_group_gemm_alpha_zero():
@@ -499,7 +509,7 @@ def test_group_gemm_alpha_zero():
 
 @pytest.mark.group_gemm
 @pytest.mark.skipif(
-IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
     reason="Hopper-only alpha/beta interface",
 )
 def test_group_gemm_beta_zero():
@@ -527,7 +537,7 @@ def test_group_gemm_beta_zero():
     "alpha,beta", [(1.0, 0.0), (2.0, 0.0), (2.0, 0.5), (0.0, 1.0), (0.5, 1.5)]
 )
 @pytest.mark.skipif(
-IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
+    IS_ASCEND or IS_ILUVATAR or IS_MTHREADS or IS_PPU or IS_HYGPON,
     reason="Hopper-only alpha/beta interface",
 )
 def test_group_gemm_alpha_beta(alpha, beta):

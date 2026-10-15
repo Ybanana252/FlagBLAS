@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from .bfgemm import bfgemm
 from .cgemm import cgemm
 from .gemv import bfgemv, fp8_gemv, hgemv, sgemv
@@ -36,6 +37,8 @@ __all__ = [
     "sger",
     "cgeru",
     "cgerc",
+    "cher",
+    "csyr",
     "group_bfgemm",
     "group_hgemm",
     "group_tf32gemm",
@@ -58,6 +61,4 @@ __all__ = [
     "hgemm",
     "bfgemm",
     "cgemm",
-    "cher",
-    "csyr",
 ]

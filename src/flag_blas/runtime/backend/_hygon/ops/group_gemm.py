@@ -63,9 +63,7 @@ def grouped_bfgemm_kernel(
     expert = tl.program_id(2)
     if USE_BP:
         end = tl.load(group_list + expert).to(tl.int32)
-        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(
-            tl.int32
-        )
+        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(tl.int32)
         num_full = (end - start) // BLOCK_M
         offs_bn = tile_n * BLOCK_N
         b_base = group_B + expert.to(tl.int64) * stride_be
@@ -98,9 +96,7 @@ def grouped_bfgemm_kernel(
                 ):
                     b = tl.trans(tl.load(b_ptrs, eviction_policy="evict_last"))
                     a = tl.load(a_ptrs)
-                    accumulator = tl.dot(
-                        a, b, acc=accumulator, out_dtype=tl.float32
-                    )
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32)
                     a_ptrs = tl.advance(a_ptrs, (0, BLOCK_K))
                     b_ptrs = tl.advance(b_ptrs, (0, BLOCK_K))
             else:
@@ -118,9 +114,7 @@ def grouped_bfgemm_kernel(
                         )
                     )
                     a = tl.load(a_ptrs, boundary_check=(0, 1))
-                    accumulator = tl.dot(
-                        a, b, acc=accumulator, out_dtype=tl.float32
-                    )
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32)
                     a_ptrs = tl.advance(a_ptrs, (0, BLOCK_K))
                     b_ptrs = tl.advance(b_ptrs, (0, BLOCK_K))
             out_ptrs = tl.make_block_ptr(
@@ -361,9 +355,7 @@ def grouped_hgemm_kernel(
     expert = tl.program_id(2)
     if USE_BP:
         end = tl.load(group_list + expert).to(tl.int32)
-        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(
-            tl.int32
-        )
+        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(tl.int32)
         num_full = (end - start) // BLOCK_M
         offs_bn = tile_n * BLOCK_N
         b_base = group_B + expert.to(tl.int64) * (K * stride_bk)
@@ -396,9 +388,7 @@ def grouped_hgemm_kernel(
                 ):
                     b = tl.trans(tl.load(b_ptrs, eviction_policy="evict_last"))
                     a = tl.load(a_ptrs)
-                    accumulator = tl.dot(
-                        a, b, acc=accumulator, out_dtype=tl.float32
-                    )
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32)
                     a_ptrs = tl.advance(a_ptrs, (0, BLOCK_K))
                     b_ptrs = tl.advance(b_ptrs, (0, BLOCK_K))
             else:
@@ -416,9 +406,7 @@ def grouped_hgemm_kernel(
                         )
                     )
                     a = tl.load(a_ptrs, boundary_check=(0, 1))
-                    accumulator = tl.dot(
-                        a, b, acc=accumulator, out_dtype=tl.float32
-                    )
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32)
                     a_ptrs = tl.advance(a_ptrs, (0, BLOCK_K))
                     b_ptrs = tl.advance(b_ptrs, (0, BLOCK_K))
             result = accumulator * alpha
@@ -686,9 +674,7 @@ def grouped_tf32gemm_kernel(
     expert = tl.program_id(2)
     if USE_BP:
         end = tl.load(group_list + expert).to(tl.int32)
-        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(
-            tl.int32
-        )
+        start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(tl.int32)
         num_tiles = tl.cdiv(end - start, BLOCK_M)
         offs_bn = tile_n * BLOCK_N
         b_base = group_B + expert.to(tl.int64) * (N * stride_bn)
@@ -717,9 +703,7 @@ def grouped_tf32gemm_kernel(
                 num_stages=PIPE_STAGES,
                 loop_unroll_factor=UNROLL,
             ):
-                b = tl.load(
-                    b_ptrs, boundary_check=(0, 1), eviction_policy="evict_last"
-                )
+                b = tl.load(b_ptrs, boundary_check=(0, 1), eviction_policy="evict_last")
                 a = tl.load(a_ptrs, boundary_check=(0, 1))
                 accumulator = tl.dot(a, b, acc=accumulator)
                 a_ptrs = tl.advance(a_ptrs, (0, BLOCK_K))
