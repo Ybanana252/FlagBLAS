@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .bfgemm import bfgemm, bgemm
+from .dgemm import dgemm
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import dger, sger, zgerc, zgeru
 from .group_gemm import group_bfgemm, group_hgemm, group_tf32gemm
+from .hgemm import hgemm
 from .hemv import chemv, zhemv
+from .sgemm import sgemm
 from .spmv import dspmv, sspmv
 from .spr import dspr, sspr
 from .spr2 import dspr2, sspr2
@@ -27,6 +31,11 @@ from .tpsv import ctpsv, dtpsv, stpsv, ztpsv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
 __all__ = [
+    "sgemm",
+    "dgemm",
+    "hgemm",
+    "bfgemm",
+    "bgemm",
     "sgemv",
     "dgemv",
     "hgemv",
