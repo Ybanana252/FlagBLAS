@@ -11,6 +11,9 @@ from benchmark.performance_utils import Benchmark
 from flag_blas.utils import shape_utils
 
 IS_ASCEND = flag_blas.device == "npu"
+IS_ILUVATAR = flag_blas.vendor_name == "iluvatar"
+IS_PPU = flag_blas.vendor_name == "thead"
+IS_HYGPON = flag_blas.vendor_name == "hygon"
 
 if IS_ASCEND:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -19,6 +22,25 @@ if IS_ASCEND:
             allow_module_level=True,
         )
     from flag_blas.runtime.backend._ascend.ops.group_gemm import grouped_hgemm_kernel
+elif IS_ILUVATAR:
+    if flag_blas.device != "cuda" or not torch.cuda.is_available():
+        pytest.skip(
+            "requires FlagBLAS with an available Iluvatar backend",
+            allow_module_level=True,
+        )
+    from ixformer import moe_w16a16_group_gemm
+elif IS_PPU:
+    if flag_blas.device != "cuda" or not torch.cuda.is_available():
+        pytest.skip(
+            "requires FlagBLAS with an available PPU (T-Head) backend",
+            allow_module_level=True,
+        )
+elif IS_HYGPON:
+    if flag_blas.device != "cuda":
+        pytest.skip(
+            "requires FlagBLAS with an available CUDA backend",
+            allow_module_level=True,
+        )
 else:
     if flag_blas.device != "cuda":
         pytest.skip(
@@ -37,7 +59,7 @@ else:
     )
 
 
-if not IS_ASCEND:
+if not IS_ASCEND and not IS_ILUVATAR and not IS_PPU and not IS_HYGPON:
 
     def load_cublas():
         lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
@@ -528,6 +550,73 @@ class GroupGemmBenchmark(Benchmark):
             )
 
 
+class HygonGroupGemmBenchmark(GroupGemmBenchmark):
+    def get_input_iter(self, cur_dtype) -> Generator:
+        scale = 1.0
+        random.seed(SEED)
+        for k, e, n in self.shapes:
+            m_list = [random.randint(1, 4096) for _ in range(e)]
+            total_M = sum(m_list)
+            total_K = e * k
+
+            group_A = (
+                torch.randn(total_M, k, dtype=cur_dtype, device=self.device) * scale
+            )
+            group_B = (
+                torch.randn(total_K, n, dtype=cur_dtype, device=self.device) * scale
+            )
+            group_C = (
+                torch.randn(total_M, n, dtype=cur_dtype, device=self.device) * scale
+            )
+
+            offs = []
+            start_M = 0
+            start_K = 0
+            for g in range(e):
+                mg = m_list[g]
+                offs.append([mg, n, k, start_M, start_K, start_M])
+                start_M += mg
+                start_K += k
+
+            out_torch = torch.empty_like(group_C)
+            out_flag = torch.empty_like(group_C)
+            group_list = torch.tensor(
+                m_list, dtype=torch.int32, device=self.device
+            ).cumsum(0)
+
+            yield group_A, group_B, group_C, offs, {
+                "out_torch": out_torch,
+                "group_list": group_list,
+                "out_flag": out_flag,
+                "alpha": self.alpha,
+                "beta": self.beta,
+            }
+
+
+def hygon_group_gemm(group_A, group_B, group_C, offs, out_torch, alpha, beta, **kwargs):
+    for mg, ng, kg, start_M, start_K, start_C in offs:
+        res = torch.matmul(
+            group_A[start_M : start_M + mg, :kg], group_B[start_K : start_K + kg, :ng]
+        )
+        if beta != 0.0:
+            out_torch[start_C : start_C + mg, :ng] = (
+                alpha * res + beta * group_C[start_C : start_C + mg, :ng]
+            )
+        elif alpha != 1.0:
+            out_torch[start_C : start_C + mg, :ng] = alpha * res
+        else:
+            out_torch[start_C : start_C + mg, :ng] = res
+    return out_torch
+
+
+def hygon_gems_group_gemm_wrapper(
+    group_A, group_B, group_C, offs, group_list, out_flag, alpha, beta, **kwargs
+):
+    return flag_blas.group_hgemm(
+        group_A, group_B, group_C, group_list, out_flag, alpha, beta
+    )
+
+
 class AscendGroupGemmBenchmark(GroupGemmBenchmark):
     def set_more_metrics(self):
         return ["tflops", "gbps"]
@@ -736,9 +825,168 @@ def ascend_gems_group_gemm_wrapper(
     return group_out
 
 
+def iluvatar_group_gemm(
+    group_A,
+    group_B,
+    group_list,
+    group_out,
+    flag_out,
+    group_size,
+    M,
+    N,
+    K,
+    group_B_ixformer,
+    tokens_per_experts,
+    **kwargs,
+):
+    return moe_w16a16_group_gemm(
+        group_A,
+        group_B_ixformer,
+        torch.float16,
+        tokens_per_experts,
+        format="TN",
+        output=group_out,
+    )
+
+
+def iluvatar_gems_group_gemm_wrapper(
+    group_A, group_B, group_list, group_out, flag_out, group_size, M, N, K, **kwargs
+):
+    return flag_blas.group_hgemm(group_A, group_B, group_list, flag_out)
+
+
+def ppu_group_gemm(
+    group_A,
+    group_B,
+    group_list,
+    group_out,
+    **kwargs,
+):
+    return torch._grouped_mm(group_A, group_B, offs=group_list)
+
+
+def ppu_gems_group_gemm_wrapper(
+    group_A, group_B, group_list, group_out, flag_out, **kwargs
+):
+    return flag_blas.group_hgemm(group_A, group_B, group_list, flag_out)
+
+
+class IluvatarGroupGemmBenchmark(GroupGemmBenchmark):
+    correctness_reference = "CoreX ixformer moe_w16a16_group_gemm (FP16)"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        random.seed(SEED)
+        for k, e, n in self.shapes:
+            m_list = [random.randint(1, 4096) for _ in range(e)]
+            total_M = sum(m_list)
+            group_A = torch.randn(total_M, k, dtype=cur_dtype, device=self.device)
+            group_B = torch.randn(e, k, n, dtype=cur_dtype, device=self.device)
+            group_B_ixformer = group_B.transpose(1, 2).contiguous()
+            tokens_per_experts = torch.tensor(m_list, dtype=torch.int32)
+            group_list = tokens_per_experts.to(self.device).cumsum(0)
+            group_out = torch.empty(total_M, n, dtype=cur_dtype, device=self.device)
+            flag_out = torch.empty_like(group_out)
+
+            yield group_A, group_B, group_list, group_out, {
+                "flag_out": flag_out,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
+                "group_B_ixformer": group_B_ixformer,
+                "tokens_per_experts": tokens_per_experts,
+            }
+
+    def get_tflops(self, op, *args, **kwargs):
+        group_A, group_B = args[0], args[1]
+        return 2 * group_A.shape[0] * group_B.shape[1] * group_B.shape[2]
+
+    def get_gbps(self, args, latency):
+        group_A, group_B, _, group_out = args[:4]
+        io_amount = (
+            shape_utils.size_in_bytes(group_A)
+            + shape_utils.size_in_bytes(group_B)
+            + shape_utils.size_in_bytes(group_out)
+        )
+        return io_amount * 1e-9 / (latency * 1e-3)
+
+
+class PpuGroupGemmBenchmark(GroupGemmBenchmark):
+    correctness_reference = "torch._grouped_mm (PPU native grouped GEMM)"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        random.seed(SEED)
+        for k, e, n in self.shapes:
+            m_list = [random.randint(1, 4096) for _ in range(e)]
+            total_M = sum(m_list)
+            group_A = torch.randn(total_M, k, dtype=cur_dtype, device=self.device)
+            group_B = torch.randn(e, k, n, dtype=cur_dtype, device=self.device)
+            group_list = torch.tensor(
+                m_list, dtype=torch.int32, device=self.device
+            ).cumsum(0, dtype=torch.int32)
+            group_out = torch.empty(total_M, n, dtype=cur_dtype, device=self.device)
+            flag_out = torch.empty_like(group_out)
+
+            yield group_A, group_B, group_list, group_out, {
+                "flag_out": flag_out,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
+            }
+
+    def get_tflops(self, op, *args, **kwargs):
+        group_A, group_B = args[0], args[1]
+        return 2 * group_A.shape[0] * group_B.shape[1] * group_B.shape[2]
+
+    def get_gbps(self, args, latency):
+        group_A, group_B, group_list, group_out = args[:4]
+        io_amount = (
+            shape_utils.size_in_bytes(group_A)
+            + shape_utils.size_in_bytes(group_B)
+            + shape_utils.size_in_bytes(group_list)
+            + shape_utils.size_in_bytes(group_out)
+        )
+        return io_amount * 1e-9 / (latency * 1e-3)
+
+
 @pytest.mark.group_gemm
 def test_perf_group_gemm_fp16():
-    if IS_ASCEND:
+    if IS_ILUVATAR:
+        bench = IluvatarGroupGemmBenchmark(
+            op_name="group_gemm",
+            torch_op=iluvatar_group_gemm,
+            gems_op=iluvatar_gems_group_gemm_wrapper,
+            dtypes=[torch.float16],
+        )
+        bench.init_user_config()
+        for cur_dtype in bench.to_bench_dtypes:
+            for A, B, group_list, group_out, kwargs in bench.get_input_iter(cur_dtype):
+                torch_result = iluvatar_group_gemm(
+                    A, B, group_list, group_out, **kwargs
+                )
+                gems_result = iluvatar_gems_group_gemm_wrapper(
+                    A, B, group_list, group_out, **kwargs
+                )
+                bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
+        bench.run()
+    elif IS_PPU:
+        bench = PpuGroupGemmBenchmark(
+            op_name="group_gemm",
+            torch_op=ppu_group_gemm,
+            gems_op=ppu_gems_group_gemm_wrapper,
+            dtypes=[torch.float16],
+        )
+        bench.init_user_config()
+        for cur_dtype in bench.to_bench_dtypes:
+            for A, B, group_list, group_out, kwargs in bench.get_input_iter(cur_dtype):
+                torch_result = ppu_group_gemm(A, B, group_list, group_out, **kwargs)
+                gems_result = ppu_gems_group_gemm_wrapper(
+                    A, B, group_list, group_out, **kwargs
+                )
+                bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
+        bench.run()
+    elif IS_ASCEND:
         bench = AscendGroupGemmBenchmark(
             op_name="group_gemm",
             torch_op=aclnn_group_gemm,
@@ -750,6 +998,22 @@ def test_perf_group_gemm_fp16():
             for A, B, group_list, kwargs in bench.get_input_iter(cur_dtype):
                 torch_result = aclnn_group_gemm(A, B, group_list, **kwargs)
                 gems_result = ascend_gems_group_gemm_wrapper(A, B, group_list, **kwargs)
+                bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
+        bench.run()
+    elif IS_HYGPON:
+        bench = HygonGroupGemmBenchmark(
+            op_name="group_gemm",
+            torch_op=hygon_group_gemm,
+            gems_op=hygon_gems_group_gemm_wrapper,
+            dtypes=[torch.float16],
+        )
+        bench.init_user_config()
+        for cur_dtype in bench.to_bench_dtypes:
+            for A, B, C, offs, kwargs in bench.get_input_iter(cur_dtype):
+                torch_result = hygon_group_gemm(A, B, C.clone(), offs, **kwargs)
+                gems_result = hygon_gems_group_gemm_wrapper(
+                    A, B, C.clone(), offs, **kwargs
+                )
                 bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
         bench.run()
     else:
