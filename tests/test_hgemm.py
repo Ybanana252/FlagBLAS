@@ -29,6 +29,17 @@ CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUDA_R_16BF = 14
 
+# T-Head (Zhenwu) cuBLAS rejects a legacy cudaDataType passed where
+# cublasGemmEx expects a cublasComputeType_t (CUBLAS_STATUS_NOT_SUPPORTED).
+# Use the proper cublasComputeType_t / cublasGemmAlgo_t enums there; other
+# vendors keep the original arguments.
+if flag_blas.vendor_name == "thead":
+    GEMM_COMPUTE_TYPE = cublas.CUBLAS_COMPUTE_32F
+    GEMM_ALGO = cublas.CUBLAS_GEMM_DEFAULT
+else:
+    GEMM_COMPUTE_TYPE = CUDA_R_32F
+    GEMM_ALGO = 0
+
 
 def cublas_hgemm_reference(
     transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
@@ -60,8 +71,8 @@ def cublas_hgemm_reference(
         C.data_ptr(),
         CUDA_R_16F,
         ldc,
-        cublas.CUBLAS_COMPUTE_32F,
-        cublas.CUBLAS_GEMM_DEFAULT,
+        GEMM_COMPUTE_TYPE,
+        GEMM_ALGO,
     )
 
 
