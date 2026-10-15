@@ -29,6 +29,17 @@ CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUDA_R_16BF = 14
 
+# T-Head (Zhenwu) cuBLAS rejects a legacy cudaDataType passed where
+# cublasGemmEx expects a cublasComputeType_t (CUBLAS_STATUS_NOT_SUPPORTED).
+# Use the proper cublasComputeType_t / cublasGemmAlgo_t enums there; other
+# vendors keep the original arguments.
+if flag_blas.vendor_name == "thead":
+    GEMM_COMPUTE_TYPE = cublas.CUBLAS_COMPUTE_32F
+    GEMM_ALGO = cublas.CUBLAS_GEMM_DEFAULT
+else:
+    GEMM_COMPUTE_TYPE = CUDA_R_32F
+    GEMM_ALGO = 0
+
 GEMM_SHAPES = [
     (511, 511, 511),
     (1023, 1023, 1023),
@@ -213,8 +224,8 @@ def cublas_hgemm(
         C_col.data_ptr(),
         CUDA_R_16F,
         ldc_cublas,
-        cublas.CUBLAS_COMPUTE_32F,
-        cublas.CUBLAS_GEMM_DEFAULT,
+        GEMM_COMPUTE_TYPE,
+        GEMM_ALGO,
     )
     return C_col
 
@@ -303,8 +314,8 @@ def cublas_bfgemm(
         C_col.data_ptr(),
         CUDA_R_16BF,
         ldc_cublas,
-        cublas.CUBLAS_COMPUTE_32F,
-        cublas.CUBLAS_GEMM_DEFAULT,
+        GEMM_COMPUTE_TYPE,
+        GEMM_ALGO,
     )
     return C_col
 
@@ -356,8 +367,8 @@ def cublas_bfgemm_reference(
         C_fp32.data_ptr(),
         CUDA_R_32F,
         ldc_cublas,
-        cublas.CUBLAS_COMPUTE_32F,
-        cublas.CUBLAS_GEMM_DEFAULT,
+        GEMM_COMPUTE_TYPE,
+        GEMM_ALGO,
     )
     C_col.copy_(C_fp32.to(torch.bfloat16))
     return C_col
