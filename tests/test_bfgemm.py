@@ -65,8 +65,8 @@ def cublas_bfgemm_reference(
         C_fp32.data_ptr(),
         CUDA_R_32F,
         ldc,
-        CUDA_R_32F,
-        0,
+        cublas.CUBLAS_COMPUTE_32F,
+        cublas.CUBLAS_GEMM_DEFAULT,
     )
     C.copy_(C_fp32.to(torch.bfloat16))
 
