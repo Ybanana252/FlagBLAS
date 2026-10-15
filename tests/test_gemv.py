@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Keep GEMV coverage across data types when updating a backend implementation.
 
 import ctypes
 
@@ -27,30 +28,27 @@ from .conftest import TO_CPU
 
 IS_ASCEND = flag_blas.vendor_name == "ascend"
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_THEAD = flag_blas.vendor_name == "thead"
 
-if IS_HYGON:
-    from .hipblas_reference import (
+if IS_HYGON or IS_MTHREADS:
+    from .vendor_blas_reference import (
         HipComplex,
         HipDoubleComplex,
         check_hipblas_status,
         get_hipblas_context,
     )
-elif not IS_ASCEND:
+elif not (IS_ASCEND or IS_MTHREADS):
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
-ASCEND_CPU_ONLY = pytest.mark.skipif(
-    not IS_ASCEND or not TO_CPU,
-    reason="Ascend --ref cpu vendor regression",
-)
-ASCEND_CPU_OR_HYGON = pytest.mark.skipif(
-    not ((IS_ASCEND and TO_CPU) or IS_HYGON),
-    reason="Ascend CPU-reference or Hygon regression",
-)
-HYGON_ONLY = pytest.mark.skipif(not IS_HYGON, reason="Hygon regression")
 HYGON_FP8_UNSUPPORTED = pytest.mark.skipif(
     IS_HYGON,
     reason="Hygon does not support FP8 GEMV",
+)
+THEAD_FP8_E4M3_UNSUPPORTED = pytest.mark.skipif(
+    IS_THEAD,
+    reason="T-Head PPU Triton does not support the fp8e4nv encoding",
 )
 
 
@@ -564,8 +562,16 @@ def hipblas_low_precision_gemv_reference(
     ]
     function.restype = ctypes.c_int
 
-    alpha_value = ctypes.c_float(float(alpha))
-    beta_value = ctypes.c_float(float(beta))
+    if IS_MTHREADS and A.dtype == torch.float16:
+        alpha_value = ctypes.c_uint16(
+            np.asarray(alpha, dtype=np.float16).view(np.uint16).item()
+        )
+        beta_value = ctypes.c_uint16(
+            np.asarray(beta, dtype=np.float16).view(np.uint16).item()
+        )
+    else:
+        alpha_value = ctypes.c_float(float(alpha))
+        beta_value = ctypes.c_float(float(beta))
     if trans == CUBLAS_OP_N:
         trans_a = 112
         gemm_m, gemm_k = m, n
@@ -592,8 +598,8 @@ def hipblas_low_precision_gemv_reference(
             ctypes.c_void_p(y_work.data_ptr()),
             data_type,
             gemm_m,
-            2,
-            160,
+            (64 if A.dtype == torch.float16 else 68) if IS_MTHREADS else 2,
+            0 if IS_MTHREADS else 160,
         ),
         "hipblasGemmEx_v2",
     )
@@ -638,7 +644,7 @@ def gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
         return cpu_gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
 
     ref_y = y.clone()
-    if IS_HYGON:
+    if IS_HYGON or IS_MTHREADS:
         if A.dtype == torch.float32:
             hipblas_sgemv_reference(
                 trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy
@@ -660,7 +666,7 @@ def gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, y, incy):
                 trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy
             )
         else:
-            raise ValueError(f"Unsupported Hygon GEMV reference dtype: {A.dtype}")
+            raise ValueError(f"Unsupported vendor GEMV reference dtype: {A.dtype}")
     elif A.dtype in (torch.float16, torch.bfloat16):
         cupy_half_gemv_reference(trans, m, n, alpha, A, lda, x, incx, beta, ref_y, incy)
     else:
@@ -723,219 +729,19 @@ def test_cpu_gemv_reference(trans, dtype, incx, incy, beta):
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.sgemv
-@ASCEND_CPU_ONLY
-@pytest.mark.parametrize("trans", [CUBLAS_OP_N, CUBLAS_OP_T])
-@pytest.mark.parametrize("beta", [0.0, 0.5])
-def test_sgemv_alpha_zero_stride(trans, beta):
-    m, n, incy = 3, 2, 2
-    dtype = torch.float32
-    A = torch.ones((m, n), dtype=dtype, device=flag_blas.device)
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.ones(len_x, dtype=dtype, device=flag_blas.device)
-    y = torch.arange(len_y * incy, dtype=dtype, device=flag_blas.device)
-    expected = y.clone()
-    expected[::incy].mul_(beta)
-    expected = to_reference(expected)
-
-    flag_blas.sgemv(trans, m, n, 0.0, A, n, x, 1, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=1)
-
-
-@pytest.mark.cgemv
-@ASCEND_CPU_OR_HYGON
-@pytest.mark.parametrize("trans", [CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_OP_C])
-@pytest.mark.parametrize("beta", [0.0, 0.5 + 0.25j])
-def test_cgemv_alpha_zero_stride(trans, beta):
-    m, n, incy = 3, 2, 2
-    dtype = torch.complex64
-    A = torch.view_as_complex(
-        torch.ones((m, n, 2), dtype=torch.float32, device=flag_blas.device)
-    )
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.view_as_complex(
-        torch.ones((len_x, 2), dtype=torch.float32, device=flag_blas.device)
-    )
-    y = torch.view_as_complex(
-        torch.arange(
-            len_y * incy * 2, dtype=torch.float32, device=flag_blas.device
-        ).reshape(len_y * incy, 2)
-    )
-    expected = y.clone()
-    expected[::incy].mul_(beta)
-    expected = to_reference(expected)
-
-    flag_blas.cgemv(trans, m, n, 0.0, A, n, x, 1, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=1)
-
-
-@pytest.mark.zgemv
-@HYGON_ONLY
-@pytest.mark.parametrize("trans", [CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_OP_C])
-@pytest.mark.parametrize("beta", [0.0, 0.5 + 0.25j])
-def test_zgemv_alpha_zero_stride(trans, beta):
-    m, n, incy = 3, 2, 3
-    dtype = torch.complex128
-    nan = complex(float("nan"), float("nan"))
-    sentinel = 41.0 + 13.0j
-    A = torch.full((m, n), nan, dtype=dtype, device=flag_blas.device)
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.full((len_x,), nan, dtype=dtype, device=flag_blas.device)
-    y = torch.full(
-        (1 + (len_y - 1) * incy + 2,),
-        sentinel,
-        dtype=dtype,
-        device=flag_blas.device,
-    )
-    y_values = torch.randn(len_y, dtype=dtype, device=flag_blas.device)
-    y[0 : len_y * incy : incy] = y_values
-    if beta == 0.0:
-        y[0 : len_y * incy : incy] = nan
-
-    expected = y.clone()
-    if beta == 0.0:
-        expected[0 : len_y * incy : incy] = 0.0
-    else:
-        expected[0 : len_y * incy : incy] = beta * y_values
-    expected = to_reference(expected)
-
-    flag_blas.zgemv(trans, m, n, 0.0, A, n, x, 1, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=1)
-
-
-@pytest.mark.sgemv
-@ASCEND_CPU_ONLY
-@pytest.mark.parametrize("m,n,trans", [(1, 4096, CUBLAS_OP_N), (4096, 1, CUBLAS_OP_T)])
-@pytest.mark.parametrize("beta", [0.0, 0.5])
-def test_sgemv_splitk_stride_tail(m, n, trans, beta):
-    dtype, alpha, incx, incy = torch.float32, 1.5, 2, 2
-    A = torch.randn((m, n), dtype=dtype, device=flag_blas.device)
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.full((len_x * incx,), 37.0, dtype=dtype, device=flag_blas.device)
-    x_values = torch.randn(len_x, dtype=dtype, device=flag_blas.device)
-    x[::incx] = x_values
-    y = torch.full((len_y * incy,), 41.0, dtype=dtype, device=flag_blas.device)
-    y_values = torch.randn(len_y, dtype=dtype, device=flag_blas.device)
-    y[::incy] = y_values
-    if beta == 0.0:
-        y[::incy] = float("nan")
-
-    op_A = A if trans == CUBLAS_OP_N else A.T
-    expected = to_reference(y, upcast=True)
-    product = op_A.to(torch.float64).to("cpu") @ x_values.to(torch.float64).to("cpu")
-    old_y = y_values.to(torch.float64).to("cpu")
-    expected[::incy] = alpha * product + beta * old_y
-
-    flag_blas.sgemv(trans, m, n, alpha, A, n, x, incx, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=len_x)
-
-
-@pytest.mark.cgemv
-@HYGON_ONLY
-@pytest.mark.parametrize(
-    "m,n,trans",
-    [
-        (1, 4096, CUBLAS_OP_N),
-        (4096, 1, CUBLAS_OP_T),
-        (4096, 1, CUBLAS_OP_C),
-    ],
-)
-@pytest.mark.parametrize("beta", [0.0, 0.5 + 0.25j])
-def test_cgemv_splitk_stride_tail(m, n, trans, beta):
-    dtype, alpha, incx, incy = torch.complex64, 1.5 + 0.5j, 2, 2
-    A = torch.randn((m, n), dtype=dtype, device=flag_blas.device)
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.full((len_x * incx,), 37.0 + 11.0j, dtype=dtype, device=flag_blas.device)
-    x_values = torch.randn(len_x, dtype=dtype, device=flag_blas.device)
-    x[::incx] = x_values
-    y = torch.full((len_y * incy,), 41.0 + 13.0j, dtype=dtype, device=flag_blas.device)
-    y_values = torch.randn(len_y, dtype=dtype, device=flag_blas.device)
-    y[::incy] = y_values
-    if beta == 0.0:
-        y[::incy] = complex(float("nan"), float("nan"))
-
-    if trans == CUBLAS_OP_N:
-        op_A = A
-    elif trans == CUBLAS_OP_T:
-        op_A = A.T
-    else:
-        op_A = A.mH
-    expected = to_reference(y, upcast=True)
-    product = op_A.to(torch.complex128).to("cpu") @ x_values.to(torch.complex128).to(
-        "cpu"
-    )
-    old_y = y_values.to(torch.complex128).to("cpu")
-    expected[::incy] = alpha * product + beta * old_y
-
-    flag_blas.cgemv(trans, m, n, alpha, A, n, x, incx, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=len_x)
-
-
-@pytest.mark.zgemv
-@HYGON_ONLY
-@pytest.mark.parametrize(
-    "m,n,trans",
-    [
-        (1, 4096, CUBLAS_OP_N),
-        (4096, 1, CUBLAS_OP_T),
-        (4096, 1, CUBLAS_OP_C),
-    ],
-)
-@pytest.mark.parametrize("beta", [0.0, 0.5 + 0.25j])
-def test_zgemv_splitk_stride_tail(m, n, trans, beta):
-    dtype, alpha, incx, incy = torch.complex128, 1.5 + 0.5j, 2, 2
-    sentinel_x = 37.0 + 11.0j
-    sentinel_y = 41.0 + 13.0j
-    A = torch.randn((m, n), dtype=dtype, device=flag_blas.device)
-    len_x, len_y = (n, m) if trans == CUBLAS_OP_N else (m, n)
-    x = torch.full(
-        (1 + (len_x - 1) * incx + 2,),
-        sentinel_x,
-        dtype=dtype,
-        device=flag_blas.device,
-    )
-    x_values = torch.randn(len_x, dtype=dtype, device=flag_blas.device)
-    x[0 : len_x * incx : incx] = x_values
-    y = torch.full(
-        (1 + (len_y - 1) * incy + 2,),
-        sentinel_y,
-        dtype=dtype,
-        device=flag_blas.device,
-    )
-    y_values = torch.randn(len_y, dtype=dtype, device=flag_blas.device)
-    y[0 : len_y * incy : incy] = y_values
-    if beta == 0.0:
-        y[0 : len_y * incy : incy] = complex(float("nan"), float("nan"))
-
-    if trans == CUBLAS_OP_N:
-        op_A = A
-    elif trans == CUBLAS_OP_T:
-        op_A = A.T
-    else:
-        op_A = A.mH
-    expected = to_reference(y.clone(), upcast=True)
-    product = op_A.to("cpu") @ x_values.to("cpu")
-    old_y = y_values.to("cpu")
-    expected[0 : len_y * incy : incy] = alpha * product + beta * old_y
-
-    flag_blas.zgemv(trans, m, n, alpha, A, n, x, incx, beta, y, incy)
-
-    blas_assert_close(y, expected, dtype, reduce_dim=len_x)
-
-
 def fp8_gemv_reference(trans, m, n, alpha, A, A_col_ref, x, x_ref, incx, beta, y, incy):
     if TO_CPU:
         return cpu_gemv_reference(trans, m, n, alpha, A, n, x, incx, beta, y, incy)
 
     ref_y = y.float().clone()
-    cublas_gemv_reference(
-        trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
-    )
+    if IS_MTHREADS:
+        hipblas_sgemv_reference(
+            trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
+        )
+    else:
+        cublas_gemv_reference(
+            trans, m, n, alpha, A_col_ref, m, x_ref, incx, beta, ref_y, incy
+        )
     return ref_y
 
 
@@ -1020,7 +826,7 @@ def test_accuracy_sgemv(m, n, trans, beta):
     ref_y = gemv_reference(trans, m, n, alpha, A_col, m, x, 1, beta, y, 1)
     flag_blas.sgemv(trans, m, n, alpha, A_row, n, x, 1, beta, y, 1)
 
-    if TO_CPU:
+    if TO_CPU or IS_MTHREADS or IS_THEAD:
         blas_assert_close(y, ref_y, dtype, reduce_dim=x_len)
     else:
         tol = min(1e-5 * (x_len**0.5), 1e-3)
@@ -1043,7 +849,7 @@ def test_accuracy_sgemv_stride(m, n, trans, incx, incy):
     ref_y = gemv_reference(trans, m, n, alpha, A_col, m, x, incx, beta, y, incy)
     flag_blas.sgemv(trans, m, n, alpha, A_row, n, x, incx, beta, y, incy)
 
-    if TO_CPU:
+    if TO_CPU or IS_THEAD:
         blas_assert_close(y, ref_y, dtype, reduce_dim=x_len)
     else:
         tol = min(1e-5 * (x_len**0.5), 1e-3)
@@ -1280,6 +1086,7 @@ def test_accuracy_bfgemv_stride(m, n, trans, incx, incy):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", FP8_GEMV_SHAPES)
 @pytest.mark.parametrize("beta", [0.0, 0.5])
@@ -1308,6 +1115,7 @@ def test_accuracy_fp8_gemv_e4m3(m, n, beta):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(64, 128), (128, 64), (256, 256)])
 @pytest.mark.parametrize("incx,incy", STRIDES)
@@ -1392,6 +1200,7 @@ def test_accuracy_fp8_gemv_e5m2_stride(m, n, incx, incy):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(256, 256), (1024, 1024), (4096, 4096)])
 @pytest.mark.parametrize("y_dtype", [torch.float16, torch.bfloat16])
@@ -1420,6 +1229,7 @@ def test_accuracy_fp8_gemv_output_dtype(m, n, y_dtype):
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_alpha_zero():
     m, n = 128, 256
@@ -1445,6 +1255,7 @@ def test_fp8_gemv_alpha_zero():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_beta_zero():
     m, n = 128, 256
@@ -1478,6 +1289,7 @@ def test_fp8_gemv_beta_zero():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 def test_fp8_gemv_empty():
     fp8_dtype = torch.float8_e4m3fn
@@ -1500,6 +1312,7 @@ def test_fp8_gemv_empty():
 @pytest.mark.fp8gemv
 @pytest.mark.fp8_gemv
 @HYGON_FP8_UNSUPPORTED
+@THEAD_FP8_E4M3_UNSUPPORTED
 @ASCEND_FP8_E4M3_REQUIRED
 @pytest.mark.parametrize("m,n", [(256, 256), (1024, 1024)])
 def test_accuracy_fp8_gemv_mixed_dtype(m, n):

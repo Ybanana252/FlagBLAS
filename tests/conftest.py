@@ -40,14 +40,22 @@ REPORT_FILE = "accuracy_result.json"
 
 
 def pytest_addoption(parser):
-    reference_choices = [device, "cpu"]
+    if flag_blas.vendor_name == "ascend":
+        reference_choices = ["cpu"]
+        default_reference = "cpu"
+    elif flag_blas.vendor_name == "mthreads":
+        reference_choices = [device, "cpu"]
+        default_reference = device
+    else:
+        reference_choices = [device, "cpu"]
+        default_reference = device
     if flag_blas.vendor_name == "hygon":
         reference_choices.append("hip")
 
     parser.addoption(
         "--ref",
         action="store",
-        default=device,
+        default=default_reference,
         required=False,
         choices=reference_choices,
         help="device to run reference tests on",
@@ -96,9 +104,15 @@ def pytest_configure(config):
     reference = config.getoption("--ref")
     TO_CPU = reference == "cpu"
     if TO_CPU:
-        ref_backend = "CPU (--ref cpu)"
+        ref_backend = (
+            "SciPy (CPU, --ref cpu)"
+            if flag_blas.vendor_name in {"ascend", "mthreads"}
+            else "CPU (--ref cpu)"
+        )
     elif flag_blas.vendor_name == "hygon":
         ref_backend = f"hipBLAS (--ref {reference})"
+    elif flag_blas.vendor_name == "mthreads":
+        ref_backend = f"muBLAS (--ref {reference})"
     else:
         ref_backend = f"{device} (--ref {device})"
     print(f"[correctness] reference backend: {ref_backend}", flush=True)
@@ -154,6 +168,15 @@ def pytest_configure(config):
             level=logging.INFO,
             format="[%(levelname)s] %(message)s",
         )
+
+
+def pytest_collection_modifyitems(config, items):
+    if flag_blas.vendor_name != "thead" or config.getoption("--ref") != "cuda":
+        return
+
+    from .thead_l2_reference import skip_unsupported_l2_references
+
+    skip_unsupported_l2_references(items)
 
 
 def pytest_runtest_teardown(item, nextitem):

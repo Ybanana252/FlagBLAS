@@ -17,14 +17,23 @@ flag_blas - BLAS operations implemented with Triton
 """
 
 import warnings
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
 
 import torch
 
-from flag_blas import testing  # noqa: F401
-from flag_blas import runtime
-from flag_blas.config import aten_patch_list, resolve_user_setting
-from flag_blas.ops import *  # noqa: F401,F403
-from flag_blas.runtime.register import Register
+from flag_blas import _triton_compat
+
+# Make triton.jit tolerate vendor-only keyword arguments (e.g. ppu_hint) when
+# the active Triton build (such as FlagTree's) does not support them. Must run
+# before any kernel module using such keywords is imported.
+_triton_compat.patch_triton_jit()
+
+from flag_blas import runtime  # noqa: E402
+from flag_blas import testing  # noqa: F401,E402
+from flag_blas.config import aten_patch_list, resolve_user_setting  # noqa: E402
+from flag_blas.ops import *  # noqa: F401,F403,E402
+from flag_blas.runtime.register import Register  # noqa: E402
 
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
@@ -33,7 +42,10 @@ registrar = Register
 current_work_registerar = None
 runtime.replace_customized_ops(globals())
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata_version("flag_blas")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 _FULL_CONFIG = ()
 

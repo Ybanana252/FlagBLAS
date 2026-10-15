@@ -184,38 +184,41 @@ for config in runtime.get_tuned_config("group_bfgemm_m256"):
     config.kwargs["llc_options"] = GROUP_BFGEMM_LLC_OPTIONS
 
 
-def matmul_tle_ws_set_block_size_hook(nargs):
-    block_m = nargs["BLOCK_M"]
-    block_n = nargs["BLOCK_N"]
-    block_k = nargs["BLOCK_K"]
-    nargs["a_desc"].block_shape = [block_m, block_k]
-    nargs["b_desc"].block_shape = [block_k, block_n]
-
-
 def prune_tle_ws_configs(configs, named_args, **kwargs):
-    """Avoid known MThreads TLE resource failures before benchmarking."""
     if named_args["N"] == 384:
-        valid_pairs = {(2, 5)}
+        valid_pairs = {(4, 3), (8, 3)}
     elif named_args["K"] == 384:
         valid_pairs = {(4, 3), (8, 3)}
     elif named_args["K"] == 192:
         valid_pairs = {(16, 6)} if named_args["N"] >= 4096 else {(8, 6)}
+    elif named_args["group_size"] >= 256:
+        valid_pairs = {(2, 4)}
     elif named_args["K"] == 2048 and named_args["N"] == 768:
         valid_pairs = {(3, 4)}
     elif (
         named_args["K"] == 2048
         and named_args["N"] == 1536
-        and (named_args["group_size"] >= 64 or named_args["group_size"] == 16)
+        and named_args["group_size"] == 16
     ):
-        valid_pairs = {(6, 4)}
+        valid_pairs = {(8, 6), (6, 4)}
+    elif (
+        named_args["K"] == 2048
+        and named_args["N"] == 1536
+        and named_args["group_size"] >= 64
+    ):
+        valid_pairs = {(6, 4), (4, 6)}
     elif (
         named_args["group_size"] <= 17
         and named_args["K"] == 4096
         and named_args["N"] >= 3072
     ):
-        valid_pairs = {(8, 4)}
+        valid_pairs = {(4, 4), (6, 3), (8, 4)}
     elif named_args["group_size"] <= 17 and named_args["N"] >= 4096:
-        valid_pairs = {(4, 4)}
+        valid_pairs = {(4, 4), (6, 3)}
+    elif named_args["K"] in (512, 768) and named_args["N"] == 2048:
+        valid_pairs = {(4, 3), (4, 4)}
+    elif named_args["K"] == 2048 and named_args["N"] == 1024:
+        valid_pairs = {(4, 3), (4, 4), (4, 5)}
     else:
         return [
             config
@@ -231,7 +234,7 @@ def prune_tle_ws_configs(configs, named_args, **kwargs):
 
 
 for config in runtime.get_tuned_config("group_bfgemm_tle_ws"):
-    config.pre_hook = matmul_tle_ws_set_block_size_hook
+    config.pre_hook = matmul_tma_set_block_size_hook
     config.kwargs["enable_backend_opt"] = True
     config.kwargs["llc_options"] = GROUP_BFGEMM_TLE_LLC_OPTIONS
 
@@ -572,12 +575,14 @@ def grouped_bfgemm_pack_a_kernel(
         offs_m = tl.arange(0, BLOCK_M)
         offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
         values = tl.load(
-            group_A + (source_row + offs_m[:, None]) * K + offs_k[None, :],
+            group_A + (source_row + offs_m[:, None]).to(tl.int64) * K + offs_k[None, :],
             mask=(source_row + offs_m[:, None] < M) & (offs_k[None, :] < K),
             other=0.0,
         )
         tl.store(
-            packed_A + (schedule_idx * BLOCK_M + offs_m[:, None]) * K + offs_k[None, :],
+            packed_A
+            + (schedule_idx * BLOCK_M + offs_m[:, None]).to(tl.int64) * K
+            + offs_k[None, :],
             values,
             mask=offs_k[None, :] < K,
         )
@@ -621,6 +626,7 @@ def _grouped_bfgemm_tle_ws_consumer(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
+    EVICT_C: tl.constexpr = 0,
 ):
     k_tiles: tl.constexpr = tl.cdiv(K, BLOCK_K)
     if valid:
@@ -635,17 +641,22 @@ def _grouped_bfgemm_tle_ws_consumer(
             accumulator = tle.gpu.wgmma_wait(0, accumulator)
             reader.release(k_iter)
         c_ptrs = group_out + offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
+        ev: tl.constexpr = "evict_first" if EVICT_C else ""
         if N % BLOCK_N != 0:
             tl.store(
                 c_ptrs,
                 accumulator.to(tl.bfloat16),
                 mask=(offs_m[:, None] < group_end) & (offs_n[None, :] < N),
+                eviction_policy=ev,
             )
         elif row_start + BLOCK_M <= group_end:
-            tl.store(c_ptrs, accumulator.to(tl.bfloat16))
+            tl.store(c_ptrs, accumulator.to(tl.bfloat16), eviction_policy=ev)
         else:
             tl.store(
-                c_ptrs, accumulator.to(tl.bfloat16), mask=offs_m[:, None] < group_end
+                c_ptrs,
+                accumulator.to(tl.bfloat16),
+                mask=offs_m[:, None] < group_end,
+                eviction_policy=ev,
             )
 
 
@@ -680,6 +691,185 @@ def _grouped_bfgemm_tle_ws_producer(
             writer.commit(k_iter)
 
 
+@triton.jit
+def _grouped_bfgemm_tle_ws_nopack_consumer(
+    reader,
+    valid,
+    tile_m,
+    tile_n,
+    c_row_starts,
+    c_row_ends,
+    group_out,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
+    EVICT_C: tl.constexpr = 0,
+):
+    # A rows are read in place from the ragged tensor. The 256-row load window
+    # is clamped to stay inside A (tail tiles would otherwise read past the
+    # allocation); the store window shifts down by the same amount so window
+    # row i still corresponds to A/C row (load_base + i).
+    k_tiles: tl.constexpr = tl.cdiv(K, BLOCK_K)
+    if valid:
+        row_start = tl.load(c_row_starts + tile_m).to(tl.int32)
+        group_end = tl.load(c_row_ends + tile_m).to(tl.int32)
+        load_base = tl.minimum(row_start, M - BLOCK_M)
+        shift = row_start - load_base
+        offs_m = load_base + tl.arange(0, BLOCK_M)
+        offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_iter in tl.range(0, k_tiles, num_stages=1, loop_unroll_factor=k_tiles):
+            wait = reader.wait(k_iter)
+            accumulator = tle.gpu.wgmma(wait.slot.a, wait.slot.b, accumulator)
+            accumulator = tle.gpu.wgmma_wait(0, accumulator)
+            reader.release(k_iter)
+        c_ptrs = group_out + offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
+        ev: tl.constexpr = "evict_first" if EVICT_C else ""
+        if shift == 0 and row_start + BLOCK_M <= group_end:
+            tl.store(c_ptrs, accumulator.to(tl.bfloat16), eviction_policy=ev)
+        else:
+            tl.store(
+                c_ptrs,
+                accumulator.to(tl.bfloat16),
+                mask=(offs_m[:, None] >= row_start) & (offs_m[:, None] < group_end),
+                eviction_policy=ev,
+            )
+
+
+@triton.jit
+def _grouped_bfgemm_tle_ws_nopack_producer(
+    writer,
+    valid,
+    M,
+    tile_m,
+    tile_n,
+    a_desc,
+    b_desc,
+    a_row_starts,
+    b_row_starts,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Same as _grouped_bfgemm_tle_ws_producer but A is read from the ORIGINAL
+    # ragged tensor at its group row start (TME accepts arbitrary row
+    # coordinates), so the pack_a pre-pass can be skipped entirely. The
+    # unaligned A copies cost a few percent of GEMM time but save the whole
+    # pack kernel (~1.1 TB/s, 15-22%% of the op on short-K N=2048 shapes).
+    k_tiles: tl.constexpr = tl.cdiv(K, BLOCK_K)
+    if valid:
+        a_row = tl.load(a_row_starts + tile_m).to(tl.int32)
+        a_row = tl.minimum(a_row, M - BLOCK_M)  # keep the box inside A
+        b_row_start = tl.load(b_row_starts + tile_m).to(tl.int32)
+        for k_iter in tl.range(0, k_tiles, num_stages=1, loop_unroll_factor=k_tiles):
+            offset_k = k_iter * BLOCK_K
+            slot = writer.acquire(k_iter)
+            tle.gpu.copy(a_desc, slot.a, (BLOCK_M, BLOCK_K), (a_row, offset_k))
+            tle.gpu.copy(
+                b_desc,
+                slot.b,
+                (BLOCK_K, BLOCK_N),
+                (b_row_start + offset_k, tile_n * BLOCK_N),
+            )
+            writer.commit(k_iter)
+
+
+@triton.jit
+def grouped_bfgemm_tle_ws_nopack_kernel(
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    a_desc,
+    b_desc,
+    group_out,
+    b_row_starts,
+    c_row_ends,
+    c_row_starts,
+    num_m_blocks,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    PANEL_WIDTH: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
+    EVICT_C: tl.constexpr = 0,
+):
+    # Fixed-config no-pack TLE WS kernel for the short-K N=2048 cluster:
+    # skips pack_a (the pre-pass is pure overhead vs MATE there).
+    a_smem = tle.gpu.alloc(
+        (PIPELINE_STAGES, BLOCK_M, BLOCK_K),
+        dtype=tl.bfloat16,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
+    b_smem = tle.gpu.alloc(
+        (PIPELINE_STAGES, BLOCK_K, BLOCK_N),
+        dtype=tl.bfloat16,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
+    pipe = tle.pipe(
+        capacity=PIPELINE_STAGES,
+        scope="cta",
+        name="gg_nopack_ab",
+        a=a_smem,
+        b=b_smem,
+    )
+    num_n_blocks: tl.constexpr = tl.cdiv(N, BLOCK_N)
+    block_idx = tl.program_id(axis=0)
+    tile_n, tile_m = _grouped_bfgemm_rasterization_2d_column(
+        block_idx, num_n_blocks, num_m_blocks, PANEL_WIDTH
+    )
+    tle.gpu.warp_specialize(
+        [
+            (
+                _grouped_bfgemm_tle_ws_nopack_consumer,
+                (
+                    pipe.reader(),
+                    True,
+                    tile_m,
+                    tile_n,
+                    c_row_starts,
+                    c_row_ends,
+                    group_out,
+                    M,
+                    N,
+                    K,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    PIPELINE_STAGES,
+                    EVICT_C,
+                ),
+            ),
+            (
+                _grouped_bfgemm_tle_ws_nopack_producer,
+                (
+                    pipe.writer(),
+                    True,
+                    M,
+                    tile_m,
+                    tile_n,
+                    a_desc,
+                    b_desc,
+                    c_row_starts,  # original row starts double as A offsets
+                    b_row_starts,
+                    K,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                ),
+            ),
+        ],
+        worker_num_warps=[4],
+        worker_num_regs=[24],
+    )
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("group_bfgemm_tle_ws"),
@@ -705,6 +895,7 @@ def grouped_bfgemm_tle_ws_kernel(
     BLOCK_K: tl.constexpr,
     PANEL_WIDTH: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
+    EVICT_C: tl.constexpr = 0,
 ):
     a_smem = tle.gpu.alloc(
         (PIPELINE_STAGES, BLOCK_M, BLOCK_K),
@@ -748,6 +939,7 @@ def grouped_bfgemm_tle_ws_kernel(
                     BLOCK_N,
                     BLOCK_K,
                     PIPELINE_STAGES,
+                    EVICT_C,
                 ),
             ),
             (
@@ -1006,7 +1198,11 @@ def group_bfgemm(group_A, group_B, group_list, group_out):
         [group_B.stride(1), group_B.stride(2)],
         dummy_block,
     )
-    if K >= 64 and (N % 256 == 0 or N in (192, 384)) and 16 <= group_size <= 128:
+    if (
+        K >= 64
+        and (N % 256 == 0 or N in (192, 384))
+        and (16 <= group_size <= 128 or (group_size == 512 and K > 64 and N % 256 == 0))
+    ):
         block_m = 256
         max_blocks = triton.cdiv(M, block_m) + group_size - 1
         block_e = 128
@@ -1058,6 +1254,44 @@ def group_bfgemm(group_A, group_B, group_list, group_out):
             BLOCK_M=block_m,
             num_warps=1,
         )
+        if K in (384, 512, 768) and N == 2048:
+            # Short-K N=2048 cluster: skip pack_a entirely (its 1.1 TB/s
+            # pre-pass costs 15-22% of the op here) and read A in place via
+            # TME row coordinates. pw4/st3 measured best on this cluster.
+            block_k = 32
+            # build real descriptors (block shape at construction time so the
+            # TME tail-divisibility metadata matches the ragged A tensor)
+            a_desc = TensorDescriptor(
+                group_A, group_A.shape, group_A.stride(), [block_m, block_k]
+            )
+            b_desc = TensorDescriptor(
+                group_B,
+                [group_size * K, N],
+                [group_B.stride(1), group_B.stride(2)],
+                [block_k, 256],
+            )
+            max_tiles = schedule_blocks * triton.cdiv(N, 256)
+            grouped_bfgemm_tle_ws_nopack_kernel[(max_tiles,)](
+                M,
+                N,
+                K,
+                a_desc,
+                b_desc,
+                group_out,
+                b_row_starts,
+                c_row_ends,
+                c_row_starts,
+                schedule_blocks,
+                BLOCK_M=block_m,
+                BLOCK_N=256,
+                BLOCK_K=block_k,
+                PANEL_WIDTH=4,
+                PIPELINE_STAGES=3,
+                EVICT_C=1 if K == 768 else 0,
+                num_warps=16,
+                num_stages=3,
+            )
+            return group_out
         grouped_bfgemm_pack_a_kernel[(schedule_blocks, triton.cdiv(K, 64))](
             group_A,
             packed_A,
@@ -1081,7 +1315,7 @@ def group_bfgemm(group_A, group_B, group_list, group_out):
         block_k = 32
         packed_a_desc.block_shape = [block_m, block_k]
         if N == 192:
-            pipeline_stages = 6
+            pipeline_stages = 5
             consumer_warps = 16
             b_desc.block_shape = [block_k, 128]
             b_n64_desc.block_shape = [block_k, 64]
@@ -1117,6 +1351,7 @@ def group_bfgemm(group_A, group_B, group_list, group_out):
                 c_row_ends,
                 c_row_starts,
                 schedule_blocks,
+                EVICT_C=1 if group_size >= 256 and K > 512 else 0,
             )
     elif group_size == 512 and K >= 64 and N >= 128:
         block_m = 256

@@ -22,6 +22,7 @@ SUPPORTED_VENDORS=(
   "iluvatar"
   "ascend"
   "hygon"
+  "mthreads"
 )
 export FLAGOS_PYPI="https://resource.flagos.net/repository/flagos-pypi-${VENDOR}/simple"
 
@@ -48,11 +49,18 @@ case $VENDOR in
     # Install PyTorch and Triton with CUDA support
     uv pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
         --index-url https://download.pytorch.org/whl/cu128
-    # Install FlagBLAS in editable mode
-
-    uv pip uninstall triton
-    RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
-    python3.12 -m pip install flagtree===0.5.0 $RES
+    # Install FlagTree compiler (plain build, no CUDA). The flagtree wheel
+    # bundles the `triton` package that flag_blas imports at runtime, so it
+    # must actually be installed or import fails later.
+    # Version aligned with FlagGems' nvidia backends (flagtree==0.6.1);
+    # `===` pins the exact plain 0.6.1 build (the hosted index also serves
+    # vendor-tagged 0.6.1+<backend>3.6 wheels).
+    uv pip uninstall triton || true
+    # Use `uv pip` (not `python3.12 -m pip`): the venv is created by `uv venv`,
+    # which does not seed pip, so `-m pip` always fails with
+    # "No module named pip" and flagtree is never installed.
+    uv pip install flagtree===0.6.1 \
+        --index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple
     uv pip install -e .
     uv pip install ".[test,nvidia-cuda128]"
     ;;
@@ -172,6 +180,32 @@ PYEOF
       printf '\n# Source Hygon DTK environment (required by DTK-patched PyTorch)\n[ -f "%s" ] && source "%s" || true\n' "$DTK_ENV" "$DTK_ENV" >> .venv/bin/activate
       echo "Baked DTK environment into .venv/bin/activate: $DTK_ENV"
     fi
+    ;;
+  mthreads)
+    # Moore Threads images provide the vendor PyTorch and Triton stack.  Do
+    # not let dependency resolution replace it with a generic CUDA build.
+    python - <<'PYEOF'
+import sys
+
+try:
+    import torch
+
+    musa = getattr(torch, "musa", None)
+    if musa is None or not musa.is_available():
+        raise RuntimeError("torch.musa is unavailable")
+    print("TorchMUSA detected:", torch.__version__)
+except Exception as exc:
+    print(
+        f"mthreads setup requires a working TorchMUSA runtime: {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PYEOF
+    uv pip install -e . --no-deps --no-build-isolation
+    # CUDA CuPy is deliberately excluded because it conflicts with MUSA
+    # runtime libraries.  Level 2 correctness tests use SciPy as reference.
+    uv pip install pytest numpy\<2 scipy distro gitpython pyyaml coverage \
+      pytest-md-report sqlalchemy packaging pybind11
     ;;
 esac
 

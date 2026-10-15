@@ -20,13 +20,26 @@ import pytest
 import torch
 
 import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from benchmark.performance_utils import run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
 
-if flag_blas.vendor_name == "hygon":
-    import atexit
+IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+IS_THEAD_EQUIVALENT = flag_blas.vendor_name == "thead"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+    from benchmark.ascend_l2_reference import randn as ascend_randn
 else:
+    from benchmark.performance_utils import Benchmark
+
+if IS_HYGON:
+    import atexit
+elif IS_MTHREADS:
+    from benchmark.mublas_compat import cp, cublas
+elif not (IS_ASCEND or IS_THEAD_EQUIVALENT):
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
 
@@ -55,6 +68,10 @@ SYMV_SIZES = [
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so", "libcublas.so.12", "libcublas.so.11"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -67,7 +84,7 @@ def load_cublas():
     raise RuntimeError("Unable to find libcublas.so on this system")
 
 
-_cublas = None if flag_blas.vendor_name == "hygon" else load_cublas()
+_cublas = None if IS_HYGON or IS_ASCEND or IS_THEAD_EQUIVALENT else load_cublas()
 
 
 class cuComplex(ctypes.Structure):
@@ -80,7 +97,7 @@ class cuDoubleComplex(ctypes.Structure):
 
 _CUBLAS_SYMV_FUNCS = (
     {}
-    if flag_blas.vendor_name == "hygon"
+    if IS_HYGON or IS_ASCEND or IS_THEAD_EQUIVALENT
     else {
         torch.float32: (_cublas.cublasSsymv_v2, ctypes.c_float, False),
         torch.float64: (_cublas.cublasDsymv_v2, ctypes.c_double, False),
@@ -247,6 +264,9 @@ def _generate_sym_A(n, lda, dtype, device):
 
 
 class SymvBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "symv"
+
     def __init__(
         self,
         *args,
@@ -271,6 +291,26 @@ class SymvBenchmark(Benchmark):
         return None
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND or IS_THEAD_EQUIVALENT:
+            if IS_ASCEND and cur_dtype not in (torch.float32, torch.complex64):
+                pytest.skip("Ascend SYMV supports float32 and complex64")
+            make_randn = ascend_randn if IS_ASCEND else torch.randn
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                A = make_randn((n, n), dtype=cur_dtype, device=self.device) * 0.1
+                x = make_randn(n, dtype=cur_dtype, device=self.device)
+                y = make_randn(n, dtype=cur_dtype, device=self.device)
+                yield A, x, y, {
+                    "uplo": self.uplo,
+                    "n": n,
+                    "alpha": self.alpha,
+                    "lda": n,
+                    "incx": 1,
+                    "beta": self.beta,
+                    "incy": 1,
+                    "handle": None,
+                }
+            return
         if flag_blas.vendor_name == "hygon":
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor, is_complex = _resolve_hipblas_symv(library, cur_dtype)
@@ -377,6 +417,17 @@ class SymvBenchmark(Benchmark):
         return ref_args, ref_kwargs, blas_args, kwargs
 
 
+def _run_symv_benchmark(bench):
+    if IS_THEAD_EQUIVALENT:
+        from benchmark.thead_l2_reference import run_thead_symv
+
+        run_thead_symv(bench)
+    elif IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
+
+
 @pytest.mark.ssymv
 def test_perf_ssymv():
     bench = SymvBenchmark(
@@ -386,7 +437,7 @@ def test_perf_ssymv():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.ssymv
@@ -398,7 +449,7 @@ def test_perf_ssymv_upper():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.dsymv
@@ -412,7 +463,7 @@ def test_perf_dsymv():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.dsymv
@@ -426,7 +477,7 @@ def test_perf_dsymv_upper():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.csymv
@@ -440,7 +491,7 @@ def test_perf_csymv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.csymv
@@ -454,7 +505,7 @@ def test_perf_csymv_upper():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.zsymv
@@ -470,7 +521,7 @@ def test_perf_zsymv():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)
 
 
 @pytest.mark.zsymv
@@ -486,4 +537,4 @@ def test_perf_zsymv_upper():
         alpha=1.5 + 0.5j,
         beta=0.5 + 0.25j,
     )
-    run_correctness_then_benchmark(bench)
+    _run_symv_benchmark(bench)

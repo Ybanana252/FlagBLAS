@@ -19,13 +19,20 @@ from typing import Generator
 
 import pytest
 import torch
-
-import flag_blas
-from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.ops import CUBLAS_FILL_MODE_LOWER, CUBLAS_FILL_MODE_UPPER
 from flag_blas.utils import shape_utils
 
+import flag_blas
+from benchmark.performance_utils import run_correctness_then_benchmark
+
 IS_HYGON = flag_blas.vendor_name == "hygon"
+IS_MTHREADS = flag_blas.vendor_name == "mthreads"
+IS_ASCEND = flag_blas.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from benchmark.ascend_l2_reference import AscendL2Benchmark as Benchmark
+else:
+    from benchmark.performance_utils import Benchmark
 
 SPR_SIZES = [
     64,
@@ -105,6 +112,10 @@ SPR_SIZES = [
 
 
 def load_cublas():
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import load_mublas
+
+        return load_mublas()
     lib_names = ["libcublas.so.13"]
     found_path = ctypes.util.find_library("cublas")
     if found_path:
@@ -237,12 +248,22 @@ def _ensure_cublas():
     global _cublas, _CUBLAS_SPR_FUNCS
     if _cublas is None:
         _cublas = load_cublas()
-        _configure_cublas_signatures()
+        if not IS_MTHREADS:
+            _configure_cublas_signatures()
         _CUBLAS_SPR_FUNCS = {
             torch.float32: (_cublas.cublasSspr_v2, ctypes.c_float),
             torch.float64: (_cublas.cublasDspr_v2, ctypes.c_double),
         }
     return _cublas
+
+
+def _get_cublas_handle():
+    """Return the active BLAS handle without creating a CUDA handle on MUSA."""
+    if IS_MTHREADS:
+        from benchmark.mublas_compat import get_mublas_handle
+
+        return get_mublas_handle()
+    raise RuntimeError("_get_cublas_handle is only used for the MUSA path")
 
 
 def hipblas_spr_baseline(
@@ -286,6 +307,9 @@ def _generate_packed(n, dtype, device):
 
 
 class SprBenchmark(Benchmark):
+    if IS_ASCEND:
+        metric_family = "spr"
+
     DEFAULT_SHAPES = [(n,) for n in SPR_SIZES]
     DEFAULT_SHAPE_DESC = "N"
 
@@ -293,7 +317,9 @@ class SprBenchmark(Benchmark):
         super().__init__(*args, **kwargs)
         self.uplo = uplo
         self.alpha = alpha
-        self.correctness_reference = "hipBLAS" if IS_HYGON else "cuBLAS"
+        self.correctness_reference = (
+            "hipBLAS" if IS_HYGON else ("muBLAS" if IS_MTHREADS else "cuBLAS")
+        )
 
     def set_more_metrics(self):
         return ["tflops", "gbps"]
@@ -310,9 +336,22 @@ class SprBenchmark(Benchmark):
             self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_ASCEND:
+            for shape in self.shapes:
+                n = shape[0] if isinstance(shape, (tuple, list)) else shape
+                yield (
+                    _generate_packed(n, cur_dtype, self.device),
+                    torch.randn(n, dtype=cur_dtype, device=self.device),
+                    {"uplo": self.uplo, "n": n, "alpha": self.alpha, "incx": 1},
+                )
+            return
         if IS_HYGON:
             library, handle = _prepare_hipblas(self.device)
             c_func, ctor = _resolve_hipblas_spr(library, cur_dtype)
+        elif IS_MTHREADS:
+            _ensure_cublas()
+            handle = _get_cublas_handle()
+            c_func, ctor = _CUBLAS_SPR_FUNCS[cur_dtype]
         else:
             cublas = _ensure_cublas()
             handle = ctypes.c_void_p()
@@ -399,7 +438,10 @@ def test_perf_sspr():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.sspr
@@ -411,7 +453,10 @@ def test_perf_sspr_upper():
         dtypes=[torch.float32],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dspr
@@ -425,7 +470,10 @@ def test_perf_dspr():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_LOWER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)
 
 
 @pytest.mark.dspr
@@ -439,4 +487,7 @@ def test_perf_dspr_upper():
         dtypes=[torch.float64],
         uplo=CUBLAS_FILL_MODE_UPPER,
     )
-    run_correctness_then_benchmark(bench)
+    if IS_ASCEND:
+        bench.run()
+    else:
+        run_correctness_then_benchmark(bench)

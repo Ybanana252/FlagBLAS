@@ -14,6 +14,7 @@
 
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 from queue import Queue
@@ -27,7 +28,6 @@ UNSUPPORT_FP64 = [
     vendors.CAMBRICON,
     vendors.ILUVATAR,
     vendors.KUNLUNXIN,
-    vendors.MTHREADS,
     vendors.AIPU,
     vendors.ASCEND,
     vendors.TSINGMICRO,
@@ -94,6 +94,8 @@ class DeviceDetector(object):
             return self._get_vendor_from_sys()
 
     def _get_vendor_from_quick_cmd(self):
+        if shutil.which("ppu-smi") is not None:
+            return "thead"
         cmd = {
             "cambricon": "mlu",
             "mthreads": "musa",
@@ -115,6 +117,8 @@ class DeviceDetector(object):
         return None
 
     def _get_vendor_from_env(self):
+        if os.environ.get("PPU_SDK") or os.environ.get("PPU_HOME"):
+            return "thead"
         device_from_evn = os.environ.get("BLAS_VENDOR")
         return None if device_from_evn not in self.vendor_list else device_from_evn
 
