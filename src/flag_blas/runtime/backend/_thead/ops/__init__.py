@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .bfgemm import bfgemm, bgemm
+from .cgemm import cgemm
 from .dgemm import dgemm
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import dger, sger, zgerc, zgeru
@@ -29,6 +30,7 @@ from .tbsv import ctbsv, dtbsv, stbsv, ztbsv
 from .tpmv import dtpmv
 from .tpsv import ctpsv, dtpsv, stpsv, ztpsv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
+from .zgemm import zgemm
 
 __all__ = [
     "sgemm",
@@ -36,6 +38,8 @@ __all__ = [
     "hgemm",
     "bfgemm",
     "bgemm",
+    "cgemm",
+    "zgemm",
     "sgemv",
     "dgemv",
     "hgemv",
