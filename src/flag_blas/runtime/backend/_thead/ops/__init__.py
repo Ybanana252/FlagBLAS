@@ -18,8 +18,8 @@ from .dgemm import dgemm
 from .gemv import bfgemv, cgemv, dgemv, hgemv, sgemv, zgemv
 from .ger import dger, sger, zgerc, zgeru
 from .group_gemm import group_bfgemm, group_hgemm, group_tf32gemm
-from .hgemm import hgemm
 from .hemv import chemv, zhemv
+from .hgemm import hgemm
 from .sgemm import sgemm
 from .spmv import dspmv, sspmv
 from .spr import dspr, sspr

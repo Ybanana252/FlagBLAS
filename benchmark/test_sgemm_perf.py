@@ -41,7 +41,9 @@ def test_perf_sgemm_nn():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -61,7 +63,9 @@ def test_perf_sgemm_tn():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -81,7 +85,9 @@ def test_perf_sgemm_nt():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -101,5 +107,7 @@ def test_perf_sgemm_tt():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
