@@ -733,6 +733,51 @@ sp 估计用 v9 官跑同进程 torch 基线（8192³ NN 3.2994 / TN 3.0233 等�
 
 **结论**：转置税按预期下降（NN 路由 -1.2~-3.4%、TN 复合/路由 -1.1~-5.2%，转置内核带宽 811→~1070GB/s 级）；**但原 sp<0.8 的 NN/TN shape 无一个跨过 0.8**（最近 NN 4096³ 0.832、8192³ 0.790；NN-main 直路 512×16384 / 2048×11008 无转置税、不受益）。**0.8 线的剩余缺口在主内核（NT/NN 279–281TF vs torch/rocBLAS 333–368TF），属 fork 级（§10），非路由/拷贝可及**。
 
+### 9.4 尝试记录：NT 主内核 sched_latency 门控 = 负结果（dir5，2026-09-07）
+
+**动机**：NN 主内核的 `sched_latency`（mmac5-ds12/ds10，§5 v9 量化为 -2.0~-3.9%）若在 NT 主内核复现，NN/TN 路由 shape（只挂 kpack=2）可再抬 ~-3%，NN 4096³ (0.832) 即可跨 0.85。
+
+**方法**：env 门控（`FLAGGEMS_NT_SCHED=mmac5-ds12`）对 NT 主内核全部 launch 注入，官跑 NT/NN/TN 三套件（全 PASS rc=0，log `dir5_official_sched_{nt|nn|tn}.log`），对照 §9.2 v12 基线。
+
+**结果**：
+- 旗舰 <0.8 shape 全部 **+0.0~+0.8% 微回退**（NT/NN/TN 8192³ +0.5%、8192×28672 +0.5~+0.8%、4096×24576 +0.3~+0.5%）；仅 NT 16384³ -2.05%（sp 1.594→1.621，无意义）；套件级 NT 26/37、NN 28/37、TN 30/37 回退（小 shape 波动 ±2-20% 噪声）。
+- **结论**：NN 主内核的 ds 收益**不在 NT 主内核复现**——NT 主内核已带 kpack=2、wait 结构不同（§10.1），sched hint 仅重排不增收；NN 4096³ 维持 0.832。**主内核 sched 类 knob 层面已穷尽**，后续主内核增益只剩 fork 级（§10.3.3-10.3.6，interleave/swizzle/unroll）。
+
+**产物**：env 门控已回滚（`bfgemm.py` 与 HEAD 一致）；探针脚本/日志留 `diag_scratch`。
+
+### 9.5 尝试记录：分块 n + 双流重叠转置 = 负结果（dir6，2026-09-08）
+
+**动机**：NN-route 的 B(k,n)→Bt(n,k) 全局副本（§7 方向①）在旗舰 shape 占 ~7% 延迟（NN 8192³ trans 0.315ms/总 4.25ms）。若按 n 分块并在侧流上提前转置第 i+1 块、主流跑第 i 块主内核，理论上可隐藏转置税。
+
+**方法**：`bfgemm.py` 加 env 门控 `FLAGGEMS_NN_CHUNK`，NN-route 分支内把 n 切成 chunk，双流（`torch.cuda.Stream`）+ event 同步做流水重叠；探针逐档剥离（入口 vs 裸调、do_bench vs 绝对计时）。
+
+**关键坑（已备案）**：`tensor + int`（`B + c0`）在 torch 是**元素级加法**而非指针偏移——会拷成新张量，往副本写导致真实 `C` 永不被写（relerr=1.00、C≈0）。偏移必须用切片视图（`B[:, c0:c0+cn]` / `C[:, c0:c0+cn]`）。
+
+**结果**（4096³，dir6h 同步绝对计时，数值均 PASS relerr=2.91e-3）：
+- 分解：trans_full=0.148ms；main_full=0.767ms；顺序整块 seq_full=0.858ms；
+- 双流 chunk=n：34.85ms；chunk=n/2：1.42ms —— **双双劣于顺序 0.858ms**；
+- 可接受的 2048×12288×4096 上 chunked 亦无收益（1.2~1.7ms vs 入口整块 1.00ms）。
+- 方法学：do_bench 对 side-stream 场景不可复现（同一 chunk 档一边 1.4ms、另一边 30ms），改用 `perf_counter + synchronize` 绝对计时取信。
+
+**结论**：双流重叠在 Hygon/DTK 上无效——stream 调度/同步开销大于可隐藏的转置量，且 4096³ 上转置本身仅 0.148ms（总 0.86ms 的 17%），不构成主要可隐藏开销。**A（sched，§9.4）+ B（双流转置）两路由级子方案均证伪**；`bfgemm.py` 已回滚（与 HEAD 一致，`git diff` 空）。
+
+### 9.6 尝试记录：NN 直路 tile 扫描 + NT 主内核 kp2 下 tile 重扫 = 均无增益（dir7/dir7b，2026-09-08）
+
+**动机**：A/B 路由级方案失败后，FlagBLAS 内剩余两个未覆盖杠杆：(a) NN 直路残留 2 shape（512×16384×4096 sp 0.646、2048×11008×4096 sp 0.733，均未被路由/编译对齐充分覆盖）的 tile 扫描；(b) NT 主内核自 v11 起无条件 kpack=2，但 warm-DB config (256,256,BK64,w16,s2) 是 kp1 时代 tune 的——kp2 改变编译产物后最优 tile 是否漂移从未验证（NT 主内核是 NN-route 7 + TN-route 6 个 <0.8 shape 的共享工作马）。
+
+**方法**：直调 jit_function（绕过 libtuner 二次调度），固定编译参数（kp2/sched 显式传），do_bench median。环境坑：hcu 后端需 `ROCM_PATH=/opt/dtk`（name 为 dtk 才走 `aillvm/bin/clang-18`；指向 dtk-25.04 时退化到 hip 后端 clang-15，bf16 mmac 编译即崩 `Cannot select fp_to_bf16`）。
+
+**结果 (a) NN 直路 2 shape，17 config 扫描**（torch 参考同进程）：
+- 512×16384×4096：最快 (256,256,BK64,w8,s2) 0.4883ms/140.7TF，torch 0.2283ms/301TF；官跑 0.4389ms/156TF（ds12）仍优于全部扫描 config —— 官跑已近最优，且主内核仅 torch 的 52%，tile 无解；
+- 2048×11008×4096：最快 (256,256,BK64,w8,s2) 1.2088ms/152.8TF，torch 0.5634ms/327.8TF；官跑 0.9712ms/212TF（kp2+ds10）远优 —— 编译对齐（kp2/sched）贡献远大于 tile，tile 方向已穷尽。
+
+**结果 (b) NT 主内核 kp2 下 17 config 重扫**（数值门 1024³ relerr 2.8e-3 全过）：
+- 8192³：生产 (256,256,BK64,w16,s2) 3.9461ms/278.6TF **最优**（第二 4.3614ms/252.1TF 差 9.5%）；
+- 8192×28672×8192：生产同 config 13.6872ms/281.2TF **最优**（第二差 8.6%）；
+- 直调值与官跑命中完全一致（3.946 vs NT 8192³ 3.9471）→ warm-DB config 在 kp2 下无漂移。
+
+**结论**：FlagBLAS 内（不改 flagtree/其它仓库）的 kernel/config/路由层杠杆至此全部验证完毕：路由（net 最大）、转置 tile（128×128w8 近优）、编译对齐（kp2/sched 按 shape 落地）、A/B 路由子方案（负）、NN 直路 tile（无解）、NT kp2 tile 重扫（无漂移）。NN/TN <0.8 残差的本质是主内核 vs rocBLAS 的调度/发射差（NN 主内核仅 torch 的 52~65%、NT 主内核 86%），属 §10 fork 级编译问题；在不动 flagtree 的约束下无法再推进。
+
 ## 10. NN/TN 侧瓶颈分析与 fork 级重构方案设计（方向③，2026-09-07）
 
 > **文档属性声明**：本章为**纯方案文档**——只成文 fork 级重构的设计、挂钩点、验收协议与里程碑。按用户约束：**不进行任何编译层（flagtree fork C++ pass / DTK-aiLLVM / 汇编器）实际代码修改**，执行需另行立项。分析为 v11 官跑 + SASS 实测口径（已定稿）；Phase 1「现有管道试射」已完成，负结果见 §10.3.1。
@@ -775,7 +820,7 @@ sp 估计用 v9 官跑同进程 torch 基线（8192³ NN 3.2994 / TN 3.0233 等�
 
 #### 10.3.1 Phase 1 已完成：现有管道试射（负结果 = fork 前置证实）
 
-在现有管道（不改内核/不 fork）对 `mmac_layout_force` ∈ {2 interleave, 4 interleave+transpose} 及 kp2 组合，NT/NN 主内核 × 4 旗舰 shape（`dir3_phase1_layout_probe`）全部 **HSACOError 编译失败**——DTK gfx936 汇编器逐条报 "The lit and lts field not support on this GPU."（~50+ 处，与 3 transpose 同根因）。base/kp2 基线同列复现（nt_8192 base 4.1021ms、kp2 -3.56/-3.88/-3.89/-4.46%，与 §9 v11 官跑一致）。**结论：Phase 1 现成开关试尽且不可用**——"双累加器链/片段布局对齐"必须经 fork 修复（§10.3.3）后才能触达；sched "tensile" variant 同属 fork 新增，不在现有管道。
+在现有管道（不改内核/不 fork）对 `mmac_layout_force` ∈ {2 interleave, 4 interleave+transpose} 及 kp2 组合，NT/NN 主内核 × 4 旗舰 shape（`dir3_phase1_layout_probe`）全部 **HSACOError 编译失败**——DTK gfx936 汇编器逐条报 "The lit and lts field not support on this GPU."（~50+ 处，与 3 transpose 同根因）。base/kp2 基线同列复现（nt_8192 base 4.1021ms、kp2 -3.56/-3.88/-3.89/-4.46%，与 §9 v11 官跑一致）。**结论：Phase 1 现成开关试尽且不可用**——"双累加器链/片段布局对齐"必须经 fork 修复（§10.3.3）后才能触达；sched "tensile" variant 同属 fork 新增，不在现有管道。**该结论已在 §10.8 扩展为编译选项全覆盖复核（含 wasp/wdra、use_buffer_ops、use_in_thread_transpose 的零/负结果），并作为止损依据。**
 
 #### 10.3.2 Phase 0 —— Tensile 目标形态档案（一切改动前）
 
@@ -861,3 +906,70 @@ sp 估计用 v9 官跑同进程 torch 基线（8192³ NN 3.2994 / TN 3.0233 等�
 - Tensile obj：`diag_scratch/locate_tensile_obj.py`、`tensile_bf16_obj.co`、`rocblas_co/`、`rocblas_co2/obj_*.co`、`scan_co_symbols.py/_out.txt`、`carve_rocblas_co.py`。
 - 探针：`dir2_knob_probe.py/.log`（kpack 等）、`dir3_phase1_layout_probe.py/.log`（mmac_layout_force 2/4 负结果）、`dir2_knob_probe` 同族脚本。
 - 管道参考：`site-packages/triton/backends/hcu/compiler_hcu.py`（HIPOptions 44–88、pass 序 430–520）。
+
+---
+
+### 10.8 非 fork 杠杆穷尽复核（2026-10-16）——**止损依据**
+
+> **本节性质**：结论性复核。把 §10.3.1 的「现成开关试尽」从 `mmac_layout_force` + `kpack` 两项扩展为**编译选项全覆盖**，用单次实测补齐，作为「§10.3.0 前置①（fork 源码 + DTK(ai)LLVM 构建链）未满足时不启动 fork」的止损判据。
+>
+> **结论**：**在不改编译层的前提下，bfgemm 的 <0.8 残余无法推到 ≥0.8。**
+
+#### 10.8.1 本轮新增试射（后端已暴露、bfgemm 从未使用的编译选项）
+
+**方法**：运行时把选项注入 NN/路由主内核的 launch kwargs（monkeypatch `_nn_kernel_kwargs`，覆盖 NN 直路与「路由到 NT 主内核」两条路），同进程对比 **flag 绝对耗时自比**；脚本 `diag_scratch/bf_wasp_probe.py`、`diag_scratch/bf_opt_probe.py`。
+
+| 选项 | 2048×11008×4096 (NN 直路) | 512×16384×4096 (NN 直路) | 判定 |
+|---|---|---|---|
+| base（现生产） | 0.9704 ms | 0.4417 ms | — |
+| `wasp_enabled=True` | 0.9711 (−0.1%) | 0.4412 (−0.0%) | **无效** |
+| `wasp_enabled=True, wdra_enabled=True` | 0.9712 (−0.1%) | 0.4417 (−0.1%) | **无效** |
+| `wdra_enabled=True`（单独） | 0.9710 (−0.1%) | 0.4417 (−0.1%) | 无效 |
+| `wasp_num_load_warps=4, wasp_num_mma_warps=4` | 0.9707 (−0.0%) | 0.4419 (−0.2%) | 无效 |
+| `use_buffer_ops=True` | 0.9703 (+0.0%) | 0.4419 (−0.0%) | **无效（已是默认）** |
+| `use_buffer_ops=False` | **1.5167 (−36.0%)** | **2.4111 (−81.7%)** | 反向灾难 |
+| `use_in_thread_transpose=True` | **1.0608 (−8.5%)** | **0.4959 (−10.9%)** | 反向 |
+| `use_in_thread_transpose=False` | 0.9704 (+0.0%) | 0.4412 (+0.1%) | 已是默认 |
+
+路由 shape（2048×4096×11008、2048×12288×4096）上上述全部变体 ≈ base（±0.3% 噪声带）。
+
+**方法学注**：同一进程内 `do_bench` 先测 flag 后测 torch 基线，会因时钟抬升使 **torch 基线偏快 13–21%**（本轮复核观测：8192³ torch 2.863 vs §9.2 的 3.298、4096³ 0.489 vs 0.601），故本节一律只用 **flag 绝对耗时自比**；绝对 sp 只引用 §9.2 官方口径。同时复核到 flag 耗时与 §9.2 逐项吻合（8192³ 4.176 vs 4.175、4096³ 0.721 vs 0.722、4096×24576×8192 6.801 vs 6.820），确认该口径可用。
+
+#### 10.8.2 全量非 fork 杠杆清单（含历史，均已有实测）
+
+| 杠杆 | 归属层 | 状态 / 量化 | 出处 |
+|---|---|---|---|
+| tune pool / tile 尺寸扫描 | config | 无增益 | §9.6 (dir7/dir7b) |
+| `sched_latency` | 编译选项 | 仅 ±1–3%；可用值只到 `ds10` | §5–§9 + 本节 10.8.3 |
+| `kpack=2` | 编译选项 | 已生产化并按 shape 门控（部分 shape 反向） | §9 |
+| NN→NT / TN→NT 路由（transB） | 路由 | 已生产化；未入列 2 shape 实测**净亏**（+49.9% / +1.4%） | §7/§8/§8 注释 |
+| 双流重叠转置、分块 n | 调度 | 负结果 | §9.5 (dir6) |
+| pad 阈值（1023³ 等小奇数） | 路由 | 强 pad 全线灾难（0.061→0.20 ms） | §3.4 |
+| `matrix_instr_nonkdim=16` | 编译选项 | 无效果 | §9 |
+| `mmac_layout_force∈{2,3,4}` | 编译选项 | **汇编器直接拒绝**（gfx936 不支持 lit/lts 字段） | §10.3.1 |
+| `wasp_enabled` / `wdra_enabled` / `wasp_num_*` | 编译选项 | **零效果** | 本节 10.8.1 |
+| `use_buffer_ops` | 编译选项 | 默认已最优（置 False 灾难） | 本节 10.8.1 |
+| `use_in_thread_transpose` | 编译选项 | 默认已最优（置 True 反向） | 本节 10.8.1 |
+
+即：**后端 HIPOptions 中所有与调度/布局/访存相关的选项已逐个试过，默认编译路径即当前最优**；唯一有正期望的相关通路（`mmac_layout_force`）被 gfx936 汇编器前置阻断。
+
+#### 10.8.3 同轮确认：`sched_latency` 可用值收窄（影响 §5/§6/§9 的 ds12 结论）
+
+- `mmac5-ds12` / `mmac5-ds14` **只存在于本地打过 patch 的 triton 构建**（`/usr/local/lib/python3.10/dist-packages/...`，较上游多 71 行，含一批 "probe-only candidates"）。
+- venv（`py310`，FlagBLAS 实际运行环境）的 `triton/backends/hcu/compiler_hcu.py` 与 FlagTree 上游源码 `third_party/hcu/backend/compiler_hcu.py` **逐字节一致**，白名单仅 `mmac5-ds6` / `mmac5-ds10`；传入其余值直接 `ValueError: Unsupported scheduling latency`。
+- 因此已把 `_NN_SCHED_BY_SHAPE` 中 7 个 `ds12` 条目回落为 `ds10`（[bfgemm.py](../../src/flag_blas/runtime/backend/_hygon/ops/bfgemm.py)）。**§5/§6/§9 中 ds12 的 −3.5~−3.9% 结论不再适用**，相关 shape 的实测量级需以官方协议重跑为准（其中 4096³ / 2048×11008×4096 两档历史实测 ds10 反而优于 ds12）。
+
+#### 10.8.4 剩余 <0.8 清单（官方口径 §9.2，止损失败集）
+
+- **NN（10 例）**：1023³ 0.767、512×16384×4096 0.646、2048×11008×4096 0.733、2048×4096×11008 0.692、2048×12288×4096 0.732、4096³ 0.832、8192³ 0.790、4096×24576×8192 0.695、4096×8192×28672 0.661、8192×28672×8192 0.736
+- **TN（6 例）**：4096³ 0.686、2048×11008×4096 0.681、2048×12288×4096 0.679、8192³ 0.686、4096×24576×8192 0.666、8192×28672×8192 0.706
+- **NT / TT：无 <0.8**（min 0.843 @NT 1023³、0.994 @TT 511³）
+
+缺口归因（§10.1/§10.2 不变）：**主内核发射形态差 10–22% + 转置税 ~7%**，SASS 三项 `v_perm` / `wait` / `max_consec` 在 config 层无对应旋钮。
+
+#### 10.8.5 止损判据与重启条件
+
+- **判据**：① 病根三项（v_perm / wait / max_consec）无 config 层旋钮；② 唯一相关通路 `mmac_layout_force` 被汇编器拒；③ 后端全部相关 HIPOptions 已试尽（本节 10.8.2）。
+- **决策**：在 §10.3.0 前置①（FlagTree fork C++ 源码 + DTK(ai)LLVM 构建链可重编）满足前，NN/TN 上述 16 例 **列为已知缺口**，**不再投入非 fork 试验**；§10.5 的 M1–M4 保持为设计态不启动。
+- **重启条件**：fork 源码可在本机重编 → 立即启动 M1（lit/lts 修复），验收口径同 §10.4。
+- **副产品**：本节 10.8.1 的负结果同时**收窄了 §10.3.4「双累加器链」的现成替代路径**——warp specialization（wasp/wdra）本可作为其非 fork 近似，实测零收益，进一步支持该杠杆必须走 fork。
