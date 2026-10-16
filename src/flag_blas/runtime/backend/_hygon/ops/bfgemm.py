@@ -50,20 +50,22 @@ _TN_TRANS_BLOCK_K = 128
 
 # ---- 16 大 shape 编译器对齐 (2026-09-07): NN 主内核 sched_latency per-shape 门控 ----
 # flagtree clang 延迟布局 (-mmac-latency=5 + -ds-load-store-latency) 收益随生产 tile 分群:
-#   (256,256,BK64,w8/s2) 大 tile shape -> mmac5-ds12, 实测 -3.6~-3.9% (NN 直路与
-#   TN A^T 复合路径同源, 均落在本 NN 主内核上, 见 probe mmac_tncomp_probe 2026-09-07);
-#   (128,256,BK32,w4/s2) tile (4096^3 / 2048x11008x4096) -> mmac5-ds10 -2.0~-2.3%,
-#   ds12 仅 -1.0~-1.1% (调度面不同, 不能一刀切)。
+#   (256,256,BK64,w8/s2) 大 tile shape 原按 mmac5-ds12 定档 (实测 -3.6~-3.9%);
+#   但 mmac5-ds12/-ds14 只存在于本地打过 patch 的 triton 构建, FlagTree 上游后端
+#   (third_party/hcu/backend/compiler_hcu.py) 的 sched_latency 白名单只有
+#   mmac5-ds6 / mmac5-ds10 -> 生产侧统一回落到 mmac5-ds10 (其余值上游会直接
+#   ValueError: Unsupported scheduling latency)。
+#   (128,256,BK32,w4/s2) tile (4096^3 / 2048x11008x4096) -> mmac5-ds10 -2.0~-2.3%。
 # 测量以生产 config (与 v8 warm DB 一致) 直调, base 对齐 v8 官跑 ±0.3%。其余 shape
 # (pad / fused-Y / direct-TN / NT / TT) 不触碰, 保持默认调度零风险。
 _NN_SCHED_BY_SHAPE = {
-    (8192, 8192, 8192): "mmac5-ds12",
-    (4096, 24576, 8192): "mmac5-ds12",
-    (8192, 28672, 8192): "mmac5-ds12",
-    (4096, 8192, 28672): "mmac5-ds12",
-    (2048, 4096, 11008): "mmac5-ds12",
-    (2048, 12288, 4096): "mmac5-ds12",
-    (512, 16384, 4096): "mmac5-ds12",
+    (8192, 8192, 8192): "mmac5-ds10",
+    (4096, 24576, 8192): "mmac5-ds10",
+    (8192, 28672, 8192): "mmac5-ds10",
+    (4096, 8192, 28672): "mmac5-ds10",
+    (2048, 4096, 11008): "mmac5-ds10",
+    (2048, 12288, 4096): "mmac5-ds10",
+    (512, 16384, 4096): "mmac5-ds10",
     (4096, 4096, 4096): "mmac5-ds10",
     (2048, 11008, 4096): "mmac5-ds10",
 }
