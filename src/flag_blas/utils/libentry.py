@@ -731,6 +731,19 @@ class LibEntry(triton.KernelInterface):
                 spec_args.append(val)
                 k_args[p.name] = val
 
+        # use_in_thread_transpose / use_buffer_ops are Triton compilation options (HIPOptions),
+        # not kernel arguments, so they do not enter const_args; but different variants produce
+        # different compiled artifacts and must be included in entry_key, otherwise two launches
+        # of different variants with the same shape would hit the same cache and get mixed up.
+        # kpack (HIPOptions field, NT optimization measured kpack=2 effective) also affects the
+        # compiled artifact and must be included in entry_key, otherwise kp1/kp2 launches of the
+        # same shape would share a compilation cache.
+        # num_warps / num_stages / num_ctas / maxnreg are covered by the tuple appended to entry_key below.
+        for _opt_name in ("use_in_thread_transpose", "use_buffer_ops", "kpack"):
+            _opt_val = kwargs.get(_opt_name, None)
+            if _opt_val is not None:
+                const_args = const_args + [(_opt_name, _opt_val)]
+
         # Launch params (num_warps / num_stages / num_ctas / maxnreg) change
         # codegen (warp count, pipeline stages, CTA layout) and register
         # allocation, but they reach run() via kwargs and are NOT part of

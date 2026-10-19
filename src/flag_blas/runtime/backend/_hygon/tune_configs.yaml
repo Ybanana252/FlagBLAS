@@ -2315,3 +2315,263 @@ group_tf32gemm:
   - META: {NUM_WM: 14, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 16, USE_BP: 1, PIPE_STAGES: 2, UNROLL: 1}
     num_warps: 16
     num_stages: 2
+
+sgemm_nn_hygon:
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 256, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 16, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 5
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 1}
+    num_warps: 16
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # v1.12: 4096^3 measured 3.6% faster than (64,64,w4,s2) (2796.6 vs 2900.9us, 3-round official protocol)
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+sgemm_hygon:
+  # v2.2 (2026-08-30): pool trimmed to 7 selected configs (winners of the full 37-shape sweep for tn/nt/tt).
+  # Large/square shapes (8192^3/16384^3/8192x28672x8192/2048x2048x16384) -> 256x256 w16;
+  # medium shapes (4096^3/1024^3) -> 128x64 w8 or 64x128 w8; tn square shapes prefer 128x128 w8 s3;
+  # thin/long-N shapes (32768x1024x1024/256x8192x2048) -> 128x256 w8 or 64x64 w4.
+  # v2.8 (2026-08-31): added 256x256 GROUP_M=8 (the original pool only had GROUP_M=1). GROUP_M determines
+  # the L2 scheduling of tiles along the M direction: for nt/tt large shapes, measured G8 is far better than G1 (16384^3 nt direct
+  # 198.7->169.5ms, tt 165.2->161.8ms), the tuner selects per shape, other shapes unchanged.
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 1}
+    num_warps: 16
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
+bfgemm_nn: &bfgemm_nn_hygon_configs
+  # v1: Hygon gfx936 bfgemm NN pool. Previously Hygon had no bfgemm_* section and fell back to the NVIDIA default pool
+  # (BK=64/128, stages 3-6); on gfx936 (<96KB smem) many shapes could only select suboptimal small tiles,
+  # 2048^3 NN main only ~77TF. This section = the original 9 NVIDIA configs (keeps TT variants from regressing, superset) +
+  # measured hygon winning configs (BK=32/64, s2, w4-16; 2048^3 main 222.6->167us -25%,
+  # 4096^3 1352->1040us -23%). libtuner selects the best per shape from the union, no regression risk.
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 128, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 4
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 4
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 4
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 6
+  - META: {BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 64, GROUP_M: 4}
+    num_warps: 4
+    num_stages: 4
+  # --- hygon measured winners (2026-09-03 raw sweep, do_bench median) ---
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # --- v2/v3 (2026-09-04): full-protocol measured pool additions for large/thin-medium shapes ---
+  # after the additions, the v3 official run on large square gained another step: the added (256,256,BK64,w8) makes 8192^3 7.53->5.54ms
+  # (~198TF; the best in the v2 pool (256,256,BK32,w16) is only ~146TF), a raw sweep of 20+ configs found none above
+  # 199TF. The residual gap is at the instruction issue level (Triton bf16 dot = v_mmac_f32_16x16x16_bf16
+  # 16x16x16 mmac, rocBLAS Tensile wider mfma ~333TF/s), config/tile already at the limit;
+  # the other added configs target thin/medium/non-square shapes of NN/NT/TN-composite/TT (flag side -5~-33%).
+  # (32,32,BK64,w4): square/small shapes with m or n=64 (64x512x512 16.0->10.7us, 512x64x512 15.4->11.0us)
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (32,64,BK32,w4): 511^3 24.6->22.7us
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (128,256,BK32,w4): 256x8192x2048 95.8->88.2us, 2048x11008x4096 1.431->1.039ms, 4096^3 1.041->0.816ms
+  - META: {BLOCK_M: 128, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (256,128,BK32,w4): 8192x256x2048 95.2->91.0us (mirrored pair)
+  - META: {BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 2
+  # (256,256,BK32,w8): 2048^3 166.1->128.5us (-23%)
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (256,256,BK64,w8): 2048x12288x4096 1.502->1.131ms, 2048x4096x11008 1.492->1.127ms,
+  # 512x16384x4096 0.574->0.455ms
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (128,128,BK32,w8): 4095^3 1.826->1.795ms
+  - META: {BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 8
+    num_stages: 2
+  # (256,256,BK64,w16): measured 7.17ms on large square (the w8 of the same tile above is better, 5.54ms);
+  # kept in the pool for autotune to trade off per shape
+  - META: {BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 16
+    num_stages: 2
+  # small shapes (511/1023 level) supplement: small blocks with more CTAs alleviate insufficient parallelism. 2026-09-06 do_bench
+  # (w200/r200) TN 511^3 sweep: (64,64,BK64,w4/w8) 0.0280 -> (64,32,BK64,w4,s3)
+  # 0.0272/-6% ((64,32) expands grid 8->16 CTAs), (32,64,BK32,w4,s3) 0.0274,
+  # (32,32,BK32,w2,s3) 0.0280. The four variants share the pool; autotune selects per shape.
+  - META: {BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 64, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_N: 64, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 32, GROUP_M: 8}
+    num_warps: 2
+    num_stages: 3
+
+# bfgemm_nt: Hygon gfx936 bfgemm NT direct kernel pool. Previously hygon had no bfgemm_nt section,
+# falling back to the NVIDIA default pool (BK128/s3-6 are outside the gfx936 smem limit, so many shapes only selected suboptimal
+# small tiles), the v4 official run NT large square was only 8192^3 7.18ms (sp 0.50), 16384^3 55.9ms (sp 0.93).
+# NT and NN share the same general level3 kernel (only the B tile read differs: with transb=T, B is physically (n,k)),
+# directly shares the bfgemm_nn pool (27 configs). 2026-09-05 official protocol (do_bench w1000/r100/
+# median) verified shape by shape: (256,256,BK64,w16,s2) 8192^3 -> 4.10ms (sp 0.87),
+# 16384^3 -> 32.8ms (sp 1.59), 4096x24576x8192 -> 6.30ms (sp 1.66), 8191^3 -> 9.45ms
+# (sp 0.54), etc., output bit-identical to the old pool; small shapes have autotune select small-tile configs, no fallback.
+bfgemm_nt: *bfgemm_nn_hygon_configs
+
+# bfgemm_tn: Hygon gfx936 bfgemm TN direct kernel pool. Previously hygon had no bfgemm_tn section,
+# falling back to the NVIDIA default pool (only 4 configs: (64,32,BK128,w8,s5)/(64,64,BK64,w4,s4)/
+# (128,128,BK64,w8,s6)/(128,128,BK64,w8,s3); s5/s6 exceed the gfx936 64KB smem limit and fail to compile,
+# only ~1-2 actually usable), many TN shapes could only select suboptimal tiles (v7 TN 8192^3 only 0.516 sp while
+# NN same shape 0.595, and 2048-level small shapes are all below the corresponding NN tiers). TN is the same general
+# level3 kernel as NN/NT (only the A tile read differs: with transa=T, A is physically (k,m)), directly shares the bfgemm_nn pool;
+# libtuner selects the best per shape from the union, enlarging the pool has no regression risk (only more choices).
+bfgemm_tn: *bfgemm_nn_hygon_configs
+
+# hgemm_nn / hgemm_nt / hgemm_tn: Hygon gfx936 hgemm dedicated pool.
+# Previously hygon had no hgemm_* sections and fell back to the NVIDIA default pool, so TN/TT variants had low absolute throughput
+# (hgemm report 2026-09-03: 8192^3 tn ~62 / tt ~76 TFLOPS, nn 105 / nt 154).
+# hgemm and bfgemm are both 2B dtype and share the same general level3 kernel and gfx936 resource constraints
+# (smem/VGPR), so the initial pool directly reuses the bfgemm_*_hygon pool (that pool contains the original 9 NVIDIA configs
+# as a superset, libtuner selects the best per shape, no regression risk vs the default pool). Later we can add/converge on
+# real hardware via fp16-specific sweeps.
+hgemm_nn: *bfgemm_nn_hygon_configs
+hgemm_nt: *bfgemm_nn_hygon_configs
+hgemm_tn: *bfgemm_nn_hygon_configs

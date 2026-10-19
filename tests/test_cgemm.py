@@ -1,8 +1,6 @@
-import cupy as cp
 import numpy as np
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas
 
 import flag_blas
@@ -11,13 +9,32 @@ from flag_blas.ops import CUBLAS_OP_C, CUBLAS_OP_N, CUBLAS_OP_T
 from . import accuracy_utils as utils
 from .conftest import TO_CPU
 
-CGEMM_SHAPES = [(32, 32, 32), (64, 64, 64), (127, 65, 33)]
+# Append 512^3: brings the "transpose composite" path of the hygon-specific
+# implementation (2*m*n*k >= 4<<24 and min(m,n) >= 64) into accuracy test coverage.
+CGEMM_SHAPES = [(32, 32, 32), (64, 64, 64), (127, 65, 33), (512, 512, 512)]
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from .hipblas_reference import get_hipblas_context, hipblas_cgemm
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
 
 
 def cublas_cgemm_reference(
     transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
 ):
     if m == 0 or n == 0:
+        return
+
+    if IS_HYGON:
+        # No cupy on the DTK side; use ctypes hipblasCgemm (complex fp32, the
+        # same convention as FlagBLAS's fp32 accumulation).
+        _, handle = get_hipblas_context(C)
+        hipblas_cgemm(
+            handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+        )
         return
 
     handle = cp.cuda.device.get_cublas_handle()
