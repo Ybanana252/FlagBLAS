@@ -7,6 +7,14 @@ import torch
 
 import flag_blas
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from tests.test_rotg import ROTG_COMPLEX_CASES_BY_DTYPE, ROTG_REAL_CASES
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if not IS_HYGON:
+    import cupy as cp
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
 
 CUBLAS_POINTER_MODE_DEVICE = 1
 
@@ -25,34 +33,32 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
-_cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-_cublas.cublasCreate_v2.restype = ctypes.c_int
-_cublas.cublasSetPointerMode_v2.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_cublas.cublasSetPointerMode_v2.restype = ctypes.c_int
+if not IS_HYGON:
+    _cublas = load_cublas()
+    _cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    _cublas.cublasCreate_v2.restype = ctypes.c_int
+    _cublas.cublasSetPointerMode_v2.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _cublas.cublasSetPointerMode_v2.restype = ctypes.c_int
 
-for _rotg_name in (
-    "cublasSrotg_v2",
-    "cublasDrotg_v2",
-    "cublasCrotg_v2",
-    "cublasZrotg_v2",
-):
-    _rotg_func = getattr(_cublas, _rotg_name)
-    _rotg_func.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    _rotg_func.restype = ctypes.c_int
+    for _rotg_name in (
+        "cublasSrotg_v2",
+        "cublasDrotg_v2",
+        "cublasCrotg_v2",
+        "cublasZrotg_v2",
+    ):
+        _rotg_func = getattr(_cublas, _rotg_name)
+        _rotg_func.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        _rotg_func.restype = ctypes.c_int
 
 
 def create_cublas_handle():
-    handle = ctypes.c_void_p()
-    status = _cublas.cublasCreate_v2(ctypes.byref(handle))
-    if status != 0:
-        raise RuntimeError(f"cuBLAS handle creation failed, error code: {status}")
+    handle = ctypes.c_void_p(cp.cuda.device.get_cublas_handle())
     status = _cublas.cublasSetPointerMode_v2(handle, CUBLAS_POINTER_MODE_DEVICE)
     if status != 0:
         raise RuntimeError(f"cuBLAS pointer mode setup failed, error code: {status}")
@@ -65,78 +71,98 @@ def as_cublas_handle(handle):
     return ctypes.c_void_p(handle)
 
 
-def cublas_rotg(a, b, c, s, handle=None):
-    if handle is None:
-        handle = create_cublas_handle()
-
+def gems_rotg(a, b, c, s, handle=None, c_func=None):
     if a.dtype == torch.float32:
-        func = _cublas.cublasSrotg_v2
+        flag_blas.srotg(a, b, c, s)
     elif a.dtype == torch.float64:
-        func = _cublas.cublasDrotg_v2
+        flag_blas.drotg(a, b, c, s)
     elif a.dtype == torch.complex64:
-        func = _cublas.cublasCrotg_v2
+        flag_blas.crotg(a, b, c, s)
     elif a.dtype == torch.complex128:
-        func = _cublas.cublasZrotg_v2
-    else:
-        raise TypeError(f"Unsupported dtype for rotg: {a.dtype}")
-
-    status = func(
-        as_cublas_handle(handle),
-        ctypes.c_void_p(a.data_ptr()),
-        ctypes.c_void_p(b.data_ptr()),
-        ctypes.c_void_p(c.data_ptr()),
-        ctypes.c_void_p(s.data_ptr()),
-    )
-    if status != 0:
-        raise RuntimeError(f"cuBLAS rotg execution failed, error code: {status}")
-    return a, b, c, s
-
-
-def gems_rotg(a, b, c, s, handle=None):
-    if a.dtype == torch.float32:
-        flag_blas.ops.srotg(a, b, c, s)
-    elif a.dtype == torch.float64:
-        flag_blas.ops.drotg(a, b, c, s)
-    elif a.dtype == torch.complex64:
-        flag_blas.ops.crotg(a, b, c, s)
-    elif a.dtype == torch.complex128:
-        flag_blas.ops.zrotg(a, b, c, s)
+        flag_blas.zrotg(a, b, c, s)
     else:
         raise TypeError(f"Unsupported dtype for rotg: {a.dtype}")
     return a, b, c, s
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_rotg(dtype):
+        symbol = {
+            torch.float32: "hipblasSrotg",
+            torch.float64: "hipblasDrotg",
+            torch.complex64: "hipblasCrotg_v2",
+            torch.complex128: "hipblasZrotg_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [ctypes.c_void_p] * 5
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_rotg_baseline(a, b, c, s, handle=None, c_func=None):
+        check_hipblas_status(
+            c_func(handle, a.data_ptr(), b.data_ptr(), c.data_ptr(), s.data_ptr()),
+            "hipBLAS ROTG",
+        )
+        return a, b, c, s
+
+    cublas_rotg = hipblas_rotg_baseline
+
+else:
+
+    def cublas_rotg(a, b, c, s, handle=None, c_func=None):
+        status = c_func(
+            as_cublas_handle(handle),
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(b.data_ptr()),
+            ctypes.c_void_p(c.data_ptr()),
+            ctypes.c_void_p(s.data_ptr()),
+        )
+        if status != 0:
+            raise RuntimeError(f"cuBLAS rotg execution failed, error code: {status}")
+        return a, b, c, s
 
 
 class RotgBenchmark(Benchmark):
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = [(1,)]
-        self.shape_desc = "scalar"
+    def set_more_shapes(self):
+        dtype = self.dtypes[0]
+        if dtype.is_complex:
+            return [
+                (a.real, a.imag, b.real, b.imag)
+                for a, b in ROTG_COMPLEX_CASES_BY_DTYPE[dtype]
+            ]
+        return ROTG_REAL_CASES
+
+    def record_shapes(self, *args, **kwargs):
+        result = super().record_shapes(*args, **kwargs)
+        # Scalar values describe the initial input, before in-place timing.
+        result[1]["scalar_case"] = self.scalar_case
+        return result
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = create_cublas_handle()
-        cases = (
-            [
-                (1.0 + 2.0j, 3.0 + 4.0j),
-                (0.0 + 0.0j, 1.0 + 0.0j),
-                (0.0 + 1.0j, 0.0 + 0.0j),
-                (-2.0 - 3.0j, -4.0 + 5.0j),
-                (1e-20 + 0.0j, 1.0 + 0.0j),
-                (1e20 + 1e20j, -1e20 + 1e20j),
-            ]
-            if cur_dtype.is_complex
-            else [
-                (3.0, 4.0),
-                (4.0, 3.0),
-                (-3.0, 4.0),
-                (-3.0, -4.0),
-                (0.0, -1.0),
-                (1.0, 0.0),
-                (0.0, 0.0),
-                (1e-20, 1.0),
-                (1.0, 1e-20),
-                (1e20, -1e20),
-            ]
-        )
-        for a_val, b_val in cases:
+        if IS_HYGON:
+            c_func = _resolve_hipblas_rotg(cur_dtype)
+        else:
+            handle = create_cublas_handle()
+            prefix = {
+                torch.float32: "S",
+                torch.float64: "D",
+                torch.complex64: "C",
+                torch.complex128: "Z",
+            }[cur_dtype]
+            c_func = getattr(_cublas, f"cublas{prefix}rotg_v2")
+        for shape in self.shapes:
+            if cur_dtype.is_complex:
+                if len(shape) != 4:
+                    raise ValueError(
+                        "Complex ROTG shapes must contain a.real, a.imag, b.real, b.imag"
+                    )
+                a_val = complex(shape[0], shape[1])
+                b_val = complex(shape[2], shape[3])
+            else:
+                if len(shape) != 2:
+                    raise ValueError("Real ROTG shapes must contain a, b")
+                a_val, b_val = shape
             a = torch.tensor([a_val], dtype=cur_dtype, device=self.device)
             b = torch.tensor([b_val], dtype=cur_dtype, device=self.device)
             real_dtype = (
@@ -146,10 +172,18 @@ class RotgBenchmark(Benchmark):
             )
             c = torch.zeros(1, dtype=real_dtype, device=self.device)
             s = torch.zeros(1, dtype=cur_dtype, device=self.device)
-            yield a, b, c, s, {"handle": handle}
+            if IS_HYGON:
+                _, handle = get_l1_hipblas_context(a)
+            kwargs = {"handle": handle, "c_func": c_func}
+            self.scalar_case = {"a": str(a_val), "b": str(b_val)}
+            yield a, b, c, s, kwargs
 
 
-@pytest.mark.rotg
+if IS_HYGON:
+    RotgBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.srotg
 def test_perf_srotg():
     run_correctness_then_benchmark(
         RotgBenchmark(
@@ -161,7 +195,7 @@ def test_perf_srotg():
     )
 
 
-@pytest.mark.rotg
+@pytest.mark.drotg
 def test_perf_drotg():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -175,7 +209,7 @@ def test_perf_drotg():
     )
 
 
-@pytest.mark.rotg
+@pytest.mark.crotg
 def test_perf_crotg():
     run_correctness_then_benchmark(
         RotgBenchmark(
@@ -187,7 +221,7 @@ def test_perf_crotg():
     )
 
 
-@pytest.mark.rotg
+@pytest.mark.zrotg
 def test_perf_zrotg():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")

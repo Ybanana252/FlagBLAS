@@ -15,7 +15,6 @@
 import ctypes
 import ctypes.util
 
-import cupy as cp
 import pytest
 import torch
 from scipy.linalg import blas as cpu_blas
@@ -30,6 +29,13 @@ from .accuracy_utils import (
     to_reference,
 )
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from .hipblas_reference import check_hipblas_status, get_hipblas_context
+else:
+    import cupy as cp
 
 
 def load_cublas():
@@ -46,7 +52,32 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
+_cublas = None if IS_HYGON else load_cublas()
+
+
+def hipblas_copy_reference(n, x, incx, y, incy):
+    if n <= 0:
+        return
+    symbol = {
+        torch.float32: "hipblasScopy",
+        torch.float64: "hipblasDcopy",
+        torch.complex64: "hipblasCcopy_v2",
+        torch.complex128: "hipblasZcopy_v2",
+    }[x.dtype]
+    library, handle = get_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(handle, n, x.data_ptr(), incx, y.data_ptr(), incy), symbol
+    )
 
 
 def cublas_copy_reference(n, x, incx, y, incy):
@@ -113,12 +144,21 @@ def copy_reference(n, x, incx, y, incy):
 
     ref_x = to_reference(x)
     ref_y = to_reference(y).clone()
-    cublas_copy_reference(n, ref_x, incx, ref_y, incy)
+    if IS_HYGON:
+        hipblas_copy_reference(n, ref_x, incx, ref_y, incy)
+    else:
+        cublas_copy_reference(n, ref_x, incx, ref_y, incy)
     return ref_y
 
 
 @pytest.mark.copy
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.scopy),
+        pytest.param(torch.float64, marks=pytest.mark.dcopy),
+    ],
+)
 @pytest.mark.parametrize("shape", COPY_SHAPES)
 def test_accuracy_copy_real(dtype, shape):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
@@ -135,15 +175,21 @@ def test_accuracy_copy_real(dtype, shape):
     ref_y = copy_reference(n, x, incx, ref_y, incy)
 
     if dtype == torch.float32:
-        flag_blas.ops.scopy(n, x, incx, y, incy)
+        flag_blas.scopy(n, x, incx, y, incy)
     else:
-        flag_blas.ops.dcopy(n, x, incx, y, incy)
+        flag_blas.dcopy(n, x, incx, y, incy)
 
     blas_assert_close(y[::incy][:n], ref_y[::incy][:n], dtype)
 
 
 @pytest.mark.copy
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.ccopy),
+        pytest.param(torch.complex128, marks=pytest.mark.zcopy),
+    ],
+)
 @pytest.mark.parametrize("shape", COPY_SHAPES)
 def test_accuracy_copy_complex(dtype, shape):
     if dtype == torch.complex128 and not flag_blas.runtime.device.support_fp64:
@@ -160,16 +206,22 @@ def test_accuracy_copy_complex(dtype, shape):
     ref_y = copy_reference(n, x, incx, ref_y, incy)
 
     if dtype == torch.complex64:
-        flag_blas.ops.ccopy(n, x, incx, y, incy)
+        flag_blas.ccopy(n, x, incx, y, incy)
     else:
-        flag_blas.ops.zcopy(n, x, incx, y, incy)
+        flag_blas.zcopy(n, x, incx, y, incy)
 
     blas_assert_close(y[::incy][:n], ref_y[::incy][:n], dtype)
 
 
 @pytest.mark.copy
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.scopy),
+        pytest.param(torch.float64, marks=pytest.mark.dcopy),
+        pytest.param(torch.complex64, marks=pytest.mark.ccopy),
+        pytest.param(torch.complex128, marks=pytest.mark.zcopy),
+    ],
 )
 def test_accuracy_copy_empty_tensor(dtype):
     if (
@@ -182,20 +234,26 @@ def test_accuracy_copy_empty_tensor(dtype):
     y = torch.empty(0, dtype=dtype, device=flag_blas.device)
 
     if dtype == torch.float32:
-        flag_blas.ops.scopy(0, x, 1, y, 1)
+        flag_blas.scopy(0, x, 1, y, 1)
     elif dtype == torch.float64:
-        flag_blas.ops.dcopy(0, x, 1, y, 1)
+        flag_blas.dcopy(0, x, 1, y, 1)
     elif dtype == torch.complex64:
-        flag_blas.ops.ccopy(0, x, 1, y, 1)
+        flag_blas.ccopy(0, x, 1, y, 1)
     else:
-        flag_blas.ops.zcopy(0, x, 1, y, 1)
+        flag_blas.zcopy(0, x, 1, y, 1)
 
     assert y.numel() == 0
     assert y.device == x.device
 
 
 @pytest.mark.copy
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.scopy),
+        pytest.param(torch.float64, marks=pytest.mark.dcopy),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_NONUNIT_PAIR_STRIDES)
 def test_accuracy_copy_different_n_with_stride_real(dtype, shape, incx, incy):
@@ -212,15 +270,21 @@ def test_accuracy_copy_different_n_with_stride_real(dtype, shape, incx, incy):
     ref_y = copy_reference(n, x, incx, ref_y, incy)
 
     if dtype == torch.float32:
-        flag_blas.ops.scopy(n, x, incx, y, incy)
+        flag_blas.scopy(n, x, incx, y, incy)
     else:
-        flag_blas.ops.dcopy(n, x, incx, y, incy)
+        flag_blas.dcopy(n, x, incx, y, incy)
 
     blas_assert_close(y[::incy][:n], ref_y[::incy][:n], dtype)
 
 
 @pytest.mark.copy
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.ccopy),
+        pytest.param(torch.complex128, marks=pytest.mark.zcopy),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_NONUNIT_PAIR_STRIDES)
 def test_accuracy_copy_different_n_with_stride_complex(dtype, shape, incx, incy):
@@ -237,8 +301,8 @@ def test_accuracy_copy_different_n_with_stride_complex(dtype, shape, incx, incy)
     ref_y = copy_reference(n, x, incx, ref_y, incy)
 
     if dtype == torch.complex64:
-        flag_blas.ops.ccopy(n, x, incx, y, incy)
+        flag_blas.ccopy(n, x, incx, y, incy)
     else:
-        flag_blas.ops.zcopy(n, x, incx, y, incy)
+        flag_blas.zcopy(n, x, incx, y, incy)
 
     blas_assert_close(y[::incy][:n], ref_y[::incy][:n], dtype)

@@ -137,7 +137,7 @@ class Benchmark:
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
         self.dtypes = dtypes if dtypes is not None else self.DEFAULT_DTYPES
-        self.metrics = self.DEFAULT_METRICS
+        self.metrics = list(self.DEFAULT_METRICS)
         self.shapes = self.DEFAULT_SHAPES
         self.shape_desc = self.DEFAULT_SHAPE_DESC
         self.shape_file = self.DEFAULT_SHAPE_FILES
@@ -169,7 +169,7 @@ class Benchmark:
                     f"Unsatisfied metric dependencies: {', '.join(unsatisfied_metrics)}"
                 )
 
-        self.to_bench_metrics = user_desired_metrics or self.metrics
+        self.to_bench_metrics = list(user_desired_metrics or self.metrics)
         if (
             hasattr(self, "set_more_metrics")
             and callable(getattr(self, "set_more_metrics"))
