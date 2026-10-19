@@ -10,7 +10,7 @@ def sgemm_nn_heur_even_k(args):
     return args["k"] % args["BLOCK_K"] == 0
 
 
-# tn/nt/tt (EVEN_* constexpr 内核) 复用同一套 EVEN 判定
+# tn/nt/tt (EVEN_* constexpr kernels) reuse the same EVEN checks
 def sgemm_xt_heur_even_m(args):
     return args["m"] % args["BLOCK_M"] == 0
 

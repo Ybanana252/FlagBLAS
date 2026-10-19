@@ -52,9 +52,9 @@ def cublas_bfgemm_reference(
         return
 
     if IS_HYGON:
-        # DTK hipBLAS 无可用 bf16 gemm 入口（hipblasGemmEx/_v2 全组合
-        # NOT_SUPPORTED / INVALID_ENUM，且无 legacy hipblasBgemm）；torch 的 bf16
-        # matmul 走 rocBLAS bf16 Tensile（fp32 累加），与 benchmark 基线同口径。
+        # No usable bf16 gemm entry point in DTK hipBLAS (all combinations of
+        # hipblasGemmEx/_v2 return NOT_SUPPORTED / INVALID_ENUM, and no legacy
+        # hipblasBgemm); torch bf16 matmul uses rocBLAS bf16 Tensile (fp32 accumulation), same as benchmark baseline.
         Aop = A.t() if transa == CUBLAS_OP_T else A
         Bop = B.t() if transb == CUBLAS_OP_T else B
         acc = Aop.to(torch.float32) @ Bop.to(torch.float32)

@@ -52,10 +52,10 @@ def cublas_hgemm_reference(
         return
 
     if IS_HYGON:
-        # DTK 侧无可用 fp16 gemmEx: hipblasGemmEx/Ex_v2 对 fp16 返回
-        # NOT_SUPPORTED/INVALID, 唯一入口 legacy hipblasHgemm 为低精度累加,
-        # 不能作为 fp32 累加契约的参考。这里改用设备端 fp32 matmul (fp32 累加)
-        # 作 oracle, 与非 hygon 的 cublas.gemmEx(compute=CUDA_R_32F) 语义一致。
+        # No usable fp16 gemmEx on the DTK side: hipblasGemmEx/Ex_v2 return
+        # NOT_SUPPORTED/INVALID for fp16, and the only entry point, legacy hipblasHgemm, uses low-precision accumulation,
+        # so it cannot serve as a reference for the fp32 accumulation contract. Use device-side fp32 matmul (fp32 accumulation)
+        # as the oracle instead, consistent with cublas.gemmEx(compute=CUDA_R_32F) on non-hygon.
         op_a = A if transa == CUBLAS_OP_N else A.t()
         op_b = B if transb == CUBLAS_OP_N else B.t()
         acc = torch.matmul(op_a.to(torch.float32), op_b.to(torch.float32))

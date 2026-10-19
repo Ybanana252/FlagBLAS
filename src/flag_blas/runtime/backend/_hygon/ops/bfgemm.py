@@ -13,16 +13,20 @@
 # limitations under the License.
 
 """
-Hygon DTK bfgemm 定制路径。
+Hygon DTK bfgemm custom path.
 
-TN (transa=T, transb=N) 下, A 的物理布局是 (k, m) 行主序, 直接 TN 主循环
-沿 k 步进时 A tile 的末维 (k) 跨度为 lda, 无法向量化/连续读, 带宽效率差
-(core-shape 基准 TN 变体 median 仅 ~0.63)。这里对 TN 采用 sgemm 同款思路:
-先用专用转置拷贝内核把 A(k,m) 落成 A^T(m,k) 连续缓冲区, 再走 NN 主内核,
-使 A 的加载与 NN 变体一致 (末维连续)。转置内核读写均按连续片段进行,
-开销远小于直接 TN 的跨步读损失。
+Under TN (transa=T, transb=N), the physical layout of A is (k, m) row-major. When
+stepping along k in the direct TN main loop, the last dimension (k) of the A tile
+has stride lda, so it cannot be vectorized/read contiguously and bandwidth
+efficiency is poor (core-shape benchmark TN variant median only ~0.63). Here the
+same idea as sgemm is used for TN: first use a dedicated transpose-copy kernel to
+materialize A(k,m) into a contiguous A^T(m,k) buffer, then run the NN main kernel,
+so that A loading matches the NN variant (contiguous last dimension). The
+transpose kernel reads and writes contiguous segments, so its overhead is far
+smaller than the strided-read penalty of direct TN.
 
-NN / NT / TT 与通用 level3 内核一致 (实测 median >=0.95, 不额外处理)。
+NN / NT / TT match the generic level3 kernels (measured median >=0.95, no extra
+handling).
 """
 
 import torch
@@ -40,24 +44,24 @@ from flag_blas.ops.level3.bfgemm import (
 )
 from flag_blas.runtime import torch_device_fn
 
-# TN 复合转置内核 tile; 末维(load 沿 m, store 沿 k)均连续可向量化
-# dir4 (2026-09-07): 转置 tile 64x64 w4 -> 128x128 w8。扫描 5 个 NN-route B 形状
-# (8192/28672/24576/12288/11008 x ...), 带宽 811-903GB/s -> 1027-1144GB/s
-# (+16~+34%, torch copy 天花板仅 ~610GB/s)。路由净收 NN ~2-5%、TN ~4-7%,
-# 仍全部 <0.8 (主内核差 = fork 级, 见报告 §10)。
+# TN composite transpose kernel tile; last dimension (load along m, store along k) is contiguous and vectorizable
+# dir4 (2026-09-07): transpose tile 64x64 w4 -> 128x128 w8. Swept 5 NN-route B shapes
+# (8192/28672/24576/12288/11008 x ...), bandwidth 811-903GB/s -> 1027-1144GB/s
+# (+16~+34%, torch copy ceiling only ~610GB/s). Net routing gain NN ~2-5%, TN ~4-7%,
+# all still <0.8 (main kernel gap = fork level, see report §10).
 _TN_TRANS_BLOCK_M = 128
 _TN_TRANS_BLOCK_K = 128
 
-# ---- 16 大 shape 编译器对齐 (2026-09-07): NN 主内核 sched_latency per-shape 门控 ----
-# flagtree clang 延迟布局 (-mmac-latency=5 + -ds-load-store-latency) 收益随生产 tile 分群:
-#   (256,256,BK64,w8/s2) 大 tile shape 原按 mmac5-ds12 定档 (实测 -3.6~-3.9%);
-#   但 mmac5-ds12/-ds14 只存在于本地打过 patch 的 triton 构建, FlagTree 上游后端
-#   (third_party/hcu/backend/compiler_hcu.py) 的 sched_latency 白名单只有
-#   mmac5-ds6 / mmac5-ds10 -> 生产侧统一回落到 mmac5-ds10 (其余值上游会直接
-#   ValueError: Unsupported scheduling latency)。
-#   (128,256,BK32,w4/s2) tile (4096^3 / 2048x11008x4096) -> mmac5-ds10 -2.0~-2.3%。
-# 测量以生产 config (与 v8 warm DB 一致) 直调, base 对齐 v8 官跑 ±0.3%。其余 shape
-# (pad / fused-Y / direct-TN / NT / TT) 不触碰, 保持默认调度零风险。
+# ---- 16 large shape compiler alignment (2026-09-07): NN main kernel sched_latency per-shape gating ----
+# flagtree clang latency layout (-mmac-latency=5 + -ds-load-store-latency) benefit groups by production tile:
+#   (256,256,BK64,w8/s2) large tile shapes were originally tiered by mmac5-ds12 (measured -3.6~-3.9%);
+#   but mmac5-ds12/-ds14 only exist in locally patched triton builds; the FlagTree upstream backend
+#   (third_party/hcu/backend/compiler_hcu.py) sched_latency whitelist only has
+#   mmac5-ds6 / mmac5-ds10 -> production side uniformly falls back to mmac5-ds10 (other values upstream directly raise
+#   ValueError: Unsupported scheduling latency).
+#   (128,256,BK32,w4/s2) tile (4096^3 / 2048x11008x4096) -> mmac5-ds10 -2.0~-2.3%.
+# Measured by calling the production config directly (consistent with v8 warm DB), base aligned with v8 official run ±0.3%. Other shapes
+# (pad / fused-Y / direct-TN / NT / TT) untouched, keep default scheduling zero risk.
 _NN_SCHED_BY_SHAPE = {
     (8192, 8192, 8192): "mmac5-ds10",
     (4096, 24576, 8192): "mmac5-ds10",
@@ -75,41 +79,41 @@ def _nn_sched_kwargs(m, n, k):
     sched = _NN_SCHED_BY_SHAPE.get((m, n, k))
     return {"sched_latency": sched} if sched else {}
 
-# ---- 方向② 落地 (2026-09-07): kpack=2 门控 (官跑量化见报告 §9) ----
-# HIPOptions.kpack 控制 bf16 点积操作数每 32bit 打包的 K 数 (默认 1)。kpack=2
-# (2-K/32bit 打包, 消 v_perm/降寄存器往返) 官跑全谱量化:
-#   * NT 主内核无条件: NN-route 7 dims -0.5~-3.5、TN-route 6 dims -0.3~-3.6、
-#     NT-native 大 shape -2.5~-3.8 (8192x28672x8192 sp 0.821->0.852 达标)、
-#     pad-odd (NN/TN/TT 8191^3/4097x8191x4095) -0.4~-3.1、小 shape 噪声内, 无回退;
-#   * NN 主内核 per-shape: 仅 (2048,11008,4096) (NN/TN 残留, k=11008 w4/ds10) -4.2~-4.5%;
-#   * 排除: NN 512x16384x4096 (w8/ds12) +4.1%、direct-TN 小 shape 1024^3 +22% /
-#     128x4096x1024 +34%、direct-TT 大 shape 4096x8192x28672 +4.5% / 2048x2048x16384
-#     +5.1% / 2048x4096x11008 +4.9% / 2048^3 +3.7% 回退 (direct-TT 按内核排除);
-#   * 其它编译旋钮出局: matrix_instr_nonkdim=16 无效果 (gfx936 bf16 仅 16x16x16),
-#     mmac_layout_force 0 数值错 (err 1.38) / 3 编译败 (lit/lts 不支持)。
+# ---- direction ② landed (2026-09-07): kpack=2 gating (official-run quantification see report §9) ----
+# HIPOptions.kpack controls how many K values are packed per 32bit for bf16 dot operands (default 1). kpack=2
+# (2-K/32bit packing, removes v_perm/reduces register round-trips) official-run full-spectrum quantification:
+#   * NT main kernel unconditional: NN-route 7 dims -0.5~-3.5, TN-route 6 dims -0.3~-3.6,
+#     NT-native large shapes -2.5~-3.8 (8192x28672x8192 sp 0.821->0.852 meets target),
+#     pad-odd (NN/TN/TT 8191^3/4097x8191x4095) -0.4~-3.1, small shapes within noise, no regression;
+#   * NN main kernel per-shape: only (2048,11008,4096) (NN/TN residual, k=11008 w4/ds10) -4.2~-4.5%;
+#   * excluded: NN 512x16384x4096 (w8/ds12) +4.1%, direct-TN small shapes 1024^3 +22% /
+#     128x4096x1024 +34%, direct-TT large shapes 4096x8192x28672 +4.5% / 2048x2048x16384
+#     +5.1% / 2048x4096x11008 +4.9% / 2048^3 +3.7% regression (direct-TT excluded per kernel);
+#   * other compiler knobs ruled out: matrix_instr_nonkdim=16 no effect (gfx936 bf16 only 16x16x16),
+#     mmac_layout_force 0 numerical error (err 1.38) / 3 compile failure (lit/lts unsupported).
 def _kp2_kwargs():
     return {"kpack": 2}
 
-# NN 主内核 kpack=2 白名单 shape (残留 NN 直路 + TN A^T 复合共用同一主内核)
+# NN main kernel kpack=2 whitelist shapes (residual NN direct path + TN A^T composite share the same main kernel)
 _NN_KP2_SHAPES = {(2048, 11008, 4096)}
 
 
 def _nn_kernel_kwargs(m, n, k):
-    """NN 主内核 launch kwargs: sched_latency 门控 + 方向② kpack 白名单。"""
+    """NN main kernel launch kwargs: sched_latency gating + direction ② kpack whitelist."""
     kw = _nn_sched_kwargs(m, n, k)
     if (m, n, k) in _NN_KP2_SHAPES:
         kw["kpack"] = 2
     return kw
 
 
-# ---- 方向① (2026-09-07): NN 大 shape B 转置一次 -> NT 主内核 ----
-# NN 布局 (A/B 均 k 末维) 在 tl.dot 主循环的调度/发射上吃亏, 同指令下 NT 布局
-# (B 读 (n,k) 末维连续) flag 低 16-23% (报告 §7 / probe dir1_ntroute 2026-09-07)。
-# 对 net 收益为正的 shape: 每次调用先 _bfgemm_tn_trans_kernel 把 B(k,n) 拷成
-# Bt(n,k) 连续缓冲 (与 _launch_pad_nt 同一条 NT 主内核路)。转置开销 0.07-0.31ms
-# 被主内核节约覆盖 (net -2.7~-17.4%)。例外: 512x16384x4096 (trans 0.31ms >
-# 主内核节约 0.09ms, net +49.9%) 与 2048x11008x4096 (net +1.4%) 净亏, 保留 NN
-# 主内核 + ds 门控。NT 主内核 config 复用 warm DB (v8 NT tune 段, 官跑命中)。
+# ---- direction ① (2026-09-07): transpose NN large-shape B once -> NT main kernel ----
+# NN layout (both A/B k last dim) loses on scheduling/issue in the tl.dot main loop; under the same instructions the NT layout
+# (B reads (n,k) with contiguous last dim) has a 16-23% lower flag (report §7 / probe dir1_ntroute 2026-09-07).
+# For shapes with positive net gain: each call first uses _bfgemm_tn_trans_kernel to copy B(k,n) into
+# a Bt(n,k) contiguous buffer (same NT main kernel path as _launch_pad_nt). Transpose overhead 0.07-0.31ms
+# is covered by main-kernel savings (net -2.7~-17.4%). Exceptions: 512x16384x4096 (trans 0.31ms >
+# main-kernel saving 0.09ms, net +49.9%) and 2048x11008x4096 (net +1.4%) are net losses, keep the NN
+# main kernel + ds gating. NT main kernel config reuses warm DB (v8 NT tune section, official run hits).
 _NN_NT_ROUTE_SHAPES = {
     (8192, 8192, 8192),
     (4096, 24576, 8192),
@@ -120,13 +124,13 @@ _NN_NT_ROUTE_SHAPES = {
     (2048, 12288, 4096),
 }
 
-# ---- 方向① TN 侧 (2026-09-07): Aᵀ 复合再叠加 transB -> NT 主内核 ----
-# TN 复合 (transA + NN 主内核) 把 NN 主内核换成 NT 主内核需补一次 transB
-# (B(k,n)->Bt(n,k)); transA 复合路径已付。net = 主内核差 - transB, §7 量化 6 dims
+# ---- direction ① TN side (2026-09-07): Aᵀ composite plus transB -> NT main kernel ----
+# The TN composite (transA + NN main kernel) switching to the NT main kernel requires an extra transB
+# (B(k,n)->Bt(n,k)); the transA composite path already pays. net = main-kernel gap - transB, §7 quantified 6 dims
 # -2.3~-16.4% (8192³ -16.42 / 8192x28672 -15.38 / 4096x8192x28672 -10.28 /
-# 4096x24576x8192 -9.87 / 4096³ -6.82 / 2048x12288x4096 -2.25)。2048x11008x4096
-# (+1.72% 净亏) 保持 NN 主内核 + ds; 2048x4096x11008 TN sp>=0.85 不入列。命中走
-# NT 主内核 (warm DB config, 不叠 ds 门控)。
+# 4096x24576x8192 -9.87 / 4096³ -6.82 / 2048x12288x4096 -2.25). 2048x11008x4096
+# (+1.72% net loss) keeps the NN main kernel + ds; 2048x4096x11008 TN sp>=0.85 is not included. Hits go
+# through the NT main kernel (warm DB config, no ds gating stacked).
 _TN_NT_ROUTE_SHAPES = {
     (8192, 8192, 8192),
     (4096, 24576, 8192),
@@ -148,8 +152,8 @@ def _bfgemm_tn_trans_kernel(
     BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    # src: A 物理 (k, m) 行主序, (k 行 stride=sr, m 列 stride=1)
-    # dst: A^T 物理 (m, k) 行主序, (m 行 stride=dr, k 列 stride=1)  -> dst = src^T
+    # src: A physical (k, m) row-major, (k row stride=sr, m col stride=1)
+    # dst: A^T physical (m, k) row-major, (m row stride=dr, k col stride=1)  -> dst = src^T
     pid = tl.program_id(0)
     ngrid_c = tl.cdiv(M, BC)
     pr = pid // ngrid_c
@@ -174,12 +178,12 @@ def _tn_use_composite(m, n, k):
     # and m*n*k >= 4e8.
     return min(m, n) >= 128 and m * n * k >= (4 << 27)
 
-# ---- TN Y 复合 (fused-Y) ----
-# 对 m >> n 的 TN shape, 直接 TN / A^T 复合都不理想: 这里转置小的 B(n,k) -> Bt(n,k)
-# 连续, 再以 NN 主循环算 C^T = Bt @ A (输出 (n,m)), 最终把 acc 转置直接写回 C(m,n)
-# (fused store, 免第二段转置内核)。实测 (8192,256,2048)/(16384,2048,2048)/
-# (32768,1024,1024)/(16384,512,4096) 达 1.00-1.42, (4096,128,1024) ~0.96-1.03。
-# 命中 shape 的 tile: n<=128 时 (BM=64,BN=128) 否则 (BM=128,BN=128); BK=64, w4, s2。
+# ---- TN Y composite (fused-Y) ----
+# For TN shapes with m >> n, neither direct TN nor the A^T composite is ideal: here transpose the small B(n,k) -> Bt(n,k)
+# contiguously, then use the NN main loop to compute C^T = Bt @ A (output (n,m)), and finally transpose acc and write it
+# directly back to C(m,n) (fused store, avoiding a second transpose kernel). Measured (8192,256,2048)/(16384,2048,2048)/
+# (32768,1024,1024)/(16384,512,4096) reach 1.00-1.42, (4096,128,1024) ~0.96-1.03.
+# Tile for hit shapes: (BM=64,BN=128) when n<=128 otherwise (BM=128,BN=128); BK=64, w4, s2.
 _TN_Y_SHAPES = {
     (8192, 256, 2048),
     (16384, 2048, 2048),
@@ -206,11 +210,11 @@ def _bfgemm_tn_y_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    # acc (n-tile x m-tile) = bt(n,k) @ a(k,m); 末维 (k 于 bt, m 于 a) 均连续。
-    # store 时转置 acc -> C(m,n) (m 行 stride ldc, n 列连续)。
+    # acc (n-tile x m-tile) = bt(n,k) @ a(k,m); last dims (k in bt, m in a) are both contiguous.
+    # store transposes acc -> C(m,n) (m row stride ldc, n column contiguous).
     pid = tl.program_id(0)
-    grid_m = tl.cdiv(m, BLOCK_N)  # C row tiles (over m), tile 高 = BLOCK_N
-    grid_n = tl.cdiv(n, BLOCK_M)  # C col tiles (over n), tile 宽 = BLOCK_M
+    grid_m = tl.cdiv(m, BLOCK_N)  # C row tiles (over m), tile height = BLOCK_N
+    grid_n = tl.cdiv(n, BLOCK_M)  # C col tiles (over n), tile width = BLOCK_M
     width = GROUP_M * grid_n
     group_id = pid // width
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
@@ -223,9 +227,9 @@ def _bfgemm_tn_y_kernel(
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < m
     mask_n = offs_n < n
-    # x = bt tile (n x k): 行 over n stride k
+    # x = bt tile (n x k): rows over n, stride k
     x_ptrs = bt_ptr + offs_n[:, None] * k + offs_k[None, :]
-    # y = a tile (k x m): 行 over k stride m
+    # y = a tile (k x m): rows over k, stride m
     y_ptrs = a_ptr + offs_k[:, None] * m + offs_m[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     is_full_m = (pid_m * BLOCK_N + BLOCK_N) <= m
@@ -293,35 +297,35 @@ def _bfgemm_tn_y_kernel(
 
 
 def _tn_y_tiles(m, n, k):
-    # Y 主内核 tile; n 很小 (<=128) 时需更小的 BM(=n 方向块) 才不吃亏
-    # ((4096,128,1024) 实测 (64,128) 31.4us vs (128,128) 45.0us)。
+    # Y main kernel tile; when n is very small (<=128) a smaller BM (=n-direction block) is needed
+    # ((4096,128,1024) measured (64,128) 31.4us vs (128,128) 45.0us).
     return (64, 128) if n <= 128 else (128, 128)
 
 
-# ---- odd / 非对齐布局的 pad 路径 ----
-# core-shape 表中 (m,n,k) 为奇数 (8191/4095/1023/511/4097x8191x4095 等) 时,
-# A/B/C 行起始地址 = row * ld * 2B, ld 奇数使行基址连 4B/8B 对齐都无法保证,
-# Triton 对 2D tile 行向量化 load/store 全面降窄, 大 shape 延迟膨胀 ~1.5-2x
-# (8191^3 NN 11.27ms vs 8192^3 5.54ms); 边界 tile 的 masked k-loop 再扣一档。
-# (诊断: /tmp/diag_kodd.py + diag_padfull.py, 2026-09-05; config 扫 27 项无解,
-# 确认为布局/掩码问题而非 tile 配置问题)
-# 修复: 输入 pad 到 (BLOCK_M/N=256, BLOCK_K=128) 整数倍缓冲 + mask-free 主
-# 内核; NN 顺带把 B(k,n) 转置成 Bt(n,k) 走 NT 主内核 (B 沿 k 列连续读, 同池
-# 实测快 ~25-30%: 8192^3 NN main 5.54ms -> NT main 4.10ms)。输出先写 pad C
-# 缓冲再裁回真实 C, alpha/beta 语义保持。pad 后以 (m_pad,n_pad,k_pad) 调
-# autotuner 内核, 与已调优对齐 shape (8192^3 等) 命中同一 tune 条目。
-_PAD_ALIGN_MN = 256  # 池内最大 BLOCK_M/BLOCK_N
-_PAD_ALIGN_K = 128  # 池内最大 BLOCK_K
-_PAD_BLK = 64  # 转置拷贝 tile 宽 BC (src n 向; 实测 odd 最优 64x128/w8)
-_PAD_TRANS_BLK = 128  # 转置拷贝 tile 高 BR (src k 向; k 行主序跨大 stride 读)
-# 小 odd shape (511/1023 级, 2mnk < _PAD_MIN_FLOPS) 不 pad: pad 需 4-5 个额外
-# kernel/拷贝 launch (~25us/次), 小 shape 上启动开销占比远大于 misalign 收益
-# (实验 2026-09-06: 1023^3 pad 后 0.20ms vs direct 0.06ms, 全线回退)。
-_PAD_MIN_FLOPS = 5.0e9  # 启用 pad 的 2*m*n*k 下界
+# ---- pad path for odd / misaligned layouts ----
+# When (m,n,k) in the core-shape table are odd (8191/4095/1023/511/4097x8191x4095 etc.),
+# the row start address of A/B/C = row * ld * 2B; odd ld means even 4B/8B alignment of the row base cannot be guaranteed,
+# Triton narrows 2D tile row-vectorized load/store across the board, and large-shape latency inflates ~1.5-2x
+# (8191^3 NN 11.27ms vs 8192^3 5.54ms); the masked k-loop of boundary tiles loses another notch.
+# (Diagnosis: /tmp/diag_kodd.py + diag_padfull.py, 2026-09-05; config sweep of 27 entries no solution,
+# confirmed as layout/mask issue rather than tile config issue)
+# Fix: pad inputs to (BLOCK_M/N=256, BLOCK_K=128) integer-multiple buffers + mask-free main
+# kernel; for NN also transpose B(k,n) into Bt(n,k) to use the NT main kernel (B reads contiguous along k columns, same pool
+# measured ~25-30% faster: 8192^3 NN main 5.54ms -> NT main 4.10ms). Output goes to the pad C
+# buffer first then cropped back to real C, alpha/beta semantics preserved. After padding call the
+# autotuner kernel with (m_pad,n_pad,k_pad), hitting the same tune entry as the already-tuned aligned shape (8192^3 etc.).
+_PAD_ALIGN_MN = 256  # max BLOCK_M/BLOCK_N in pool
+_PAD_ALIGN_K = 128  # max BLOCK_K in pool
+_PAD_BLK = 64  # transpose-copy tile width BC (src n direction; measured odd optimum 64x128/w8)
+_PAD_TRANS_BLK = 128  # transpose-copy tile height BR (src k direction; k row-major reads with large stride)
+# Small odd shapes (511/1023 level, 2mnk < _PAD_MIN_FLOPS) are not padded: padding needs 4-5 extra
+# kernel/copy launches (~25us each), and on small shapes launch overhead dominates the misalign gain
+# (experiment 2026-09-06: 1023^3 padded 0.20ms vs direct 0.06ms, regression across the board).
+_PAD_MIN_FLOPS = 5.0e9  # lower bound of 2*m*n*k to enable pad
 
 def _padded_size(m, n, k, lda, ldb, ldc):
-    # 行起始地址 16B 对齐需 ld*2B % 16 == 0 -> ld % 8 == 0。任一不满足即
-    # misalign -> 需要 pad (覆盖全部奇数 shape 与 lda/ldb/ldc 非 8 倍数情形)。
+    # Row start address 16B alignment requires ld*2B % 16 == 0 -> ld % 8 == 0. If any fails it is
+    # misaligned -> padding needed (covers all odd shapes and cases where lda/ldb/ldc are not multiples of 8).
     if lda % 8 == 0 and ldb % 8 == 0 and ldc % 8 == 0:
         return None
     return (
@@ -332,8 +336,8 @@ def _padded_size(m, n, k, lda, ldb, ldc):
 
 
 def _row_view(t, ld):
-    # 物理缓冲 -> (行, ld) 行主序视图 (无拷贝), 供切片拷贝取逻辑 (m,k) 区;
-    # 兼容 2D (行,ld) 与 1D 平铺缓冲。
+    # physical buffer -> (row, ld) row-major view (no copy), for slice copies to take the logical (m,k) region;
+    # compatible with both 2D (row,ld) and 1D flat buffers.
     if t.dim() == 2 and t.shape[1] == ld:
         return t
     return t.view(-1, ld)
@@ -351,13 +355,13 @@ def _bfgemm_pad_trans_kernel(
     BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    # src: B(k,n) 行主序 (k 行 stride=sr, n 列连续)
-    # dst: Bt(n_pad,k_pad) 行主序 (n 行 stride=dr, k 列连续); 一次完成 pad+转置,
-    # grid = cdiv(k_pad,BR) x cdiv(n_pad,BC) 全覆盖 -> store 无掩码; 源越界
-    # (k>=K 或 n>=N) 读 0 -> pad 区为 0。
+    # src: B(k,n) row-major (k row stride=sr, n column contiguous)
+    # dst: Bt(n_pad,k_pad) row-major (n row stride=dr, k column contiguous); does pad+transpose in one pass,
+    # grid = cdiv(k_pad,BR) x cdiv(n_pad,BC) full coverage -> store without mask; out-of-range source
+    # (k>=K or n>=N) reads 0 -> pad region is 0.
     pid = tl.program_id(0)
     ngrid_c = tl.cdiv(np, BC)
-    pr = pid // ngrid_c  # k tiles (k_pad 维)
+    pr = pid // ngrid_c  # k tiles (k_pad dimension)
     pc = pid % ngrid_c  # n tiles
     offs_k = pr * BR + tl.arange(0, BR)
     offs_n = pc * BC + tl.arange(0, BC)
@@ -379,8 +383,8 @@ def _launch_pad_nt(
     kp,
     lda_p,
 ):
-    # NT 主内核 (输入 Ap(m,kp) lda=lda_p, Bt(np,kp) ldb=kp) -> Cp(mp,np);
-    # grid lambda 交给 libtuner 展开。
+    # NT main kernel (input Ap(m,kp) lda=lda_p, Bt(np,kp) ldb=kp) -> Cp(mp,np);
+    # grid lambda is expanded by libtuner.
     grid = lambda meta: (
         triton.cdiv(mp, meta["BLOCK_M"]) * triton.cdiv(np, meta["BLOCK_N"]),
     )
@@ -442,23 +446,23 @@ def bfgemm(
     )
 
     with torch_device_fn.device(A.device):
-        # odd/misalign 布局 (任一 ld%8!=0) + 大 shape: pad 到对齐缓冲统一走 NT 主
-        # 内核, 见上方 pad 路径注释。probe_pad_dispatch2 (2026-09-05, 官跑口径 e2e,
-        # 数值 beta0/β=1.5 全 PASS): NN 8191^3 11.27->6.05ms、NT 9.48->6.23、
-        # TN 11.76->5.89、TT 13.19->6.07; sp 0.75-1.54 (相对同进程 torch)。
+        # odd/misalign layout (any ld%8!=0) + large shape: pad to aligned buffers and uniformly use the NT main
+        # kernel, see the pad path comments above. probe_pad_dispatch2 (2026-09-05, official-run e2e metric,
+        # numeric beta0/β=1.5 all PASS): NN 8191^3 11.27->6.05ms, NT 9.48->6.23,
+        # TN 11.76->5.89, TT 13.19->6.07; sp 0.75-1.54 (relative to same-process torch).
         ps = _padded_size(m, n, k, lda, ldb, ldc)
         if ps is not None and 2.0 * m * n * k >= _PAD_MIN_FLOPS:
             mp, np, kp = ps
-            # torch.empty 而非 zeros: 三块大缓冲 fmem (8191^3 级 ~400MB) 每次调用
-            # ~0.8ms, 纯浪费。有效输出 (i<m,j<n) 的 k 方向点积只跨 A/B 的 k-pad
-            # 列, 故仅需把两缓冲的 [:, k:kp] 条带清零 (见下); m-pad 行 / n-pad 行
-            # / Cp 的 pad 区只影响被裁掉的输出, 无需清零。
+            # torch.empty instead of zeros: three large buffers fmem (~400MB at 8191^3 level) per call
+            # ~0.8ms, pure waste. For valid outputs (i<m,j<n) the k-direction dot product only spans the k-pad
+            # columns of A/B, so only the [:, k:kp] strip of the two buffers needs zeroing (see below); m-pad rows / n-pad rows
+            # / the pad region of Cp only affect cropped outputs, no need to zero.
             Ap = torch.empty(mp, kp, dtype=A.dtype, device=A.device)
             Bt = torch.empty(np, kp, dtype=A.dtype, device=A.device)
             Cp = torch.empty(mp, np, dtype=A.dtype, device=A.device)
-            if transa == CUBLAS_OP_N:  # A 物理 (m,k): 同布局 pad
+            if transa == CUBLAS_OP_N:  # A physical (m,k): same-layout pad
                 Ap[:m, :k].copy_(_row_view(A, lda)[:m, :k])
-            else:  # A 物理 (k,m): pad+转置 -> Ap(m,k)
+            else:  # A physical (k,m): pad+transpose -> Ap(m,k)
                 g = (
                     triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(mp, _PAD_BLK),
                 )
@@ -466,7 +470,7 @@ def bfgemm(
                     A, Ap, k, m, lda, kp, mp,
                     BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
                 )
-            if transb == CUBLAS_OP_N:  # B 物理 (k,n): pad+转置 -> Bt(n,k)
+            if transb == CUBLAS_OP_N:  # B physical (k,n): pad+transpose -> Bt(n,k)
                 b_pad_trans = True
                 g = (
                     triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(np, _PAD_BLK),
@@ -475,25 +479,25 @@ def bfgemm(
                     B, Bt, k, n, ldb, kp, np,
                     BR=_PAD_TRANS_BLK, BC=_PAD_BLK, num_warps=8,
                 )
-            else:  # B 物理 (n,k): 同布局 pad
+            else:  # B physical (n,k): same-layout pad
                 b_pad_trans = False
                 Bt[:n, :k].copy_(_row_view(B, ldb)[:n, :k])
             if kp > k:
-                # k-pad 条带归零: 仅 same-layout copy_ 的缓冲需要 (copy_ 只写
-                # [:m,:k]/[:n,:k], k-pad 是 torch.empty 残留); 转置 kernel 的
-                # store 覆盖整块缓冲且源越界处读 0 写入, k-pad 已为 0, 跳过。
-                if transa == CUBLAS_OP_N:  # A 同布局 copy, k-pad 需归零
+                # zero the k-pad strip: only needed for same-layout copy_ buffers (copy_ only writes
+                # [:m,:k]/[:n,:k], k-pad is torch.empty residue); the transpose kernel's
+                # store covers the whole buffer and writes 0 at out-of-range source, so k-pad is already 0, skip.
+                if transa == CUBLAS_OP_N:  # A same-layout copy, k-pad needs zeroing
                     Ap[:, k:].zero_()
                 if not b_pad_trans:
                     Bt[:, k:].zero_()
-            if not beta_is_zero:  # 预置 beta*C 语义: 拷贝 C 到 pad 缓冲左上
+            if not beta_is_zero:  # pre-set beta*C semantics: copy C into the top-left of the pad buffer
                 Cp[:m, :n].copy_(_row_view(C, ldc)[:m, :n])
             _launch_pad_nt(A, Ap, Bt, Cp, alpha, beta, beta_is_zero, mp, np, kp, kp)
             _row_view(C, ldc)[:m, :n].copy_(Cp[:m, :n])
             return
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
             if (m, n, k) in _NN_NT_ROUTE_SHAPES:
-                # 方向①: B(k,n) (k 行 stride=ldb) -> Bt(n,k) (行 stride=k), 再走 NT 主内核
+                # direction ①: B(k,n) (k row stride=ldb) -> Bt(n,k) (row stride=k), then run the NT main kernel
                 Bt = torch.empty((n, k), dtype=B.dtype, device=B.device)
                 gt = (
                     triton.cdiv(k, _TN_TRANS_BLOCK_K)
@@ -521,7 +525,7 @@ def bfgemm(
                 )
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if (m, n, k) in _TN_Y_SHAPES:
-                # Y 复合: B(k,n) 连续转置成 Bt(n,k), 再 NN 主循环 + 转置 store 直写 C
+                # Y composite: transpose B(k,n) contiguously into Bt(n,k), then NN main loop + transposed store directly writes C
                 Bt = torch.empty((n, k), dtype=B.dtype, device=B.device)
                 gb = (
                     triton.cdiv(k, _TN_TRANS_BLOCK_K)
@@ -559,7 +563,7 @@ def bfgemm(
                     num_stages=2,
                 )
             elif _tn_use_composite(m, n, k):
-                # A(k,m) 行主序 (行长=lda) -> A^T(m,k) 行主序 (行长=k)
+                # A(k,m) row-major (row length=lda) -> A^T(m,k) row-major (row length=k)
                 At = torch.empty((m, k), dtype=A.dtype, device=A.device)
                 g = (
                     triton.cdiv(k, _TN_TRANS_BLOCK_K)
@@ -577,7 +581,7 @@ def bfgemm(
                     num_warps=8,
                 )
                 if (m, n, k) in _TN_NT_ROUTE_SHAPES:
-                    # 方向① TN: 再补 B(k,n)->Bt(n,k) (行 stride=k), At+Bt 走 NT 主内核
+                    # direction ① TN: additionally B(k,n)->Bt(n,k) (row stride=k), At+Bt run the NT main kernel
                     Bt = torch.empty((n, k), dtype=B.dtype, device=B.device)
                     gb = (
                         triton.cdiv(k, _TN_TRANS_BLOCK_K)

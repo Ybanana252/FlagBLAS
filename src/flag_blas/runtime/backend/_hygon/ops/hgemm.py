@@ -13,26 +13,27 @@
 # limitations under the License.
 
 """
-Hygon DTK hgemm 定制路径。
+Hygon DTK hgemm custom path.
 
-hygon 侧此前无 `hgemm` 专用实现, 直接复用通用 level3 内核 + NVIDIA 缺省 tune 池。
-本模块对齐 `_hygon/ops/bfgemm.py` 的既有模式, 为 fp16 gemm 增加两条 hygon 定制路径,
-其余布局仍复用通用 level3 内核:
+Previously there was no dedicated `hgemm` implementation on the hygon side; it reused the generic level3 kernels + the NVIDIA default tune pool.
+This module follows the existing pattern of `_hygon/ops/bfgemm.py` and adds two hygon custom paths for fp16 gemm,
+while the remaining layouts still reuse the generic level3 kernels:
 
-1. TN (transa=T, transb=N): A 物理 (k, m) 行主序, 直接主循环沿 k 步进时 A tile 的
-   末维 (k) 跨度为 lda, 无法向量化/连续读, 带宽效率差。这里先用专用转置拷贝内核把
-   A(k,m) 落成 A^T(m,k) 连续缓冲区, 再走 NN 主内核, 使 A 的加载与 NN 变体一致。
-   转置内核读写均按连续片段进行, 开销远小于直接 TN 的跨步读损失。
+1. TN (transa=T, transb=N): A physical (k, m) row-major; when the direct main loop steps along k, the last
+   dimension (k) of the A tile has stride lda, so it cannot be vectorized/read contiguously and bandwidth
+   efficiency is poor. Here a dedicated transpose-copy kernel is used first to materialize
+   A(k,m) into a contiguous A^T(m,k) buffer, then run the NN main kernel, so that A loading matches the NN variant.
+   The transpose kernel reads and writes contiguous segments, so its overhead is far smaller than the strided-read penalty of direct TN.
 
-2. odd / 非对齐布局 (任一 ld % 8 != 0): 行起始地址 = row * ld * 2B, ld 非 8 倍数时
-   连 16B 对齐都无法保证, Triton 对 2D tile 行向量化 load/store 全面降窄。对大 shape
-   把输入 pad 到对齐缓冲 (NN 顺带把 B 转置成 Bt 走 NT 主内核), 再裁回真实 C。
+2. odd / misaligned layouts (any ld % 8 != 0): row start address = row * ld * 2B; when ld is not a multiple of 8,
+   even 16B alignment cannot be guaranteed, and Triton narrows 2D tile row-vectorized load/store across the board. For large shapes
+   pad inputs to aligned buffers (NN additionally transposes B into Bt to use the NT main kernel), then crop back to real C.
 
-NN / NT / TT 与通用 level3 内核一致 (实测 median >= 0.95, 不额外处理), 仅补 hygon
-专用 tune 池 (tune_configs.yaml 的 hgemm_* 段), 避免回落 NVIDIA 缺省池。
+NN / NT / TT match the generic level3 kernels (measured median >= 0.95, no extra handling); only the hygon
+dedicated tune pool is added (hgemm_* section of tune_configs.yaml) to avoid falling back to the NVIDIA default pool.
 
-注: bfgemm 侧按 shape 白名单叠加的 sched_latency / kpack / NN->NT 路由等编译器级调优
-均为 bf16 实测结论, 未在本模块搬运; hgemm 仅保留与 dtype 无关的结构路径。
+Note: the compiler-level tunings stacked on the bfgemm side by shape whitelist (sched_latency / kpack / NN->NT routing etc.)
+are all bf16 measurement conclusions and are not ported to this module; hgemm keeps only the dtype-independent structural paths.
 """
 
 import torch
@@ -50,8 +51,8 @@ from flag_blas.ops.level3.hgemm import (
 )
 from flag_blas.runtime import torch_device_fn
 
-# TN 复合转置内核 tile; 末维 (load 沿 m, store 沿 k) 均连续可向量化。
-# 与 _hygon/ops/bfgemm.py 同值 (同为 2B dtype, 转置带宽特性一致)。
+# TN composite transpose kernel tile; last dimension (load along m, store along k) is contiguous and vectorizable.
+# Same values as _hygon/ops/bfgemm.py (both 2B dtypes, same transpose bandwidth characteristics).
 _TN_TRANS_BLOCK_M = 128
 _TN_TRANS_BLOCK_K = 128
 
@@ -67,8 +68,8 @@ def _hgemm_tn_trans_kernel(
     BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    # src: A 物理 (k, m) 行主序 (k 行 stride=sr, m 列 stride=1)
-    # dst: A^T 物理 (m, k) 行主序 (m 行 stride=dr, k 列 stride=1) -> dst = src^T
+    # src: A physical (k, m) row-major (k row stride=sr, m col stride=1)
+    # dst: A^T physical (m, k) row-major (m row stride=dr, k col stride=1) -> dst = src^T
     pid = tl.program_id(0)
     ngrid_c = tl.cdiv(M, BC)
     pr = pid // ngrid_c
@@ -85,24 +86,24 @@ def _hgemm_tn_trans_kernel(
 
 
 def _tn_use_composite(m, n, k):
-    # A^T composite (transpose A + NN main) 仅在大输出非瘦 shape 上净正收益;
-    # 瘦/小 shape (m 或 n <= 64) 直接 TN 更快, 故设下界。判据与 bfgemm 一致。
+    # A^T composite (transpose A + NN main) has net positive gain only on large-output non-skinny shapes;
+    # skinny/small shapes (m or n <= 64) are faster with direct TN, hence the lower bound. Criteria identical to bfgemm.
     return min(m, n) >= 128 and m * n * k >= (4 << 27)
 
 
-# ---- odd / 非对齐布局的 pad 路径 ----
-# 判据 / 阈值与 _hygon/ops/bfgemm.py 一致: fp16 与 bf16 同为 2B dtype, 行对齐条件
-# (ld % 8 == 0 对应 16B 行起始对齐) 与 pad tile 完全相同。
-_PAD_ALIGN_MN = 256  # 池内最大 BLOCK_M/BLOCK_N
-_PAD_ALIGN_K = 128  # 池内最大 BLOCK_K
-_PAD_BLK = 64  # 转置拷贝 tile 宽 BC (src n 向)
-_PAD_TRANS_BLK = 128  # 转置拷贝 tile 高 BR (src k 向; k 行主序跨大 stride 读)
-_PAD_MIN_FLOPS = 5.0e9  # 启用 pad 的 2*m*n*k 下界 (小 odd shape 启动开销占优, 不 pad)
+# ---- pad path for odd / misaligned layouts ----
+# Criteria / thresholds identical to _hygon/ops/bfgemm.py: fp16 and bf16 are both 2B dtypes, row alignment condition
+# (ld % 8 == 0 corresponds to 16B row start alignment) and pad tiles are exactly the same.
+_PAD_ALIGN_MN = 256  # max BLOCK_M/BLOCK_N in pool
+_PAD_ALIGN_K = 128  # max BLOCK_K in pool
+_PAD_BLK = 64  # transpose-copy tile width BC (src n direction)
+_PAD_TRANS_BLK = 128  # transpose-copy tile height BR (src k direction; k row-major reads with large stride)
+_PAD_MIN_FLOPS = 5.0e9  # lower bound of 2*m*n*k to enable pad (small odd shapes dominated by launch overhead, no pad)
 
 
 def _padded_size(m, n, k, lda, ldb, ldc):
-    # 行起始地址 16B 对齐需 ld*2B % 16 == 0 -> ld % 8 == 0。任一不满足即
-    # misalign -> 需要 pad (覆盖全部奇数 shape 与 lda/ldb/ldc 非 8 倍数情形)。
+    # Row start address 16B alignment requires ld*2B % 16 == 0 -> ld % 8 == 0. If any fails it is
+    # misaligned -> padding needed (covers all odd shapes and cases where lda/ldb/ldc are not multiples of 8).
     if lda % 8 == 0 and ldb % 8 == 0 and ldc % 8 == 0:
         return None
     return (
@@ -113,8 +114,8 @@ def _padded_size(m, n, k, lda, ldb, ldc):
 
 
 def _row_view(t, ld):
-    # 物理缓冲 -> (行, ld) 行主序视图 (无拷贝), 供切片拷贝取逻辑 (m,k) 区;
-    # 兼容 2D (行,ld) 与 1D 平铺缓冲。
+    # physical buffer -> (row, ld) row-major view (no copy), for slice copies to take the logical (m,k) region;
+    # compatible with both 2D (row,ld) and 1D flat buffers.
     if t.dim() == 2 and t.shape[1] == ld:
         return t
     return t.view(-1, ld)
@@ -132,13 +133,13 @@ def _hgemm_pad_trans_kernel(
     BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    # src: B(k,n) 行主序 (k 行 stride=sr, n 列连续)
-    # dst: Bt(n_pad,k_pad) 行主序 (n 行 stride=dr, k 列连续); 一次完成 pad+转置,
-    # grid = cdiv(k_pad,BR) x cdiv(n_pad,BC) 全覆盖 -> store 无掩码; 源越界
-    # (k>=K 或 n>=N) 读 0 -> pad 区为 0。
+    # src: B(k,n) row-major (k row stride=sr, n column contiguous)
+    # dst: Bt(n_pad,k_pad) row-major (n row stride=dr, k column contiguous); does pad+transpose in one pass,
+    # grid = cdiv(k_pad,BR) x cdiv(n_pad,BC) full coverage -> store without mask; out-of-range source
+    # (k>=K or n>=N) reads 0 -> pad region is 0.
     pid = tl.program_id(0)
     ngrid_c = tl.cdiv(np, BC)
-    pr = pid // ngrid_c  # k tiles (k_pad 维)
+    pr = pid // ngrid_c  # k tiles (k_pad dimension)
     pc = pid % ngrid_c  # n tiles
     offs_k = pr * BR + tl.arange(0, BR)
     offs_n = pc * BC + tl.arange(0, BC)
@@ -160,8 +161,8 @@ def _launch_pad_nt(
     kp,
     lda_p,
 ):
-    # NT 主内核 (输入 Ap(m,kp) lda=lda_p, Bt(np,kp) ldb=kp) -> Cp(mp,np);
-    # grid lambda 交给 libtuner 展开。
+    # NT main kernel (input Ap(m,kp) lda=lda_p, Bt(np,kp) ldb=kp) -> Cp(mp,np);
+    # grid lambda is expanded by libtuner.
     grid = lambda meta: (
         triton.cdiv(mp, meta["BLOCK_M"]) * triton.cdiv(np, meta["BLOCK_N"]),
     )
@@ -222,19 +223,19 @@ def hgemm(
     )
 
     with torch_device_fn.device(A.device):
-        # odd/misalign 布局 (任一 ld%8!=0) + 大 shape: pad 到对齐缓冲统一走 NT 主
-        # 内核 (B 沿 k 列连续读)。有效输出 (i<m,j<n) 的 k 方向点积只跨 A/B 的 k-pad
-        # 列, 故仅需把两缓冲的 [:, k:kp] 条带清零; m-pad 行 / n-pad 行 / Cp 的 pad 区
-        # 只影响被裁掉的输出, 无需清零。alpha/beta 语义保持。
+        # odd/misalign layout (any ld%8!=0) + large shape: pad to aligned buffers and uniformly use the NT main
+        # kernel (B reads contiguous along k columns). For valid outputs (i<m,j<n) the k-direction dot product only spans the k-pad
+        # columns of A/B, so only the [:, k:kp] strip of the two buffers needs zeroing; m-pad rows / n-pad rows / the pad region of Cp
+        # only affect cropped outputs, no need to zero. alpha/beta semantics preserved.
         ps = _padded_size(m, n, k, lda, ldb, ldc)
         if ps is not None and 2.0 * m * n * k >= _PAD_MIN_FLOPS:
             mp, np, kp = ps
             Ap = torch.empty(mp, kp, dtype=A.dtype, device=A.device)
             Bt = torch.empty(np, kp, dtype=A.dtype, device=A.device)
             Cp = torch.empty(mp, np, dtype=A.dtype, device=A.device)
-            if transa == CUBLAS_OP_N:  # A 物理 (m,k): 同布局 pad
+            if transa == CUBLAS_OP_N:  # A physical (m,k): same-layout pad
                 Ap[:m, :k].copy_(_row_view(A, lda)[:m, :k])
-            else:  # A 物理 (k,m): pad+转置 -> Ap(m,k)
+            else:  # A physical (k,m): pad+transpose -> Ap(m,k)
                 g = (
                     triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(mp, _PAD_BLK),
                 )
@@ -250,7 +251,7 @@ def hgemm(
                     BC=_PAD_BLK,
                     num_warps=8,
                 )
-            if transb == CUBLAS_OP_N:  # B 物理 (k,n): pad+转置 -> Bt(n,k)
+            if transb == CUBLAS_OP_N:  # B physical (k,n): pad+transpose -> Bt(n,k)
                 b_pad_trans = True
                 g = (
                     triton.cdiv(kp, _PAD_TRANS_BLK) * triton.cdiv(np, _PAD_BLK),
@@ -267,18 +268,18 @@ def hgemm(
                     BC=_PAD_BLK,
                     num_warps=8,
                 )
-            else:  # B 物理 (n,k): 同布局 pad
+            else:  # B physical (n,k): same-layout pad
                 b_pad_trans = False
                 Bt[:n, :k].copy_(_row_view(B, ldb)[:n, :k])
             if kp > k:
-                # k-pad 条带归零: 仅 same-layout copy_ 的缓冲需要 (copy_ 只写
-                # [:m,:k]/[:n,:k], k-pad 是 torch.empty 残留); 转置 kernel 的
-                # store 覆盖整块缓冲且源越界处读 0 写入, k-pad 已为 0, 跳过。
-                if transa == CUBLAS_OP_N:  # A 同布局 copy, k-pad 需归零
+                # zero the k-pad strip: only needed for same-layout copy_ buffers (copy_ only writes
+                # [:m,:k]/[:n,:k], k-pad is torch.empty residue); the transpose kernel's
+                # store covers the whole buffer and writes 0 at out-of-range source, so k-pad is already 0, skip.
+                if transa == CUBLAS_OP_N:  # A same-layout copy, k-pad needs zeroing
                     Ap[:, k:].zero_()
                 if not b_pad_trans:
                     Bt[:, k:].zero_()
-            if not beta_is_zero:  # 预置 beta*C 语义: 拷贝 C 到 pad 缓冲左上
+            if not beta_is_zero:  # pre-set beta*C semantics: copy C into the top-left of the pad buffer
                 Cp[:m, :n].copy_(_row_view(C, ldc)[:m, :n])
             _launch_pad_nt(A, Ap, Bt, Cp, alpha, beta, beta_is_zero, mp, np, kp, kp)
             _row_view(C, ldc)[:m, :n].copy_(Cp[:m, :n])
@@ -290,8 +291,8 @@ def hgemm(
             )
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if _tn_use_composite(m, n, k):
-                # TN 复合: A(k,m) 行主序 (行长=lda) -> A^T(m,k) 行主序 (行长=k),
-                # 再走 NN 主内核, 使 A 的加载与 NN 变体一致 (末维连续)。
+                # TN composite: A(k,m) row-major (row length=lda) -> A^T(m,k) row-major (row length=k),
+                # then run the NN main kernel, so that A loading matches the NN variant (contiguous last dimension).
                 At = torch.empty((m, k), dtype=A.dtype, device=A.device)
                 g = (
                     triton.cdiv(k, _TN_TRANS_BLOCK_K)

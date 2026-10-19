@@ -1,43 +1,44 @@
-"""FlagBLAS 侧对 Triton HCU 后端 per-kernel 编译选项的运行时注入。
+"""Runtime injection of per-kernel compilation options for the Triton HCU backend on the FlagBLAS side.
 
-背景
-----
-Triton (flagtree 0.6.1+hcu3.6) 的下列编译开关由全局 knob 控制（env 动态读取），
-仅支持进程级，但 Hygon gfx936 上它们对 kernel 的影响按 shape 分化，需要 per-kernel 控制：
+Background
+----------
+The following compilation switches of Triton (flagtree 0.6.1+hcu3.6) are controlled by global knobs (env read dynamically),
+which only support process scope, but on Hygon gfx936 their impact on kernels varies by shape, requiring per-kernel control:
 
-1. in-thread-transpose (ITT): env ``TRITON_HIP_USE_IN_THREAD_TRANSPOSE``。
-   大/方 shape 受益 +5~15%，瘦/小 shape 受损（v1.2 已按 shape 分发）。
-2. buffer ops: env ``AMDGCN_USE_BUFFER_OPS``（默认 True）。
-   大/中输出 shape 受益 -1~-4%，但 2048x2048x16384 +43% 严重受损、
-   128x4096x1024 +3.8% 等小 shape 轻微受损（v1.3 按 shape 分发）。
+1. in-thread-transpose (ITT): env ``TRITON_HIP_USE_IN_THREAD_TRANSPOSE``.
+   Large/square shapes benefit +5~15%, thin/small shapes regress (v1.2 already dispatches by shape).
+2. buffer ops: env ``AMDGCN_USE_BUFFER_OPS`` (default True).
+   Large/medium output shapes benefit -1~-4%, but 2048x2048x16384 +43% severely regresses,
+   128x4096x1024 +3.8% and other small shapes slightly regress (v1.3 dispatches by shape).
 
-方案
-----
-不改 site-packages 源码，在 FlagBLAS 导入时做两处运行时注入：
+Approach
+--------
+Without modifying site-packages source, perform two runtime injections at FlagBLAS import time:
 
-1. 动态给 ``HIPOptions``（frozen dataclass）增加字段 ``use_in_thread_transpose``
-   与 ``use_buffer_ops``（默认 None）。Triton 的 ``parse_options`` 按
-   ``HIPOptions.__dataclass_fields__`` 从 launch kwargs 过滤编译选项，且编译缓存
-   key（``compute_cache_key`` 用 ``str(options)``）基于 dataclass 字段序列化——
-   新字段被自动吸收并区分不同变体的编译产物。
-2. 包装 ``HIPBackend.make_ttgir``：编译时按 ``options`` 中的字段值临时设置对应
-   env（knob 每次访问动态读 env），编译后恢复 env。字段为 None 时不动 env
-   （保持全局默认，产物与未注入时完全一致）。
+1. Dynamically add fields ``use_in_thread_transpose`` and ``use_buffer_ops`` (default None)
+   to ``HIPOptions`` (frozen dataclass). Triton's ``parse_options`` filters compilation options
+   from launch kwargs by ``HIPOptions.__dataclass_fields__``, and the compilation cache key
+   (``compute_cache_key`` uses ``str(options)``) is serialized based on dataclass fields --
+   the new fields are automatically absorbed and distinguish the compiled artifacts of different variants.
+2. Wrap ``HIPBackend.make_ttgir``: at compile time, temporarily set the corresponding env according
+   to the field values in ``options`` (the knob reads env dynamically on each access), and restore
+   env after compilation. When a field is None, leave env untouched
+   (keep the global default, artifact exactly identical to no injection).
 
-幂等：重复调用安全；若 site-packages 已手工打了同款 patch（字段已存在），跳过注入。
+Idempotent: repeated calls are safe; if site-packages already has the same patch applied manually (fields already exist), skip injection.
 """
 
 import dataclasses
 import os
 import threading
 
-# (HIPOptions 字段名, env 名) 列表——新增 per-kernel 编译选项在此登记
+# (HIPOptions field name, env name) list -- register new per-kernel compilation options here
 _OPTION_FIELDS = (
     ("use_in_thread_transpose", "TRITON_HIP_USE_IN_THREAD_TRANSPOSE"),
     ("use_buffer_ops", "AMDGCN_USE_BUFFER_OPS"),
 )
-# frozen dataclass 重新生成 __init__/__repr__/__eq__/__hash__ 前需要删除的旧方法
-# （dataclass 的 _set_new_attribute 不覆盖已有属性）
+# Old methods that must be deleted before regenerating __init__/__repr__/__eq__/__hash__ for the frozen dataclass
+# (dataclass's _set_new_attribute does not overwrite existing attributes)
 _DATACLASS_METHODS = (
     "__init__", "__repr__", "__eq__", "__hash__", "__setattr__", "__delattr__",
     "__match_args__",
@@ -45,15 +46,15 @@ _DATACLASS_METHODS = (
 
 _installed = False
 _install_lock = threading.Lock()
-# make_ttgir 编译期间 env 切换的互斥（编译为同步流程，锁仅防多线程编译交错）
+# Mutual exclusion for env switching during make_ttgir compilation (compilation is synchronous; the lock only prevents interleaving in multi-threaded compilation)
 _env_lock = threading.Lock()
 
 
 def install_triton_itt_patch():
-    """在 Triton HCU 后端注入 per-kernel 编译选项支持。
+    """Inject per-kernel compilation option support into the Triton HCU backend.
 
     Returns:
-        bool: True 表示注入完成（或已支持），False 表示当前环境无 Triton HCU 后端。
+        bool: True means injection is complete (or already supported), False means the current environment has no Triton HCU backend.
     """
     global _installed
     if _installed:
@@ -69,22 +70,22 @@ def install_triton_itt_patch():
         hip_options = _chcu.HIPOptions
         hip_backend = _chcu.HIPBackend
 
-        # 1) HIPOptions 动态加字段（site-packages 已手工 patch 则跳过）
+        # 1) Dynamically add fields to HIPOptions (skip if site-packages is already patched manually)
         for field_name, _env_name in _OPTION_FIELDS:
             if field_name not in hip_options.__dataclass_fields__:
                 annotations = dict(getattr(hip_options, "__annotations__", {}))
                 annotations[field_name] = bool
                 hip_options.__annotations__ = annotations
-                # 类属性默认值：重新生成 __init__ 时避免 non-default follows default
+                # Class attribute default: avoid "non-default follows default" when regenerating __init__
                 setattr(hip_options, field_name, None)
                 hip_options.__dataclass_fields__[field_name] = dataclasses.field(default=None)
                 for _name in _DATACLASS_METHODS:
                     if _name in hip_options.__dict__:
                         delattr(hip_options, _name)
-                # 保持原始 @dataclass(frozen=True) 语义（frozen 会生成 __hash__ 与禁赋值 __setattr__）
+                # Preserve the original @dataclass(frozen=True) semantics (frozen generates __hash__ and a disabled-assignment __setattr__)
                 dataclasses.dataclass(hip_options, frozen=True)
 
-        # 2) 包装 make_ttgir：编译时按 options 的字段值切换对应 env
+        # 2) Wrap make_ttgir: switch the corresponding env by options field values at compile time
         _make_ttgir = hip_backend.__dict__.get("make_ttgir")
         if _make_ttgir is not None and not getattr(_make_ttgir, "_flagblas_itt_patched", False):
             _orig_func = _make_ttgir.__func__

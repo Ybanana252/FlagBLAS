@@ -63,8 +63,8 @@ def cublas_zgemm(
     beta_ptr,
 ):
     if IS_HYGON:
-        # DTK 侧无 cupy; 走 ctypes hipblasZgemm (alpha/beta 为 hipblasDoubleComplex
-        # host 标量, 由 gemm_perf_common.get_input_iter 打包成 alpha_ptr/beta_ptr)。
+        # No cupy on the DTK side; use ctypes hipblasZgemm (alpha/beta are hipblasDoubleComplex
+        # host scalars, packed into alpha_ptr/beta_ptr by gemm_perf_common.get_input_iter).
         library = _load_hipblas()
         library.hipblasZgemm(
             handle,

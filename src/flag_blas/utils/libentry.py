@@ -731,12 +731,14 @@ class LibEntry(triton.KernelInterface):
                 spec_args.append(val)
                 k_args[p.name] = val
 
-        # use_in_thread_transpose / use_buffer_ops 是 Triton 编译选项 (HIPOptions),
-        # 非 kernel 参数, 不会进入 const_args; 但不同变体的编译产物不同, 必须纳入
-        # entry_key, 否则同 shape 的不同变体两次 launch 会命中同一缓存导致混淆.
-        # kpack (HIPOptions 字段, NT 优化实测 kpack=2 有效) 同样影响编译产物,
-        # 必须纳入 entry_key, 否则同 shape 的 kp1/kp2 两次 launch 会串用编译缓存.
-        # num_warps / num_stages / num_ctas / maxnreg 由下方 entry_key 追加元组覆盖.
+        # use_in_thread_transpose / use_buffer_ops are Triton compilation options (HIPOptions),
+        # not kernel arguments, so they do not enter const_args; but different variants produce
+        # different compiled artifacts and must be included in entry_key, otherwise two launches
+        # of different variants with the same shape would hit the same cache and get mixed up.
+        # kpack (HIPOptions field, NT optimization measured kpack=2 effective) also affects the
+        # compiled artifact and must be included in entry_key, otherwise kp1/kp2 launches of the
+        # same shape would share a compilation cache.
+        # num_warps / num_stages / num_ctas / maxnreg are covered by the tuple appended to entry_key below.
         for _opt_name in ("use_in_thread_transpose", "use_buffer_ops", "kpack"):
             _opt_val = kwargs.get(_opt_name, None)
             if _opt_val is not None:

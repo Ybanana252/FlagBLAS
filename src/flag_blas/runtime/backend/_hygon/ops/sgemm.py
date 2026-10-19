@@ -31,14 +31,14 @@ from flag_blas.runtime import torch_device_fn
 from flag_blas.runtime.dispatch import StaticDispatch
 from flag_blas.utils import libentry, libtuner
 
-# per-kernel ITT 编译选项的运行时注入（不改 site-packages Triton 源码）。
-# 必须在任何 sgemm kernel launch 前执行一次；注入失败仅失去 per-kernel ITT
-# 能力（回落全局默认），不影响其余功能。
+# Runtime injection of per-kernel ITT compile options (without modifying site-packages Triton source).
+# Must be executed once before any sgemm kernel launch; if injection fails, only the per-kernel ITT
+# capability is lost (falls back to the global default), with no impact on other functionality.
 try:
     from flag_blas.runtime.backend._hygon._triton_itt import install_triton_itt_patch
 
     install_triton_itt_patch()
-except Exception:  # pragma: no cover - 环境无 Triton HCU 后端时静默跳过
+except Exception:  # pragma: no cover - silently skip when the environment has no Triton HCU backend
     pass
 
 _SGEMM_KEY = ["m", "n", "k", "BETA_IS_ZERO"]
@@ -166,11 +166,11 @@ sgemm_nn_hygon_kernel = libentry()(
     )(heuristics(runtime.get_heuristic_config("sgemm_nn"))(_sgemm_nn_opt_kernel))
 )
 
-# ---- 大 K shape 专用: 两阶段 split-k (FlagTree tle 方式, 无原子加) ----
-# 内核1: 每个 block 计算部分 K 段写入 scratch(SPLIT_K, m, n)
-# 内核2: reduce 合并 SPLIT_K 段累加到 C
-# 实测 (py310 venv + flagtree 0.6.1): 仅对 k >= 4*max(m,n) 的 shape 有效,
-# 2048x2048x16384 sp 0.778 -> 0.791 (+1.7%); 其他大 K shape 无效或变差
+# ---- Large-K shape specific: two-stage split-k (FlagTree tle style, no atomic add) ----
+# Kernel 1: each block computes a partial K segment and writes scratch(SPLIT_K, m, n)
+# Kernel 2: reduce merges the SPLIT_K segments and accumulates into C
+# Measured (py310 venv + flagtree 0.6.1): only effective for shapes with k >= 4*max(m,n),
+# 2048x2048x16384 sp 0.778 -> 0.791 (+1.7%); other large-K shapes show no gain or regress
 
 
 @libentry()
@@ -306,13 +306,13 @@ def _sgemm_nn_splitk_reduce_kernel(
         tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=mask)
 
 
-# ---- A 类非对齐 shape 专用: pre-pad + 全 EVEN 内核 ----
-# 思路: 将 A(m x k) pad 到 A'(mp x kp), B(k x n) pad 到 B'(kp x np),
-# 其中 mp/kp/np 是 BLOCK 的整数倍; 主内核全 EVEN (load 无 mask), 仅 store 对真实 m/n 打 mask.
-# 成本: 一次 A/B 合并 pad-copy (内存带宽受限), 换取主循环 mask 开销 ~11% + k remainder ~13%.
-# 实测 (py310 venv + flagtree 0.6.1, 对比报告当前 opt 路径):
-#   8191³ 0.732 -> 0.860、4095³ 0.618 -> 0.739、4097x8191x4095 0.705 -> 0.805、
-#   1023³ 0.608 -> 0.623 (边际); 511³ 反而更差 (0.845 -> 0.638), 由分发条件排除.
+# ---- Class-A unaligned shape specific: pre-pad + all-EVEN kernel ----
+# Idea: pad A(m x k) to A'(mp x kp), B(k x n) to B'(kp x np),
+# where mp/kp/np are integer multiples of BLOCK; the main kernel is all EVEN (loads without mask), only stores mask against real m/n.
+# Cost: one fused A/B pad-copy (memory-bandwidth bound), in exchange for main-loop mask overhead ~11% + k remainder ~13%.
+# Measured (py310 venv + flagtree 0.6.1, compared with the current opt path in the report):
+#   8191³ 0.732 -> 0.860, 4095³ 0.618 -> 0.739, 4097x8191x4095 0.705 -> 0.805,
+#   1023³ 0.608 -> 0.623 (marginal); 511³ is actually worse (0.845 -> 0.638), excluded by the dispatch condition.
 
 
 @libentry()
@@ -336,7 +336,7 @@ def _sgemm_nn_pad_copy_kernel(
     pid = tl.program_id(0)
     nblk_a = tl.cdiv(mp, CM) * tl.cdiv(kp, CK)
     if pid < nblk_a:
-        # A tile: 真实 m x k -> pad (mp x kp), 越界补零
+        # A tile: real m x k -> pad (mp x kp), zero-fill out of bounds
         bi = pid // tl.cdiv(kp, CK)
         bj = pid % tl.cdiv(kp, CK)
         offs_i = bi * CM + tl.arange(0, CM)
@@ -348,10 +348,10 @@ def _sgemm_nn_pad_copy_kernel(
         )
         tl.store(a_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
     else:
-        # B tile: 真实 k x n -> pad (kp x np), 越界补零
-        # 注意: B 的网格按 (kp/CM) x (np/CK) 划分, offs_i 是 k 维(CM 行)、
-        # offs_j 是 n 维(CK 列), 使 tile/mask 恒为 (CM,CK), 与 A 分支一致,
-        # 从而支持 CM != CK 的非方形 tile (原实现 CM==CK 时两者才吻合)。
+        # B tile: real k x n -> pad (kp x np), zero-fill out of bounds
+        # Note: B's grid is partitioned by (kp/CM) x (np/CK); offs_i is the k dimension (CM rows),
+        # offs_j is the n dimension (CK columns), so tile/mask are always (CM,CK), consistent with the A branch,
+        # thereby supporting non-square tiles with CM != CK (the original implementation only matched when CM==CK).
         q = pid - nblk_a
         bi = q // tl.cdiv(np, CK)
         bj = q % tl.cdiv(np, CK)
@@ -420,11 +420,11 @@ def _sgemm_nn_pad_kernel(
         tl.store(c_ptrs, alpha * acc + beta * c_vals, mask=c_mask)
 
 
-# ---- tn/nt/tt per-shape 编译选项决策 (v2.2, 2026-08-30) ----
-# ITT: 三种 trans 的 dot 布局为 MFMA 友好布局时 ITT=1 全面受益 (9 shape 全选 ITT1,
-# 4096^3 -4~-6%、8192^3 -14~-18% 等), 统一取 True。
-# buffer: 对齐大/中输出 (m*n>=2M) 与 32 非对齐 shape 用 no-buffer (-1~-7% 实测);
-# (2048,2048,16384) 大 K opt 在 no-buffer 下严重变差 (+43% nn 正式确认), 保持默认。
+# ---- tn/nt/tt per-shape compile option decisions (v2.2, 2026-08-30) ----
+# ITT: when the dot layout of all three trans modes is MFMA-friendly, ITT=1 benefits across the board (all 9 shapes choose ITT1,
+# 4096^3 -4~-6%, 8192^3 -14~-18%, etc.), so uniformly take True.
+# buffer: aligned large/medium outputs (m*n>=2M) and 32-unaligned shapes use no-buffer (-1~-7% measured);
+# (2048,2048,16384) large-K opt degrades severely under no-buffer (+43% officially confirmed on nn), keep the default.
 def _sgemm_xt_use_itt(m, n, k, **_kw):
     return True
 
@@ -439,14 +439,14 @@ def _sgemm_xt_use_buffer_ops(m, n, k, **_kw):
     return True
 
 
-# no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项 (cache key 区分);
-# buffer=True 时不传, 保持全局默认产物 (与 nn 路径同款约定)。
+# no-buffer variant: explicitly pass use_buffer_ops=False into compile options (distinguished in cache key);
+# when buffer=True, do not pass it, keeping the global default artifact (same convention as the nn path).
 _XT_NOBUF_KWARGS = {"use_buffer_ops": False}
 
 
-# ---- tn (C = A^T B) 内核: common tn + EVEN_M/N/K constexpr (v2.2) ----
-# A(k,m) lda=m, B(k,n) ldb=n; a(BM,BK) 为 A^T 片 (last-dim stride lda, ITT 转置),
-# b(BK,BN) 连续。EVEN 分支消除对齐 shape 的 mask 开销 (4096^3 实测 -5~-10%)。
+# ---- tn (C = A^T B) kernel: common tn + EVEN_M/N/K constexpr (v2.2) ----
+# A(k,m) lda=m, B(k,n) ldb=n; a(BM,BK) is the A^T slice (last-dim stride lda, ITT transpose),
+# b(BK,BN) is contiguous. The EVEN branch eliminates mask overhead for aligned shapes (-5~-10% measured on 4096^3).
 @triton.jit
 def _sgemm_tn_even_kernel(
     a_ptr,
@@ -558,36 +558,36 @@ sgemm_tn_hygon_kernel = libentry()(
     )(heuristics(runtime.get_heuristic_config("sgemm_tn"))(_sgemm_tn_even_kernel))
 )
 
-# ---- tn 复合路径: 预转置 A^T + nn 分发 (v2.3, 2026-08-30) ----
-# 为什么 tn 慢/nt 快: MFMA (v_mmac 16x16x8_f32) 要求 dot LHS 的 k 维内存连续。
-# nt 的 C=A B^T 直接写成 acc_t=B A^T (两操作数均 k 连续) 故快; tn 的 A(k,m)
-# 与 B(k,n) k 维 stride 均为行距 (strided), 任何方向下 LHS 都非 k 连续,
-# Triton 只能逐迭代做布局转换, 这是 tn 的结构性上限。
-# 复合方案参考 nt 的做法: 用带宽型转置内核把 A^T 变成连续 (m,k) 缓冲,
-# 再走 nn 分发 (opt/pad/splitk 全路径), 两操作数均 k 连续。转置内核已达设备
-# 峰值 (~1.1 TB/s, 128MB 120us), 无进一步优化空间。
-# 实测 (37-shape): 非对齐大 shape 4095³ 0.657->0.758、8191³ 0.771->0.860、
-# 4097x8191x4095 0.759->0.842; 对齐 shape 4096³ 0.791->0.849、
-# 512x16384x4096 0.814->0.898、2048x4096x11008 0.826->0.892、
-# 2048x11008x4096 0.846->0.896、2048x16384x2048 0.836->0.857 等。
+# ---- tn composite path: pre-transpose A^T + nn dispatch (v2.3, 2026-08-30) ----
+# Why tn is slow / nt is fast: MFMA (v_mmac 16x16x8_f32) requires the k dimension of the dot LHS to be contiguous in memory.
+# nt's C=A B^T is written directly as acc_t=B A^T (both operands k-contiguous), hence fast; for tn's A(k,m)
+# and B(k,n), the k-dimension stride is the row stride (strided), so the LHS is not k-contiguous in any direction,
+# and Triton can only perform a layout conversion per iteration; this is tn's structural upper bound.
+# The composite scheme follows nt's approach: use a bandwidth-bound transpose kernel to turn A^T into a contiguous (m,k) buffer,
+# then go through nn dispatch (opt/pad/splitk full path), with both operands k-contiguous. The transpose kernel already reaches device
+# peak (~1.1 TB/s, 128MB in 120us), with no room for further optimization.
+# Measured (37-shape): unaligned large shapes 4095³ 0.657->0.758, 8191³ 0.771->0.860,
+# 4097x8191x4095 0.759->0.842; aligned shapes 4096³ 0.791->0.849,
+# 512x16384x4096 0.814->0.898, 2048x4096x11008 0.826->0.892,
+# 2048x11008x4096 0.846->0.896, 2048x16384x2048 0.836->0.857, etc.
 _TN_TP_BM = 64
 _TN_TP_BK = 64
 _TN_TP_GM = 4
-# 非对齐 shape 走复合的最小计算量: 1023³(1.1e9)/511³ 等中小 shape 转置成本
-# 占比高, 实测直连更优; 4095³(6.9e10) 起转置只占 4% 且消除 mask 收益显著。
+# Minimum FLOPs for unaligned shapes to use composite: for medium/small shapes such as 1023³(1.1e9)/511³ the transpose cost
+# accounts for a high proportion, and direct is measured better; from 4095³(6.9e10) the transpose takes only 4% and the mask-elimination gain is significant.
 _TN_COMP_MIN_ELEMS = 10**10
-# 对齐 shape 由实验确认的精确 shape 集合驱动 (共享 config 表下 nn 内核在该批
-# shape 显著优于 tn 直连; 其余对齐 shape 两者几乎持平, 复合仅增加转置成本)。
-# 排除微秒级 shape (64,2048,1024): 复合 = tp+nn 两内核, 测量受 GPU 历史状态
-# 干扰 (32~62us 漂移), 全量 benchmark 实测 62.8us 反而远差于直连 36.3us;
-# (64,4096,2048) 复合 5 次独立测量稳定 57-60us (直连 62-66us), 保留。
-# 排除 (2048,2048,16384): 转置 263us 成本下收益仅 ~1% 且在两次全量复跑中
-# 3418/3485us 波动 (直连 3445us), 正负尾相当, 保持直连更稳。
-# v2.4 (2026-08-30): 37-shape 全量路径扫描 (warmup=200/rep=50) 后扩展的精确集合。
-# - 薄 m shape (64/128/256): A^T 转置成本 m*k 极小, nn 内核显著快于 tn 直连
-#   (128x1024x4096 119->59us -50%、64x1024x2048 63->35us -45% 等), 复合必然更优;
-# - 16384x4096x512 (-3%)、2048x4096x12288 (-7.5%)、2048x2048x16384 (-1%) 等
-#   对齐中大型 shape 实测 compA 也优于直连 (原 min(m,n)>=512 规则仅覆盖非对齐)。
+# Aligned shapes are driven by an exact shape set confirmed by experiment (under the shared config table the nn kernel on this batch of
+# shapes is significantly better than tn direct; for other aligned shapes the two are nearly on par, and composite only adds transpose cost).
+# Exclude the microsecond-level shape (64,2048,1024): composite = tp+nn two kernels, and measurement is affected by GPU history state
+# (32~62us drift); full benchmark measured 62.8us, actually far worse than direct 36.3us;
+# (64,4096,2048) composite is stable at 57-60us over 5 independent measurements (direct 62-66us), so keep it.
+# Exclude (2048,2048,16384): with a 263us transpose cost the gain is only ~1%, and in two full re-runs it fluctuated
+# 3418/3485us (direct 3445us), with comparable positive and negative tails; keeping direct is more stable.
+# v2.4 (2026-08-30): exact set expanded after a 37-shape full path scan (warmup=200/rep=50).
+# - thin-m shapes (64/128/256): A^T transpose cost m*k is tiny, and the nn kernel is significantly faster than tn direct
+#   (128x1024x4096 119->59us -50%, 64x1024x2048 63->35us -45%, etc.), so composite is necessarily better;
+# - 16384x4096x512 (-3%), 2048x4096x12288 (-7.5%), 2048x2048x16384 (-1%), etc.
+#   aligned medium/large shapes measured compA also better than direct (the original min(m,n)>=512 rule only covered unaligned).
 _TN_COMP_ALIGNED_SHAPES = {
     (4096, 4096, 4096),
     (512, 16384, 4096),
@@ -619,7 +619,7 @@ def _sgemm_tn_tp_kernel(
     BK: tl.constexpr,
     GM: tl.constexpr,
 ):
-    # src(k,m) lda=m -> dst(m,k) 连续 (A^T 转置); 带宽型内核, 64x64 达设备峰值。
+    # src(k,m) lda=m -> dst(m,k) contiguous (A^T transpose); bandwidth-bound kernel, 64x64 reaches device peak.
     pid = tl.program_id(0)
     grid_m = tl.cdiv(m, BM)
     grid_k = tl.cdiv(k, BK)
@@ -637,28 +637,28 @@ def _sgemm_tn_tp_kernel(
 
 
 def _sgemm_tn_use_composite(m, n, k, **_kw):
-    # 非对齐大 shape: 转置等价于 nn pad 路径 (消除 mask/折返开销)。
+    # Unaligned large shapes: transpose is equivalent to the nn pad path (eliminates mask/fold-back overhead).
     if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
         return min(m, n) >= 512 and m * n * k >= _TN_COMP_MIN_ELEMS
     return (m, n, k) in _TN_COMP_ALIGNED_SHAPES
 
 
 def _sgemm_tn_use_composite_y(m, n, k, **_kw):
-    # 变体 Y (v2.3, 2026-08-30): 只转置 B^T (成本 n*k) + tt 内核。
-    # tt 内核 acc_t=dot(b_t,a_t) 天然把 strided 的 A(k,m) 放 dot RHS (MFMA 不要求
-    # RHS k 连续), 只需 B 一次转置; n≪m 时 n*k 远小于方案A的 m*k, 转置成本可忽略。
-    # 实测 (exp_tn_comp_tt 37-shape): (16384,512,4096) 0.815->0.853、
-    # (32768,1024,1024) 0.798->0.816、(16384,2048,2048) 0.828->0.830、
-    # (8192,256,2048) 与直连持平; 中小 shape (m*n*k<1e9) 转置+双内核开销占比高,
-    # 直连更优 (如 (4096,128,1024) Y 0.690 vs 直连 0.738), 故要求计算量下限。
+    # Variant Y (v2.3, 2026-08-30): transpose only B^T (cost n*k) + tt kernel.
+    # The tt kernel acc_t=dot(b_t,a_t) naturally puts the strided A(k,m) on the dot RHS (MFMA does not require
+    # RHS k-contiguity), so only B needs one transpose; when n≪m, n*k is far smaller than scheme A's m*k, making transpose cost negligible.
+    # Measured (exp_tn_comp_tt 37-shape): (16384,512,4096) 0.815->0.853,
+    # (32768,1024,1024) 0.798->0.816, (16384,2048,2048) 0.828->0.830,
+    # (8192,256,2048) on par with direct; for medium/small shapes (m*n*k<1e9) transpose + two-kernel overhead is a high proportion,
+    # so direct is better (e.g., (4096,128,1024) Y 0.690 vs direct 0.738), hence the lower bound on FLOPs.
     return m >= 8 * n and m * n * k >= 10**9
 
 
-# ---- nt (C = A B^T) 直连布局内核 + EVEN_M/N/K (v2.2, 2026-08-30) ----
-# common _sgemm_nt_kernel 每 k 迭代做 tl.trans(a) 再 dot(b, a_t), 显式转置
-# 在 gfx936 上开销极大 (4096^3 6394us)。此内核改为直接加载 a_t (BK,BM) 与
-# b_t (BN,BK) (均为 MFMA 友好 row-major), dot(b_t, a_t) 后仅末尾一次 trans:
-# 4096^3 6394->3026us、8192^3 50740->21478us。EVEN 分支进一步消除 mask。
+# ---- nt (C = A B^T) direct-layout kernel + EVEN_M/N/K (v2.2, 2026-08-30) ----
+# The common _sgemm_nt_kernel does tl.trans(a) then dot(b, a_t) at every k iteration; the explicit transpose
+# is extremely expensive on gfx936 (4096^3 6394us). This kernel instead loads a_t (BK,BM) and
+# b_t (BN,BK) directly (both MFMA-friendly row-major), and after dot(b_t, a_t) does only one trans at the end:
+# 4096^3 6394->3026us, 8192^3 50740->21478us. The EVEN branch further eliminates masks.
 @triton.jit
 def _sgemm_nt_even_kernel(
     a_ptr,
@@ -772,12 +772,12 @@ sgemm_nt_hygon_kernel = libentry()(
     )(heuristics(runtime.get_heuristic_config("sgemm_nt"))(_sgemm_nt_even_kernel))
 )
 
-# ---- nt pad 路径 (v2.6, 2026-08-30) ----
-# 非对齐大 shape 直连 kernel 的 mask/k remainder 开销高 (nt 4095³ 0.755/8191³ 0.767/
-# 4097x8191x4095 0.769)。参照 nn pad 思路: A(m,k)/B(n,k) pre-pad 到 (mp,kp)/(np,kp)
-# 对齐缓冲, 主内核全 EVEN (load 无 mask), 仅 store 对真实 m/n 打 mask。
-# 实测 (warmup=100/rep=100, hipBLAS ref): 4095³ 0.755->0.840、8191³ 0.767->0.866、
-# 4097x8191x4095 0.769->0.874 (main 128x128 w8 s2 最优)。
+# ---- nt pad path (v2.6, 2026-08-30) ----
+# The direct kernel for unaligned large shapes has high mask/k remainder overhead (nt 4095³ 0.755/8191³ 0.767/
+# 4097x8191x4095 0.769). Following the nn pad idea: pre-pad A(m,k)/B(n,k) to (mp,kp)/(np,kp)
+# aligned buffers, the main kernel is all EVEN (loads without mask), only stores mask against real m/n.
+# Measured (warmup=100/rep=100, hipBLAS ref): 4095³ 0.755->0.840, 8191³ 0.767->0.866,
+# 4097x8191x4095 0.769->0.874 (main 128x128 w8 s2 optimal).
 _nt_pad_cache = {}
 
 
@@ -858,7 +858,7 @@ def _sgemm_nt_pad_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    # A_pad(mp,kp) lda=kp, B_pad(np,kp) ldb=kp; 全 EVEN load, store 对真实 m/n 打 mask。
+    # A_pad(mp,kp) lda=kp, B_pad(np,kp) ldb=kp; all-EVEN load, stores mask against real m/n.
     pid = tl.program_id(0)
     grid_m = tl.cdiv(mp, BLOCK_M)
     grid_n = tl.cdiv(np, BLOCK_N)
@@ -892,7 +892,7 @@ def _sgemm_nt_pad_kernel(
 
 
 def _sgemm_xt_is_pad_shape(m, n, k, **_kw):
-    # 非对齐且非小/瘦 shape 才走 pre-pad (nt/tt 共用; nn 有独立判定与分级 config)
+    # Only unaligned and non-small/thin shapes go through pre-pad (shared by nt/tt; nn has its own decision and tiered config)
     if (
         m % _PAD_BLOCK_M == 0
         and n % _PAD_BLOCK_N == 0
@@ -901,21 +901,21 @@ def _sgemm_xt_is_pad_shape(m, n, k, **_kw):
         return False
     if min(m, n) < 512:
         return False
-    # nt/tt main 只有大 tile config (128x128), 无 nn 的小输出分级; 实测 1023³ (1.07e9)
-    # pad 0.45 vs 直连 1.08, 阈值须显著高于 nn 的 5e8 才只覆盖 4095³ 及以上
+    # nt/tt main only has a large-tile config (128x128), without nn's small-output tiers; measured 1023³ (1.07e9)
+    # pad 0.45 vs direct 1.08, so the threshold must be significantly higher than nn's 5e8 to cover only 4095³ and above
     if m * n * k < _NT_PAD_MIN_ELEMS:
         return False
     return True
 
 
-# nt pad 专用: 只有 4095³ (6.9e10) 及以上的大非对齐 shape 走 pre-pad (见 _sgemm_nt_is_pad_shape)
+# nt pad specific: only large unaligned shapes of 4095³ (6.9e10) and above go through pre-pad (see _sgemm_nt_is_pad_shape)
 _NT_PAD_MIN_ELEMS = 2 * 10**10
 
 
 def _make_sgemm_nt_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
-    # 非对齐大 shape: main 128x128 w8 s2 最优 (4095³/8191³/4097x8191x4095 全量扫描)
+    # Unaligned large shapes: main 128x128 w8 s2 is optimal (full scan of 4095³/8191³/4097x8191x4095)
     BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
     mp = triton.cdiv(m, BM) * BM
     np = triton.cdiv(n, BN) * BN
@@ -975,12 +975,12 @@ def _make_sgemm_nt_pad_runner(
     return run
 
 
-# ---- tt pad 路径 (v2.7, 2026-08-30) ----
-# tt (C=A^T B^T): A(k,m) lda=m、B(n,k) ldb=k 均行主序。非对齐大 shape 直连内核
-# 走 mask/k remainder 路径开销高 (tt 8191³ 0.883/4097x8191x4095 0.826)。参照 nt pad:
-# A(k,m)->A_pad(kp,mp)、B(n,k)->B_pad(np,kp) pre-pad, 主内核全 EVEN load。
-# 实测 (warmup=100/rep=100, hipBLAS ref): 8191³ 0.883->1.037、4097x8191x4095 0.826->0.940、
-# 4095³ 1.115->1.239 (main 128x128 w8 s2 最优)。
+# ---- tt pad path (v2.7, 2026-08-30) ----
+# tt (C=A^T B^T): A(k,m) lda=m, B(n,k) ldb=k, both row-major. For unaligned large shapes the direct kernel
+# incurs high mask/k remainder overhead (tt 8191³ 0.883/4097x8191x4095 0.826). Following nt pad:
+# A(k,m)->A_pad(kp,mp), B(n,k)->B_pad(np,kp) pre-pad, the main kernel loads all EVEN.
+# Measured (warmup=100/rep=100, hipBLAS ref): 8191³ 0.883->1.037, 4097x8191x4095 0.826->0.940,
+# 4095³ 1.115->1.239 (main 128x128 w8 s2 optimal).
 _tt_pad_cache = {}
 
 
@@ -1012,8 +1012,8 @@ def _sgemm_tt_pad_copy_kernel(
     CM: tl.constexpr,
     CK: tl.constexpr,
 ):
-    # A(k,m) lda -> A_pad(kp,mp), B(n,k) ldb -> B_pad(np,kp); 两者列数不同,
-    # grid_j 分开计算。
+    # A(k,m) lda -> A_pad(kp,mp), B(n,k) ldb -> B_pad(np,kp); the two have different column counts,
+    # so grid_j is computed separately.
     pid = tl.program_id(0)
     nblk_a = tl.cdiv(kp, CM) * tl.cdiv(mp, CK)
     if pid < nblk_a:
@@ -1054,7 +1054,7 @@ def _sgemm_tt_pad_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    # A_pad(kp,mp) lda=mp, B_pad(np,kp) ldb=kp; 全 EVEN load, store 对真实 m/n 打 mask。
+    # A_pad(kp,mp) lda=mp, B_pad(np,kp) ldb=kp; all EVEN loads, stores masked against real m/n.
     pid = tl.program_id(0)
     grid_m = tl.cdiv(mp, BLOCK_M)
     grid_n = tl.cdiv(np, BLOCK_N)
@@ -1066,8 +1066,8 @@ def _sgemm_tt_pad_kernel(
     offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    a_t_ptrs = a_ptr + (offs_k[:, None] * mp + offs_am[None, :])  # (BK,BM) 连续
-    b_t_ptrs = b_ptr + (offs_bn[:, None] * kp + offs_k[None, :])  # (BN,BK) 连续
+    a_t_ptrs = a_ptr + (offs_k[:, None] * mp + offs_am[None, :])  # (BK,BM) contiguous
+    b_t_ptrs = b_ptr + (offs_bn[:, None] * kp + offs_k[None, :])  # (BN,BK) contiguous
     acc_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     for i in range(kp // BLOCK_K):
         a_t = tl.load(a_t_ptrs)
@@ -1090,7 +1090,7 @@ def _sgemm_tt_pad_kernel(
 def _make_sgemm_tt_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
-    # 非对齐大 shape: main 128x128 w8 s2 最优 (4095³/8191³/4097x8191x4095 全量扫描)
+    # Unaligned large shapes: main 128x128 w8 s2 is optimal (full scan of 4095³/8191³/4097x8191x4095)
     BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
     mp = triton.cdiv(m, BM) * BM
     np = triton.cdiv(n, BN) * BN
@@ -1150,12 +1150,12 @@ def _make_sgemm_tt_pad_runner(
     return run
 
 
-# ---- tn pad 路径 (v2.8, 2026-08-30) ----
-# tn (C=A^T B): A(k,m) lda=m 与 tt 的 A 布局一致, 但 B(k,n) ldb=n 是 k 行主序,
-# 直连/复合路径 (A^T->nn pad) 对大非对齐 shape 均落后 (tn 4095³ 0.880/8191³ 0.918/
-# 4097x8191x4095 0.934)。参照 tt pad: A(k,m)->A_pad(kp,mp)、B(k,n) 转置+pad->
-# B_pad(np,kp), 复用 _sgemm_tt_pad_kernel (全 EVEN main)。tt pad 同 shape 已 1.24/
-# 1.01/0.94, tn 复用后预计 4095³~1.0/8191³~0.96/4097x8191x4095~1.0。
+# ---- tn pad path (v2.8, 2026-08-30) ----
+# tn (C=A^T B): A(k,m) lda=m matches tt's A layout, but B(k,n) ldb=n is k row-major,
+# and the direct/composite paths (A^T->nn pad) both lag on large unaligned shapes (tn 4095³ 0.880/8191³ 0.918/
+# 4097x8191x4095 0.934). Following tt pad: A(k,m)->A_pad(kp,mp), B(k,n) transpose+pad->
+# B_pad(np,kp), reusing _sgemm_tt_pad_kernel (all-EVEN main). tt pad already reaches 1.24/
+# 1.01/0.94 on the same shapes; after tn reuse, expected 4095³~1.0/8191³~0.96/4097x8191x4095~1.0.
 _tn_pad_cache = {}
 
 
@@ -1187,8 +1187,8 @@ def _sgemm_tn_pad_copy_kernel(
     CM: tl.constexpr,
     CK: tl.constexpr,
 ):
-    # A(k,m) lda -> A_pad(kp,mp) (同 tt); B(k,n) ldb -> B_pad(np,kp) 转置
-    # (b_pad[n,k] = B[k,n])。A/B 的网格划分不同 (A 按 (kp,mp) tile, B 按 (np,kp) tile)。
+    # A(k,m) lda -> A_pad(kp,mp) (same as tt); B(k,n) ldb -> B_pad(np,kp) transpose
+    # (b_pad[n,k] = B[k,n]). The grid partition differs for A/B (A by (kp,mp) tile, B by (np,kp) tile).
     pid = tl.program_id(0)
     nblk_a = tl.cdiv(kp, CM) * tl.cdiv(mp, CK)
     if pid < nblk_a:
@@ -1203,8 +1203,8 @@ def _sgemm_tn_pad_copy_kernel(
         q = pid - nblk_a
         bi = q // tl.cdiv(kp, CK)
         bj = q % tl.cdiv(kp, CK)
-        offs_i = bi * CM + tl.arange(0, CM)  # n 维
-        offs_j = bj * CK + tl.arange(0, CK)  # k 维
+        offs_i = bi * CM + tl.arange(0, CM)  # n dimension
+        offs_j = bj * CK + tl.arange(0, CK)  # k dimension
         mask = (offs_i[:, None] < n) & (offs_j[None, :] < k)
         vals = tl.load(b_ptr + offs_i[:, None] + offs_j[None, :] * ldb, mask=mask, other=0.0)
         tl.store(b_pad_ptr + offs_i[:, None] * kp + offs_j[None, :], vals)
@@ -1213,7 +1213,7 @@ def _sgemm_tn_pad_copy_kernel(
 def _make_sgemm_tn_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
-    # main 128x128 w8 s2 同 tt pad (tt 全量扫描最优); A/B 两个 copy 与 tt pad 同体积。
+    # main 128x128 w8 s2 same as tt pad (optimal in the full tt scan); the two A/B copies have the same volume as tt pad.
     BM, BN, BK, GM, nw, ns = 128, 128, 32, 8, 8, 2
     mp = triton.cdiv(m, BM) * BM
     np = triton.cdiv(n, BN) * BN
@@ -1273,10 +1273,10 @@ def _make_sgemm_tn_pad_runner(
     return run
 
 
-# ---- tt (C = A^T B^T) 内核: common tt + EVEN_M/N/K (v2.2) ----
-# A(k,m) lda=m, B(n,k) ldb=k; a_t(BK,BM) 与 b_t(BN,BK) 均为连续 row-major,
-# dot(b_t, a_t) 后一次 trans 写 C。天然 MFMA 友好布局, 基线已达 sp~1.0,
-# EVEN 分支在 8192^3 再 -5.5%。
+# ---- tt (C = A^T B^T) kernel: common tt + EVEN_M/N/K (v2.2) ----
+# A(k,m) lda=m, B(n,k) ldb=k; a_t(BK,BM) and b_t(BN,BK) are both contiguous row-major,
+# dot(b_t, a_t) followed by a single trans writes C. Naturally MFMA-friendly layout, baseline already reaches sp~1.0,
+# the EVEN branch gives another -5.5% at 8192^3.
 @triton.jit
 def _sgemm_tt_even_kernel(
     a_ptr,
@@ -1391,35 +1391,35 @@ sgemm_tt_hygon_kernel = libentry()(
 )
 
 
-# ---- nt 瘦 shape 专用: 两阶段 split-k (v2.13, 2026-08-31) ----
-# nt 直连内核 (64,64) tile 下 blocks 仅 8-32, 并行度不足 (gfx936 数十 CU)。
-# split-k 把 k 均分给 SPLIT_K 段并行 (内核1 写 scratch(SPLIT_K,n,m) C^T 布局,
-# 内核2 reduce 到 C), blocks 倍乘 SPLIT_K。官方口径 do_bench(warmup=1000,
-# rep=100, median) 实测 (kpack=2, DB 生产 config):
-#   (64,512,512) SP4 20.6->15.7us (+31%)、(512,64,512) SP4 19.7->15.0 (+31%)、
-#   (64,2048,1024) SP4 31.0->25.8 (+20%)、(2048,64,1024) SP4 31.0->25.8 (+20%)、
-#   (64,1024,512) SP4 18.4->16.3 (+13%)、(1024,64,512) SP4 18.6->16.6 (+12%)、
-#   (64,4096,2048) SP2 57.3->53.9 (+6%)。
-# 已 64+ blocks 的 shape (4096x128x1024/128x4096x1024) 反而 SP 变差 (0.59-0.90),
-# 以及 (2048,2048,16384) SP 0.92, 均不进白名单。k 必须整除 SPLIT_K*BLOCK_K,
-# 白名单 shape 全为 64 倍数 (全 EVEN, 无 k remainder)。
+# ---- nt thin shape specific: two-stage split-k (v2.13, 2026-08-31) ----
+# With the nt direct kernel's (64,64) tile, blocks are only 8-32, insufficient parallelism (gfx936 has dozens of CUs).
+# split-k evenly divides k among SPLIT_K segments in parallel (kernel 1 writes scratch(SPLIT_K,n,m) in C^T layout,
+# kernel 2 reduces into C), multiplying blocks by SPLIT_K. Official protocol do_bench(warmup=1000,
+# rep=100, median) measured (kpack=2, DB production config):
+#   (64,512,512) SP4 20.6->15.7us (+31%), (512,64,512) SP4 19.7->15.0 (+31%),
+#   (64,2048,1024) SP4 31.0->25.8 (+20%), (2048,64,1024) SP4 31.0->25.8 (+20%),
+#   (64,1024,512) SP4 18.4->16.3 (+13%), (1024,64,512) SP4 18.6->16.6 (+12%),
+#   (64,4096,2048) SP2 57.3->53.9 (+6%).
+# Shapes already at 64+ blocks (4096x128x1024/128x4096x1024) instead regress with SP (0.59-0.90),
+# and (2048,2048,16384) SP 0.92; none enter the whitelist. k must be divisible by SPLIT_K*BLOCK_K,
+# and all whitelist shapes are multiples of 64 (all EVEN, no k remainder).
 _NT_SPLITK_BLOCK_M = 64
 _NT_SPLITK_BLOCK_N = 64
 _NT_SPLITK_BLOCK_K = 32
 _NT_SPLITK_GROUP_M = 8
 _NT_SPLITK_STAGES = 2
-# shape -> (SPLIT_K, num_warps) (num_warps 取 DB 生产直连 config 的 w)
-# v2.26: 移除 (64,512,512)/(512,64,512)/(1024,64,512) -> 改走 direct override
-# (BK64+kp2 全 config 扫描官方 A/B: 17.28/16.80/17.76us -> 12.80/13.76/12.32us,
-# 显著优于 split-k)。
-# v2.27: 移除剩余 4 个 (64,1024,512)/(64,2048,1024)/(2048,64,1024)/
-# (64,4096,2048) -> 改走 direct override (BK64+kp2 全 config 扫描 + 官方 A/B 三轮
-# 全稳定, 详见 _NT_DIRECT_OVERRIDES)。白名单清空, split-k 机制保留备用。
+# shape -> (SPLIT_K, num_warps) (num_warps takes the w of the DB production direct config)
+# v2.26: removed (64,512,512)/(512,64,512)/(1024,64,512) -> routed to direct override
+# (BK64+kp2 full config scan official A/B: 17.28/16.80/17.76us -> 12.80/13.76/12.32us,
+# significantly better than split-k).
+# v2.27: removed the remaining 4 (64,1024,512)/(64,2048,1024)/(2048,64,1024)/
+# (64,4096,2048) -> routed to direct override (BK64+kp2 full config scan + official A/B three rounds
+# all stable, see _NT_DIRECT_OVERRIDES for details). Whitelist cleared, split-k mechanism kept for spare use.
 _NT_SPLITK_SHAPES = {}
 
 
 def _sgemm_nt_splitk(m, n, k, **_kw):
-    # 返回 SPLIT_K 或 0 (不走 split-k)。仅精确白名单 shape, 避免误伤。
+    # Returns SPLIT_K or 0 (do not use split-k). Only exact whitelist shapes, to avoid unintended hits.
     cfg = _NT_SPLITK_SHAPES.get((m, n, k))
     if cfg is None:
         return 0
@@ -1449,7 +1449,7 @@ def _sgemm_nt_splitk_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    # 内核1: 每个 block 计算部分 K 段, 写 scratch(SPLIT_K, n, m) (C^T 布局)。
+    # Kernel 1: each block computes a partial K segment, writes scratch(SPLIT_K, n, m) (C^T layout).
     pid = tl.program_id(0)
     pid_k = pid % SPLIT_K
     pid_mn = pid // SPLIT_K
@@ -1524,7 +1524,7 @@ def _sgemm_nt_splitk_reduce_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    # 内核2: reduce SPLIT_K 段 -> C (m,n) row-major。
+    # Kernel 2: reduce SPLIT_K segments -> C (m,n) row-major.
     pid = tl.program_id(0)
     grid_m = tl.cdiv(m, BLOCK_M)
     grid_n = tl.cdiv(n, BLOCK_N)
@@ -1580,8 +1580,8 @@ def _get_nt_splitk_scratch(sp, n, m, device):
 def _make_sgemm_nt_splitk_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, SPLIT_K, num_warps, **_kw
 ):
-    # 白名单 shape 全为 (64,64) tile 对齐 (m/n 64 倍数) 且 k 整除 SPLIT_K*BK,
-    # 内核可静态全 EVEN; 转置内核不参与, 无 config 表依赖。
+    # Whitelist shapes are all (64,64) tile aligned (m/n multiples of 64) and k divisible by SPLIT_K*BK,
+    # so the kernel can be statically all EVEN; the transpose kernel is not involved, no config table dependency.
     BM, BN, BK, GM = (
         _NT_SPLITK_BLOCK_M,
         _NT_SPLITK_BLOCK_N,
@@ -1616,39 +1616,39 @@ def _make_sgemm_nt_splitk_runner(
     return run
 
 
-# ---- nt 直连 config override (v2.13, 2026-08-31) ----
-# libtuner 从共享 config 池为直连内核选 config, 个别非对齐小 shape 上生产 config
-# (num_warps 等) 不是最优。官方口径 raw 扫描实测 511³ (64,64) tile w16 比生产
-# w4 快 20% (29.4->23.7us, ratio 0.745->0.93), itt0+kp1 最优。
-# runner 固定手动 launch raw 内核。
+# ---- nt direct config override (v2.13, 2026-08-31) ----
+# libtuner selects configs for the direct kernel from a shared config pool; on some unaligned small shapes the production config
+# (num_warps, etc.) is not optimal. Official-protocol raw scan measured 511³ (64,64) tile w16 is 20% faster than production
+# w4 (29.4->23.7us, ratio 0.745->0.93), with itt0+kp1 optimal.
+# The runner always manually launches the raw kernel.
 _NT_DIRECT_OVERRIDES = {
     (511, 511, 511): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
     ),
-    # v2.14 (2026-08-31): 官方口径 A/B 交替实测 (同进程各 3 次 do_bench)
-    # (256,256,256) 生产 (64,64)w4 13.44us -> (64,64)w8 kp1 13.28us (+1.2%, 稳定)
-    # (128,4096,1024)/(4096,128,1024) 换 config 无收益或更慢, 不落地
-    # v2.15 (2026-09-01): 小 tile 扫描, (32,32)w4 大胜 (64,64)w8:
-    #   同进程 A/B 各 3 次 do_bench: 生产 14.56us 稳定 -> (32,32)w4 kp1 11.09us
-    #   (MED, min 10.72) 快 24-36%。小 shape 并行度是瓶颈, 32 块 grid 128 程序。
+    # v2.14 (2026-08-31): official-protocol alternating A/B measurement (3 do_bench each in the same process)
+    # (256,256,256) production (64,64)w4 13.44us -> (64,64)w8 kp1 13.28us (+1.2%, stable)
+    # (128,4096,1024)/(4096,128,1024) show no gain or are slower with another config, not landed
+    # v2.15 (2026-09-01): small tile scan, (32,32)w4 beats (64,64)w8 by a large margin:
+    #   A/B 3 do_bench each in the same process: production 14.56us stable -> (32,32)w4 kp1 11.09us
+    #   (MED, min 10.72), 24-36% faster. Parallelism is the bottleneck for small shapes, the 32-block grid becomes 128 programs.
     (256, 256, 256): dict(
         BLOCK_M=32, BLOCK_N=32, GROUP_M=8, num_warps=4,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
     ),
-    # v2.15b (2026-09-01): 512^3 同 tile 提并行: 生产 (64,64)w4kp1 21.60us ->
-    #   (64,64)w8kp2 20.43us (-5.4%, A/B 交替各 3 次确认, min 20.00us)。
+    # v2.15b (2026-09-01): 512^3 same tile, more parallelism: production (64,64)w4kp1 21.60us ->
+    #   (64,64)w8kp2 20.43us (-5.4%, confirmed by alternating A/B 3 times, min 20.00us).
     (512, 512, 512): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.16 (2026-09-01): (256,8192,2048) 同 (512,16384,4096) 模式 w4->w8 kp2:
-    #   生产 211.33us -> 201.12us (-4.8%, A/B 各 3 次全稳定), ratio 0.889->0.941。
+    # v2.16 (2026-09-01): (256,8192,2048) same (512,16384,4096) pattern w4->w8 kp2:
+    #   production 211.33us -> 201.12us (-4.8%, all 3 A/B runs stable), ratio 0.889->0.941.
     (256, 8192, 2048): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.14b: (512,16384,4096) w4->w8 kp2 1356->1343us ratio 0.9495->0.9587 达标
+    # v2.14b: (512,16384,4096) w4->w8 kp2 1356->1343us ratio 0.9495->0.9587 meets target
     #         (8192,256,2048) w4->w8 kp2 205.6->199.7us ratio 0.922->0.949 (+2.9%)
     (512, 16384, 4096): dict(
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
@@ -1658,53 +1658,53 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, GROUP_M=8, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.17 (2026-09-01): 1023³ 最弱 (37 shape 画像 0.7051)。直连扫描
-    # (128,128)w16kp2 大 tile 提 A 跨块重读利用; 关键 knob 是 GROUP_M=1
-    # (旧扫描固定 GM8 只找到 128x64w8kp2 边际 -2%)。官方口径 A/B 交替各 3 轮:
-    # 生产 (64,128)w8gm8 91.68us 稳定 -> 88.80us 稳定 (-3.1%, ratio 0.7051->0.7279)。
-    # pad 路径 97.9us (copy 37us 吃掉收益)、composite 被 min<4096 排除, 均不适用。
+    # v2.17 (2026-09-01): 1023³ weakest (0.7051 in the 37-shape profile). Direct scan
+    # (128,128)w16kp2 large tile improves A cross-block re-read utilization; the key knob is GROUP_M=1
+    # (the old scan fixed GM8 and only found a marginal -2% for 128x64w8kp2). Official-protocol alternating A/B 3 rounds:
+    # production (64,128)w8gm8 91.68us stable -> 88.80us stable (-3.1%, ratio 0.7051->0.7279).
+    # pad path 97.9us (copy 37us eats the gain), composite excluded by min<4096, neither applicable.
     (1023, 1023, 1023): dict(
         BLOCK_M=128, BLOCK_N=128, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.18 (2026-09-01): 1024³ 偶数立方异常值 (0.8160, 2048³/4096³ 均 >0.92)。
-    # 直连扫描 176 config (11 tile x w8/16 x itt0/1 x kp1/2 x gm1/8): 生产
-    # (128,128)w8gm8kp1 73.92us 稳定 -> (64,128)w8gm1kp2 71.84us 稳定 (-2.7%,
-    # ratio 0.8225->0.845)。kp2+GM1 优于生产 tile。
+    # v2.18 (2026-09-01): 1024³ even-cube outlier (0.8160, 2048³/4096³ both >0.92).
+    # Direct scan of 176 configs (11 tile x w8/16 x itt0/1 x kp1/2 x gm1/8): production
+    # (128,128)w8gm8kp1 73.92us stable -> (64,128)w8gm1kp2 71.84us stable (-2.7%,
+    # ratio 0.8225->0.845). kp2+GM1 outperforms the production tile.
     (1024, 1024, 1024): dict(
         BLOCK_M=64, BLOCK_N=128, GROUP_M=1, num_warps=8,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.19 (2026-09-01): 瘦 shape 扫描 (4096,128,1024)/(128,4096,1024) 各 128
-    # config: (4096,128,1024) A/B 无收益 (扫描 45.92us 为噪声, A/B 均 46.56us),
-    # 不落地。(128,4096,1024) 生产 (64,128)w8gm8 46.72us 稳定 -> (64,128)w16gm1
-    # kp2 45.76us 稳定 (-2.1%, ratio 0.8082->0.8252)。
-    # v2.26b (2026-09-01): BK64 扫描再提升 -4.5%: (64,64)BK64w16gm8kp2itt1
-    # 官方口径 A/B 三轮稳定 43.20us (r 0.83->0.874, 生产 44.96-45.60us)。
+    # v2.19 (2026-09-01): thin shape scan (4096,128,1024)/(128,4096,1024) 128
+    # configs each: (4096,128,1024) A/B no gain (scan 45.92us is noise, A/B both 46.56us),
+    # not landed. (128,4096,1024) production (64,128)w8gm8 46.72us stable -> (64,128)w16gm1
+    # kp2 45.76us stable (-2.1%, ratio 0.8082->0.8252).
+    # v2.26b (2026-09-01): BK64 scan improves another -4.5%: (64,64)BK64w16gm8kp2itt1
+    # official-protocol A/B three rounds stable 43.20us (r 0.83->0.874, production 44.96-45.60us).
     (128, 4096, 1024): dict(
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=True, kpack=2,
     ),
-    # v2.20 (2026-09-01): 64³ 超小 shape launch-bound (生产 (64,64)w4gm8 grid=1)。
-    # 384 config 小 tile 扫描 (8 tile x w1/2/4 x itt x kp x gm x BK16/32): 54 config
-    # 达 8.16us, 远超生产 10.24us (r=0.8125)。官方 A/B 三轮稳定确认
-    # (32,16)w4itt0kp1gm1 8.16/8.00/8.00us (r=0.98-1.0) vs 生产 9.92-10.08us
-    # (r=0.79-0.81)。小 tile 提并行度 (grid 1 -> 8) 是核心收益。
+    # v2.20 (2026-09-01): 64³ ultra-small shape launch-bound (production (64,64)w4gm8 grid=1).
+    # 384-config small tile scan (8 tile x w1/2/4 x itt x kp x gm x BK16/32): 54 configs
+    # reach 8.16us, far better than production 10.24us (r=0.8125). Official A/B three rounds stably confirm
+    # (32,16)w4itt0kp1gm1 8.16/8.00/8.00us (r=0.98-1.0) vs production 9.92-10.08us
+    # (r=0.79-0.81). Raising parallelism with small tiles (grid 1 -> 8) is the core gain.
     (64, 64, 64): dict(
         BLOCK_M=32, BLOCK_N=16, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False, kpack=1,
     ),
-    # v2.26 (2026-09-01): 瘦/小 shape 4 个, 生产 config 非最优 (BK=64+kp2 关键)。
-    # 全 config 扫描 (11 tile x w4/8/16 x itt x kp x gm x BK32/64) + 官方口径 A/B 三轮:
-    #   (64,512,512):   生产 (64,64)w8kp2 17.12us r=0.83 -> (16,32)w4itt1kp2gm8
-    #                   BK64 12.80/12.80/11.36us r=1.11-1.25。小 tile 提并行度
-    #                   (grid 8 -> 64 块)。
-    #   (1024,64,512):  生产 17.76us r=0.85 -> (32,32)w4itt1kp2gm1 BK64
-    #                   13.44/13.60/13.60us r=1.11。grid 16 -> 32 块。
-    #   (512,64,512):   生产 15.68-16.80us r=0.79-0.85 -> (16,16)w4itt0kp2gm1
-    #                   BK64 13.76us 稳定 r=0.97。grid 16 -> 128 块。
-    #   (4096,64,2048): 生产 54.24-54.40us r=0.87 -> (64,64)w16itt0kp2gm1
-    #                   BK64 48.32-48.48us r=0.98。grid 64 -> 64 块 w16 提 ILP。
+    # v2.26 (2026-09-01): 4 thin/small shapes, production config not optimal (BK=64+kp2 key).
+    # Full config scan (11 tile x w4/8/16 x itt x kp x gm x BK32/64) + official-protocol A/B three rounds:
+    #   (64,512,512):   production (64,64)w8kp2 17.12us r=0.83 -> (16,32)w4itt1kp2gm8
+    #                   BK64 12.80/12.80/11.36us r=1.11-1.25. Small tile raises parallelism
+    #                   (grid 8 -> 64 blocks).
+    #   (1024,64,512):  production 17.76us r=0.85 -> (32,32)w4itt1kp2gm1 BK64
+    #                   13.44/13.60/13.60us r=1.11. grid 16 -> 32 blocks.
+    #   (512,64,512):   production 15.68-16.80us r=0.79-0.85 -> (16,16)w4itt0kp2gm1
+    #                   BK64 13.76us stable r=0.97. grid 16 -> 128 blocks.
+    #   (4096,64,2048): production 54.24-54.40us r=0.87 -> (64,64)w16itt0kp2gm1
+    #                   BK64 48.32-48.48us r=0.98. grid 64 -> 64 blocks, w16 raises ILP.
     (64, 512, 512): dict(
         BLOCK_M=16, BLOCK_N=32, BLOCK_K=64, GROUP_M=8, num_warps=4,
         num_stages=2, use_in_thread_transpose=True, kpack=2,
@@ -1721,19 +1721,19 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.27 (2026-09-02): 原 split-k 白名单 4 个, BK64+kp2 全 config 扫描 +
-    # 官方口径 A/B 交替 3 轮 (全部稳定, 详见 /tmp/nt_v227_ab.py):
-    #   (64,1024,512):  split-k 生产 17.60/16.16/17.60us r=0.82-0.89 ->
-    #                   (32,32)w4itt0kp2gm1BK64 12.16-13.28us r=1.08-1.18。
-    #                   grid 4 -> 64 块提并行度。
-    #   (64,2048,1024): split-k 生产 24.80-25.92us r=0.88-0.92 ->
-    #                   (32,64)w8itt0kp2gm8BK64 21.12-21.76us r=1.04-1.08。
-    #                   grid 8 -> 64 块。
-    #   (2048,64,1024): split-k 生产 24.16-25.60us r=0.93-0.98 ->
-    #                   (32,64)w8itt0kp2gm8BK64 20.96-22.08us r=1.07-1.13。
-    #                   grid 8 -> 64 块。
-    #   (64,4096,2048): split-k 生产 53.92us r=0.89 -> (64,64)w16itt0kp2gm8BK64
-    #                   48.32us r=1.00 稳定 (-10.4%)。
+    # v2.27 (2026-09-02): the original 4 split-k whitelist shapes, BK64+kp2 full config scan +
+    # official-protocol alternating A/B 3 rounds (all stable, see /tmp/nt_v227_ab.py for details):
+    #   (64,1024,512):  split-k production 17.60/16.16/17.60us r=0.82-0.89 ->
+    #                   (32,32)w4itt0kp2gm1BK64 12.16-13.28us r=1.08-1.18.
+    #                   grid 4 -> 64 blocks to raise parallelism.
+    #   (64,2048,1024): split-k production 24.80-25.92us r=0.88-0.92 ->
+    #                   (32,64)w8itt0kp2gm8BK64 21.12-21.76us r=1.04-1.08.
+    #                   grid 8 -> 64 blocks.
+    #   (2048,64,1024): split-k production 24.16-25.60us r=0.93-0.98 ->
+    #                   (32,64)w8itt0kp2gm8BK64 20.96-22.08us r=1.07-1.13.
+    #                   grid 8 -> 64 blocks.
+    #   (64,4096,2048): split-k production 53.92us r=0.89 -> (64,64)w16itt0kp2gm8BK64
+    #                   48.32us r=1.00 stable (-10.4%).
     (64, 1024, 512): dict(
         BLOCK_M=32, BLOCK_N=32, BLOCK_K=64, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
@@ -1750,20 +1750,20 @@ _NT_DIRECT_OVERRIDES = {
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=False, kpack=2,
     ),
-    # v2.28 (2026-09-02): (4096,128,1024) NT 最大异常值 (r=0.767)。BK64 全 config
-    # 扫描 (12 tile x w4/8/16 x itt x kp x gm): 生产 (64,64)w16 46.56us 稳定 ->
-    # (64,64)BK64w16itt1kp2gm1 42.40us 稳定。官方口径 A/B 交替 3 轮:
-    # 45.92-46.40us (r=0.755-0.763) -> 42.88-43.04us (r=0.814-0.817, -7.4%)。
-    # 同 (128,4096,1024) v2.26b pattern (BK64+w16+kp2)。仍 <0.90 但明显改善。
+    # v2.28 (2026-09-02): (4096,128,1024) NT largest outlier (r=0.767). BK64 full config
+    # scan (12 tile x w4/8/16 x itt x kp x gm): production (64,64)w16 46.56us stable ->
+    # (64,64)BK64w16itt1kp2gm1 42.40us stable. Official-protocol alternating A/B 3 rounds:
+    # 45.92-46.40us (r=0.755-0.763) -> 42.88-43.04us (r=0.814-0.817, -7.4%).
+    # Same (128,4096,1024) v2.26b pattern (BK64+w16+kp2). Still <0.90 but clearly improved.
     (4096, 128, 1024): dict(
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=16,
         num_stages=2, use_in_thread_transpose=True, kpack=2,
     ),
-    # v2.29 (2026-09-02): (2048,2048,16384) 大 K shape (<0.8 异常值)。direct
-    # config + split-k 扫描 (10 direct + 8 split-k): 生产 DB direct (kp1) 3289.3us
-    # (r=0.7855) 稳定 -> (64,64)BK64w16kp2gm8itt1 3190us 稳定 (r=0.809-0.810)。
-    # 官方口径 A/B 交替 3 轮: 3289.3us -> 3189.6-3192.8us (-3.0%)。BK64+w16+kp2
-    # 提 k-loop 吞吐 (k=16384 长循环); split-k 4 段 (128,128) 3201us 略差不取。
+    # v2.29 (2026-09-02): (2048,2048,16384) large-K shape (<0.8 outlier). direct
+    # config + split-k scan (10 direct + 8 split-k): production DB direct (kp1) 3289.3us
+    # (r=0.7855) stable -> (64,64)BK64w16kp2gm8itt1 3190us stable (r=0.809-0.810).
+    # Official-protocol alternating A/B 3 rounds: 3289.3us -> 3189.6-3192.8us (-3.0%). BK64+w16+kp2
+    # raises k-loop throughput (k=16384 long loop); split-k 4 segments (128,128) 3201us is slightly worse, not taken.
     (2048, 2048, 16384): dict(
         BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=16,
         num_stages=2, use_in_thread_transpose=True, kpack=2,
@@ -1796,12 +1796,12 @@ def _make_sgemm_nt_direct_runner(
     return run
 
 
-# ---- tn 直连 config override (v2.22, 2026-09-01) ----
-# 5 个不达标 shape (core_shape 画像 speedup<0.90) 均因生产 config 并行度/效率不足:
-# 小 shape 缩小 tile 提并行度 (与 tt 同策略), 官方口径 do_bench(1000/100/median)
-# 扫描 (扫描 /tmp/sgemm_tn_scan_results.json + /tmp/sgemm_tn_scan2_results.json)
-# 全部达 speedup>=1.0。runner 固定手动 launch raw 内核。
-# 注: tn 布局 A(k,m) lda=m / B(k,n) ldb=n / C(m,n) ldc=n。
+# ---- tn direct config override (v2.22, 2026-09-01) ----
+# The 5 underperforming shapes (core_shape profile speedup<0.90) all suffer from insufficient parallelism/efficiency of the production config:
+# shrinking tiles for small shapes raises parallelism (same strategy as tt), official-protocol do_bench(1000/100/median)
+# scan (scan /tmp/sgemm_tn_scan_results.json + /tmp/sgemm_tn_scan2_results.json)
+# all reach speedup>=1.0. The runner always manually launches the raw kernel.
+# Note: tn layout A(k,m) lda=m / B(k,n) ldb=n / C(m,n) ldc=n.
 _TN_DIRECT_OVERRIDES = {
     (256, 256, 256): dict(
         BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
@@ -1823,11 +1823,11 @@ _TN_DIRECT_OVERRIDES = {
         BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False,
     ),
-    # v2.30 (2026-09-02): 64³ 超小 shape launch-bound (grid=1, 生产 10.56us
-    # r=0.788 官方口径)。小 tile 扫描 54 config: w4 各类 tile 均达 8.16us 下限
-    # (r=1.0-1.16)。monkeypatch A/B 三轮交替: prod 10.56us 稳定 -> (32,32)w4gm1
-    # 8.16-9.44us (r=0.87-1.02, 最差轮仍 >=0.8)。与其余 tn 小 shape override 同款
-    # (32,32)w4gm1。小 tile 提并行度 (grid 1 -> 4)。
+    # v2.30 (2026-09-02): 64³ ultra-small shape launch-bound (grid=1, production 10.56us
+    # r=0.788 official protocol). Small tile scan of 54 configs: w4 across tiles all reach the 8.16us floor
+    # (r=1.0-1.16). monkeypatch A/B three alternating rounds: prod 10.56us stable -> (32,32)w4gm1
+    # 8.16-9.44us (r=0.87-1.02, worst round still >=0.8). Same as the other tn small shape overrides
+    # (32,32)w4gm1. Small tiles raise parallelism (grid 1 -> 4).
     (64, 64, 64): dict(
         BLOCK_M=32, BLOCK_N=32, GROUP_M=1, num_warps=4,
         num_stages=2, use_in_thread_transpose=False,
@@ -1859,11 +1859,11 @@ def _make_sgemm_tn_direct_runner(
     return run
 
 
-# ---- tn 复合路径 nn 内核 config override (v2.23, 2026-09-01) ----
-# comp 路径 = tp(A^T) + nn 内核。生产走 _SGEMM_NN_DISPATCH tuner config0
-# (64,64,w4,gm8,BK32,s2) 对 4096³ 非最优: 实验扫描 (warmup=200/rep=30, 362+ config)
-# 发现 (64,128,w8,itt1,gm1,BK32,s2,nobuf) 更快 (prod 2912->2898us, r 0.886->0.890)。
-# tp 内核已到带宽峰值 (~1.1TB/s, 120us), 直连/compY 结构均更差, 此为结构下限。
+# ---- tn composite path nn kernel config override (v2.23, 2026-09-01) ----
+# comp path = tp(A^T) + nn kernel. Production uses _SGEMM_NN_DISPATCH tuner config0
+# (64,64,w4,gm8,BK32,s2), which is not optimal for 4096³: experimental scan (warmup=200/rep=30, 362+ configs)
+# found (64,128,w8,itt1,gm1,BK32,s2,nobuf) faster (prod 2912->2898us, r 0.886->0.890).
+# The tp kernel has reached the bandwidth peak (~1.1TB/s, 120us); direct/compY structures are both worse, this is the structural floor.
 _TN_COMP_OVERRIDES = {
     (4096, 4096, 4096): dict(
         BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, GROUP_M=1, num_warps=8,
@@ -1899,11 +1899,11 @@ def _make_sgemm_tn_comp_override_runner(
     return run
 
 
-# ---- tn 复合路径 Y (compY) tt 内核 config override (v2.24, 2026-09-01) ----
-# compY = tp(B^T) + tt even 内核。生产走 tuner config 对这 2 个大 shape 非最优:
-# 官方口径 do_bench(1000/100/median) 验证 (32768,1024,1024) 1556->1540us
-# (r 0.892->0.901), (16384,2048,2048) 2953->2921us (r 0.880->0.890, 结构上限
-# 未达 0.90)。runner 固定手动 launch raw 内核。
+# ---- tn composite path Y (compY) tt kernel config override (v2.24, 2026-09-01) ----
+# compY = tp(B^T) + tt even kernel. The production tuner config is not optimal for these 2 large shapes:
+# official-protocol do_bench(1000/100/median) verification (32768,1024,1024) 1556->1540us
+# (r 0.892->0.901), (16384,2048,2048) 2953->2921us (r 0.880->0.890, structural ceiling
+# not reaching 0.90). The runner always manually launches the raw kernel.
 _TN_COMPY_OVERRIDES = {
     (32768, 1024, 1024): dict(
         BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, GROUP_M=1, num_warps=8,
@@ -1944,13 +1944,13 @@ def _make_sgemm_tn_compy_override_runner(
     return run
 
 
-# ---- tt 直连 config override (v2.21, 2026-09-01) ----
-# 7 个不达标 shape (core_shape 画像 speedup<0.90) 全是 grid 并行度不足导致:
-# 生产 config 大 tile 下 blocks 少 (64x512x512 (64,64)tile 64 块 -> 16x16 1024 块),
-# 小 tile 提并行度, 官方口径 do_bench(warmup=1000, rep=100, median) A/B 交替验证
-# (扫描 /tmp/sgemm_tt_scan_results.json + A/B /tmp/verify_sgemm_tt_ab.py) 全部
-# 提速 15-46% 达 speedup>=1.0。runner 固定手动 launch raw 内核。
-# 注: tt 布局 A(k,m) lda=m / B(n,k) ldb=k / C(m,n) ldc=n, EVEN 判定按 m,n,k。
+# ---- tt direct config override (v2.21, 2026-09-01) ----
+# All 7 underperforming shapes (core_shape profile speedup<0.90) are caused by insufficient grid parallelism:
+# the production config's large tiles leave few blocks (64x512x512 (64,64)tile 64 blocks -> 16x16 1024 blocks),
+# small tiles raise parallelism, official-protocol do_bench(warmup=1000, rep=100, median) alternating A/B verification
+# (scan /tmp/sgemm_tt_scan_results.json + A/B /tmp/verify_sgemm_tt_ab.py) all
+# speed up 15-46% reaching speedup>=1.0. The runner always manually launches the raw kernel.
+# Note: tt layout A(k,m) lda=m / B(n,k) ldb=k / C(m,n) ldc=n, EVEN determined by m,n,k.
 _TT_DIRECT_OVERRIDES = {
     (64, 512, 512): dict(
         BLOCK_M=16, BLOCK_N=16, GROUP_M=1, num_warps=2,
@@ -2007,10 +2007,10 @@ def _make_sgemm_tt_direct_runner(
     return run
 
 
-# ---- StaticDispatch: 按 shape 情况分发不同 sgemm_nn kernel ----
-# 大 K shape (k >= 4*max(m,n)): 两阶段 split-k, 实测 2048x2048x16384 有效
-# 非对齐且非小 shape: pre-pad + 全 EVEN 内核 (消除 mask/k remainder 开销)
-# 其余: 现网 libtuner opt kernel (保持原行为)
+# ---- StaticDispatch: dispatch different sgemm_nn kernels by shape ----
+# Large K shape (k >= 4*max(m,n)): two-stage split-k, measured effective for 2048x2048x16384
+# Unaligned and non-small shape: pre-pad + all-EVEN kernel (eliminate mask/k remainder overhead)
+# Otherwise: current libtuner opt kernel (keep original behavior)
 
 _SPLITK_BLOCK_M = 64
 _SPLITK_BLOCK_N = 64
@@ -2019,47 +2019,47 @@ _SPLITK_GROUP_M = 8
 _SPLITK_WARPS = 4
 _SPLITK_STAGES = 2
 
-# pad 路径参数 (实测最优 config)
+# pad path parameters (measured optimal config)
 _PAD_BLOCK_M = 128
 _PAD_BLOCK_N = 256
 _PAD_BLOCK_K = 32
-# v1.8 (2026-08-26): copy tile 由 64x64 改为 32x32 (带宽型 copy, 小 tile 网格更大
-# 负载均衡更好): 8191³ copy 1214->908us (-25%)、1023³ copy 50->20us、4097x8191x4095
-# copy 356us 持平; 完整路径 8191³ -1.6%、1023³ -16%。32 恒整除 mp/np/kp
-# (mp/np 为 BM/BN 倍数, kp 为 128 倍数), 无对齐风险。
+# v1.8 (2026-08-26): copy tile changed from 64x64 to 32x32 (bandwidth-bound copy, smaller tiles give a larger grid
+# and better load balance): 8191³ copy 1214->908us (-25%), 1023³ copy 50->20us, 4097x8191x4095
+# copy 356us unchanged; full path 8191³ -1.6%, 1023³ -16%. 32 always divides mp/np/kp
+# (mp/np are multiples of BM/BN, kp is a multiple of 128), no alignment risk.
 _PAD_COPY_CM = 32
 _PAD_COPY_CK = 128
-# tt pad-copy 专用 tile (v2.9): 非对齐大 shape 实测小方形 tile (32,32) 远优于
-# (32,128) —— 4097x8191x4095 copy 487us -> 331us (1.08TB/s -> 1.2TB/s),
-# 4095³/8191³ 同构受益。小 tile 程序数翻倍, 更利于延迟隐藏/带宽饱和。
+# tt pad-copy dedicated tile (v2.9): measured on unaligned large shapes, a small square tile (32,32) is far better than
+# (32,128) -- 4097x8191x4095 copy 487us -> 331us (1.08TB/s -> 1.2TB/s),
+# 4095³/8191³ benefit similarly. Small tiles double the program count, better for latency hiding/bandwidth saturation.
 _TT_PAD_COPY_CM = 32
 _TT_PAD_COPY_CK = 32
-# 小输出 shape 的更高并行度候选: main (32,64) + copy tile 32
-# (1023³ 完整路径 116->92us, -20%; copy 50->20us)。
-# 但 main BM=32 使 mp 可能非 64 倍数, 而 copy tile 必须整除 mp/np/kp,
-# 不满足时由 runner 回退 (128,128) main (mp/np 恒为 128 倍数, 安全)。
-# v2.9 曾试 (64,32): buf1 下与 (32,64) 持平 (75.4us), 无收益, 维持 (32,64)。
+# Higher-parallelism candidate for small-output shapes: main (32,64) + copy tile 32
+# (1023³ full path 116->92us, -20%; copy 50->20us).
+# But main BM=32 makes mp possibly not a multiple of 64, while the copy tile must divide mp/np/kp;
+# when not satisfied the runner falls back to (128,128) main (mp/np are always multiples of 128, safe).
+# v2.9 once tried (64,32): with buf1 it ties (32,64) (75.4us), no gain, keep (32,64).
 _PAD_CFG_SMALL_TILE = (32, 64, 32, 8, 4, 2)
-# 大输出 shape 分级 (v1.8 实测, 2026-08-26):
-# - m*n >= 32M (大输出, 如 8191³/4097x8191x4095): (256,256,32,G1,w16,s1) + ITT1 + no-buffer
-#   8191³ 0.862->0.925 达标 (main 与 opt 8192³ 生产 config 同款, 20652us)、
+# Large-output shape tiers (v1.8 measured, 2026-08-26):
+# - m*n >= 32M (large output, e.g. 8191³/4097x8191x4095): (256,256,32,G1,w16,s1) + ITT1 + no-buffer
+#   8191³ 0.862->0.925 meets target (main is the same as opt 8192³ production config, 20652us),
 #   4097x8191x4095 0.806->0.869
-# - 4M <= m*n < 32M (中输出, 如 4095³): (256,128,32,G8,w8,s1) + ITT0 + no-buffer
-#   4095³ 0.738->0.788 ((256,256,w16) 反而 0.734, 因 grid 仅 16x16 时大 tile 低效)
-# - m*n < 4M (小输出, 如 1023³): (32,64) 避免 tile 浪费, 保持 ITT0+buf 默认 (0.625->0.724)
+# - 4M <= m*n < 32M (medium output, e.g. 4095³): (256,128,32,G8,w8,s1) + ITT0 + no-buffer
+#   4095³ 0.738->0.788 ((256,256,w16) instead 0.734, because large tiles are inefficient when the grid is only 16x16)
+# - m*n < 4M (small output, e.g. 1023³): (32,64) avoids tile waste, keeps ITT0+buf default (0.625->0.724)
 _PAD_CFG_LARGE = (256, 256, 32, 1, 16, 2)
-# v1.10: MID 由 (256,128,32,G8,w8,s1)+ITT0 改为 (64,64,32,G8,w4,s2)+ITT1
-# (与 opt 4096^3 生产 config 同款)。4095^3 pad main 算全 EVEN 4096^3:
-# (64,64,ITT1) 2927us vs (256,128,ITT0) 3013us (-2.9%), ITT1 必需 (ITT0 3201)。
-# 4095^3 完整路径 0.788 -> ~0.809。mp/np=cdiv(4095,64)=4096 仍满足 copy tile 对齐。
+# v1.10: MID changed from (256,128,32,G8,w8,s1)+ITT0 to (64,64,32,G8,w4,s2)+ITT1
+# (same as opt 4096^3 production config). 4095^3 pad main counts as all-EVEN 4096^3:
+# (64,64,ITT1) 2927us vs (256,128,ITT0) 3013us (-2.9%), ITT1 required (ITT0 3201).
+# 4095^3 full path 0.788 -> ~0.809. mp/np=cdiv(4095,64)=4096 still satisfies copy tile alignment.
 _PAD_CFG_MID = (64, 64, 32, 8, 4, 2)
 _PAD_LARGE_OUTPUT = 32 * 1024 * 1024
 _PAD_CFG_SMALL = (128, 128, 32, 8, 8, 2)
 _PAD_SMALL_OUTPUT = 4 * 1024 * 1024
-# 排除 511³ (1.3e8) 等小 shape: pad-copy 开销占比大, 实测反而更差
+# Exclude small shapes like 511³ (1.3e8): pad-copy overhead dominates, measured worse instead
 _PAD_MIN_ELEMS = 5 * 10**8
 
-# pad 缓冲区缓存: 避免每次调用重复分配大 buffer (按 pad 后尺寸缓存)
+# pad buffer cache: avoid reallocating large buffers on every call (cached by padded size)
 _pad_cache = {}
 
 
@@ -2075,36 +2075,36 @@ def _get_pad_buffers(mp, kp, np, device):
 
 
 _LARGE_K_OPT_SHAPES = {(2048, 2048, 16384)}
-# v1.10: SPLIT_K=4 对薄大 K shape 显著更优 (实测):
-#   128x1024x4096 64.2->52.5us (-18.2%)、256x2048x8192 288.5->251.7us (-12.8%);
-#   512x4096x16384 反而 SPK=4 退化 (1700->2825), 保持 SPK=2。
-# 仅当 k 能被 SPLIT_K*BLOCK_K 整除时走 SPK=4 (保证段内全 EVEN, 无 k remainder)。
+# v1.10: SPLIT_K=4 is significantly better for thin large-K shapes (measured):
+#   128x1024x4096 64.2->52.5us (-18.2%), 256x2048x8192 288.5->251.7us (-12.8%);
+#   512x4096x16384 instead regresses with SPK=4 (1700->2825), keep SPK=2.
+# Use SPK=4 only when k is divisible by SPLIT_K*BLOCK_K (ensure all EVEN within a segment, no k remainder).
 _SPLITK4_SHAPES = {(128, 1024, 4096), (256, 2048, 8192)}
 
 
 def _sgemm_nn_is_large_k(m, n, k, **_kw):
-    # 大 K shape 走两阶段 split-k; 特例 (2048,2048,16384) 实测 opt+ITT1 (0.852)
-    # 优于 split-k+ITT0 (0.792) 与 opt+ITT0 (0.778), 由 _LARGE_K_OPT_SHAPES 排除
+    # Large K shapes use two-stage split-k; the special case (2048,2048,16384) measured opt+ITT1 (0.852)
+    # better than split-k+ITT0 (0.792) and opt+ITT0 (0.778), excluded by _LARGE_K_OPT_SHAPES
     if (m, n, k) in _LARGE_K_OPT_SHAPES:
         return False
-    # split-k 按 k_per = k // SPLIT_K 均分, k 为奇数时末元素被丢弃 (静默错误),
-    # 且 EVEN_K 需按段内余数判断; 奇数 k 一律回退 opt (其自带 k-remainder 分支)
+    # split-k evenly divides by k_per = k // SPLIT_K; when k is odd the last element is dropped (silent error),
+    # and EVEN_K must be determined by the per-segment remainder; odd k always falls back to opt (which has its own k-remainder branch)
     if k % 2 != 0:
         return False
     return k >= 4 * max(m, n)
 
 
-# ITT (in-thread-transpose) per-shape 决策: 基于 ITT=0/1 全量回归实测
-# - ITT=1 (True): 大 shape 普遍受益 (2048³ 0.828->0.904、256x8192x2048 0.839->0.908 等)
-# - ITT=0 (False): 瘦 shape (min(m,n)<=128) 与小立方受 in-thread-transpose 布局损害
-#   (64x512x512 1.054->0.774、256³ 1.103->0.918、511³ 0.854->0.790 等), config 无法恢复
-# - 显式集合覆盖规则例外 (64³ 超小 shape ITT=1 反而 +0.136 至 0.983)
-# v1.6 教训 (2026-08-26): 4 组合 (ITT x buffer) 扫描用手动 launch + DB TunedConfig
-# 表 config, 但生产 libtuner 实际用 benchmark 表 config (二者不一致, 瘦 shape 尤甚)
-# -> 手动 config 下 ITT0 对 16384x512x4096/512x16384x4096 更优 (-2.3%), 但 monkeypatch
-#    生产路径确认 ITT1 才是生产最优 (1465us vs ITT0 1592us, 组合结论被 config 翻转).
-#    唯一保留: 2048x16384x2048 从 _ITT0_SHAPES 移除 -> 生产路径 ITT1+nobuf 2867.6us
-#    优于 ITT0+nobuf 2901us (+1.2%).
+# ITT (in-thread-transpose) per-shape decision: based on full regression measurements of ITT=0/1
+# - ITT=1 (True): large shapes generally benefit (2048³ 0.828->0.904, 256x8192x2048 0.839->0.908, etc.)
+# - ITT=0 (False): thin shapes (min(m,n)<=128) and small cubes are hurt by the in-thread-transpose layout
+#   (64x512x512 1.054->0.774, 256³ 1.103->0.918, 511³ 0.854->0.790, etc.), the config cannot recover
+# - Explicit sets override the rule exceptions (64³ ultra-small shape ITT=1 instead +0.136 to 0.983)
+# v1.6 lesson (2026-08-26): the 4-combination (ITT x buffer) scan used manual launch + DB TunedConfig
+# table configs, but the production libtuner actually uses benchmark table configs (the two differ, especially for thin shapes)
+# -> under manual config ITT0 is better for 16384x512x4096/512x16384x4096 (-2.3%), but monkeypatching the
+#    production path confirms ITT1 is the production optimum (1465us vs ITT0 1592us, the combination conclusion is flipped by config).
+#    The only retained change: 2048x16384x2048 removed from _ITT0_SHAPES -> production path ITT1+nobuf 2867.6us
+#    better than ITT0+nobuf 2901us (+1.2%).
 _ITT0_SHAPES = {
     (256, 256, 256),
     (511, 511, 511),
@@ -2124,14 +2124,14 @@ def _sgemm_nn_use_itt(m, n, k, **_kw):
     return True
 
 
-# use_buffer_ops (AMDGCN_USE_BUFFER_OPS) per-shape 决策: 基于 33 个 opt shape
-# 全量快扫 + 正式协议 (warmup=1000/rep=100) 交错确认 (2026-08-26)
-# - no-buffer (False): 大/中输出 shape (m*n>=2M) 普遍受益 -1~-4%
-#   (4096³ -3.9%、512x16384x4096 -4.0%、2048x11008x4096 -4.1% 等);
-#   非对齐 mask 路径 shape 受益显著 (511³ -10.0%)
-# - buffer (True, 默认): 小输出 shape 保持 (1024³ +3.6%、128x4096x1024 +3.8%
-#   [正式确认] 等 no-buffer 反而变差); (2048,2048,16384) 大 K opt 在 no-buffer 下
-#   严重变差 (+43% 正式确认), 必须保持 buffer
+# use_buffer_ops (AMDGCN_USE_BUFFER_OPS) per-shape decision: based on 33 opt shapes
+# full quick scan + formal protocol (warmup=1000/rep=100) interleaved confirmation (2026-08-26)
+# - no-buffer (False): large/medium output shapes (m*n>=2M) generally benefit -1~-4%
+#   (4096³ -3.9%, 512x16384x4096 -4.0%, 2048x11008x4096 -4.1%, etc.);
+#   shapes on the unaligned mask path benefit significantly (511³ -10.0%)
+# - buffer (True, default): small output shapes keep it (1024³ +3.6%, 128x4096x1024 +3.8%
+#   [formally confirmed] etc. become worse with no-buffer); the (2048,2048,16384) large K opt under no-buffer
+#   becomes severely worse (+43% formally confirmed), must keep buffer
 def _sgemm_nn_use_buffer_ops(m, n, k, **_kw):
     if (m, n, k) == (2048, 2048, 16384):
         return True
@@ -2143,15 +2143,15 @@ def _sgemm_nn_use_buffer_ops(m, n, k, **_kw):
 
 
 def _sgemm_nn_is_pad_shape(m, n, k, **_kw):
-    # 非对齐(相对 pad tile 尺寸)且非小/瘦 shape 才走 pre-pad 路径
+    # Only unaligned (relative to pad tile size) and non-small/thin shapes take the pre-pad path
     if (
         m % _PAD_BLOCK_M == 0
         and n % _PAD_BLOCK_N == 0
         and k % _PAD_BLOCK_K == 0
     ):
         return False
-    # 瘦 shape (输出任一维度 < 512) 走 opt: 实测 pad-copy 开销占比大反而更差,
-    # 同时覆盖 511³、64³ 及 4096x64x2048 等 (n/m=64/128 对 BN=256 不对齐)
+    # Thin shapes (either output dimension < 512) use opt: measured pad-copy overhead dominates and is actually worse,
+    # also covering 511³, 64³ and 4096x64x2048 etc. (n/m=64/128 not aligned to BN=256)
     if min(m, n) < 512:
         return False
     if m * n * k < _PAD_MIN_ELEMS:
@@ -2167,9 +2167,9 @@ def _make_sgemm_nn_pad_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
     if m * n < _PAD_SMALL_OUTPUT:
-        # 小输出: main (32,64) 提升并行度 (1023³ 完整路径 116->92us, -20%);
-        # main BM=32 使 mp 可能非 128 倍数, 不满足时回退 (128,128) main。
-        # copy 统一 32x32 (v1.8: 带宽型 copy 最优, 1023³ copy 50->20us)。
+        # Small output: main (32,64) raises parallelism (1023³ full path 116->92us, -20%);
+        # main BM=32 makes mp possibly not a multiple of 128, falls back to (128,128) main when not satisfied.
+        # copy uniformly 32x32 (v1.8: optimal for bandwidth-bound copy, 1023³ copy 50->20us).
         BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL_TILE
         mp = triton.cdiv(m, BM) * BM
         np = triton.cdiv(n, BN) * BN
@@ -2177,28 +2177,28 @@ def _make_sgemm_nn_pad_runner(
             BM, BN, BK, GM, nw, ns = _PAD_CFG_SMALL
             mp = triton.cdiv(m, BM) * BM
             np = triton.cdiv(n, BN) * BN
-        use_buf = True   # 小输出保持 buffer ops 默认 (1023³ buf0 反而略差)
+        use_buf = True   # small output keeps buffer ops default (1023³ buf0 is actually slightly worse)
         use_itt = False
     elif m * n >= _PAD_LARGE_OUTPUT:
-        # 大输出: (256,256,32,G1,w16,s2) + ITT1 + no-buffer
-        # (s2 比 s1 快 13%: 8191³ 0.795->0.924, 4097x8191x4095 0.755->0.869)
+        # Large output: (256,256,32,G1,w16,s2) + ITT1 + no-buffer
+        # (s2 is 13% faster than s1: 8191³ 0.795->0.924, 4097x8191x4095 0.755->0.869)
         BM, BN, BK, GM, nw, ns = _PAD_CFG_LARGE
         mp = triton.cdiv(m, BM) * BM
         np = triton.cdiv(n, BN) * BN
         use_buf = False
         use_itt = True
     else:
-        # 中输出: (64,64,32,G8,w4,s2) + ITT1 + no-buffer (v1.10, 4095³ 0.809)
+        # Medium output: (64,64,32,G8,w4,s2) + ITT1 + no-buffer (v1.10, 4095³ 0.809)
         BM, BN, BK, GM, nw, ns = _PAD_CFG_MID
         mp = triton.cdiv(m, BM) * BM
         np = triton.cdiv(n, BN) * BN
         use_buf = False
         use_itt = True
     CCM = CCK = _PAD_COPY_CM
-    # kp 需同时为主内核 BLOCK_K(32) 与 pad-copy tile (32) 的整数倍:
-    # copy kernel 对 k 维按 CK 分块且 store 无 mask, 若 kp 非 CK 倍数
-    # 末块会写到 kp 之外 (如 512x12800x5210, kp=5216 -> 写到 5247 行, 越界 VMFault)。
-    # 128 是 32 的倍数, 按 _PAD_COPY_CK(128) 对齐可同时满足两者。
+    # kp must be a multiple of both the main kernel BLOCK_K (32) and the pad-copy tile (32):
+    # the copy kernel tiles the k dimension by CK and stores without mask; if kp is not a multiple of CK
+    # the last block writes beyond kp (e.g. 512x12800x5210, kp=5216 -> writes to row 5247, out-of-bounds VMFault).
+    # 128 is a multiple of 32, aligning to _PAD_COPY_CK (128) satisfies both.
     kp = triton.cdiv(k, _PAD_COPY_CK) * _PAD_COPY_CK
     A_pad, B_pad = _get_pad_buffers(mp, kp, np, A.device)
     grid_pad = (
@@ -2223,8 +2223,8 @@ def _make_sgemm_nn_pad_runner(
             kp,
             CM=CCM,
             CK=CCK,
-            num_warps=4,  # tile32 下 nw4 优于 nw8: 8191³ copy 948->908, 4095³ 229->223, 4097 359->345
-            use_in_thread_transpose=False,  # pad 路径在 ITT=1 下变差 (8191³ 0.862->0.823)
+            num_warps=4,  # nw4 is better than nw8 with tile32: 8191³ copy 948->908, 4095³ 229->223, 4097 359->345
+            use_in_thread_transpose=False,  # pad path regresses with ITT=1 (8191³ 0.862->0.823)
         )
         main_kwargs = dict(
             BETA_IS_ZERO=beta_is_zero,
@@ -2234,11 +2234,11 @@ def _make_sgemm_nn_pad_runner(
             GROUP_M=GM,
             num_warps=nw,
             num_stages=ns,
-            use_in_thread_transpose=use_itt,  # 大/中输出 ITT1, 小输出 ITT0
+            use_in_thread_transpose=use_itt,  # large/medium output ITT1, small output ITT0
         )
         if not use_buf:
-            # no-buffer 变体 (大/中输出): 显式传 use_buffer_ops=False 进编译选项;
-            # use_buf=True 时不传, 保持全局默认产物
+            # no-buffer variant (large/medium output): explicitly pass use_buffer_ops=False into the compile options;
+            # when use_buf=True do not pass it, keeping the global default artifact
             main_kwargs["use_buffer_ops"] = False
         _sgemm_nn_pad_kernel[grid_main](
             A_pad,
@@ -2261,9 +2261,9 @@ def _make_sgemm_nn_pad_runner(
 def _make_sgemm_nn_splitk_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, **_kw
 ):
-    # per-shape SPLIT_K: 薄大 K shape (128x1024x4096/256x2048x8192) 实测 SPK=4
-    # 显著更优 (-18.2%/-12.8%); 512x4096x16384 等 SPK=4 严重退化, 保持 SPK=2。
-    # SPK=4 仅在 k 能被 SPLIT_K*BLOCK_K 整除时采用 (保证段内全 EVEN, 无 k remainder)。
+    # per-shape SPLIT_K: thin large-K shapes (128x1024x4096/256x2048x8192) measured SPK=4
+    # significantly better (-18.2%/-12.8%); 512x4096x16384 etc. severely regress with SPK=4, keep SPK=2.
+    # SPK=4 is used only when k is divisible by SPLIT_K*BLOCK_K (ensure all EVEN within a segment, no k remainder).
     if (m, n, k) in _SPLITK4_SHAPES and k % (_SPLITK_BLOCK_K * 4) == 0:
         spk = 4
     else:
@@ -2271,8 +2271,8 @@ def _make_sgemm_nn_splitk_runner(
     scratch = torch.zeros(spk, m, n, dtype=torch.float32, device=C.device)
     ev_m = m % _SPLITK_BLOCK_M == 0
     ev_n = n % _SPLITK_BLOCK_N == 0
-    # EVEN_K 按段内余数判断: k_per = k // SPLIT_K, 段内全 EVEN 等价于 k_per % BK == 0
-    # (原 k % BK == 0 未考虑 split-k 均分, 例如 k=96/SPK=2 -> k_per=48 %32 != 0)
+    # EVEN_K determined by the per-segment remainder: k_per = k // SPLIT_K, all EVEN within a segment is equivalent to k_per % BK == 0
+    # (the original k % BK == 0 did not account for split-k division, e.g. k=96/SPK=2 -> k_per=48 %32 != 0)
     ev_k = (k // spk) % _SPLITK_BLOCK_K == 0
     grid_mn = triton.cdiv(m, _SPLITK_BLOCK_M) * triton.cdiv(n, _SPLITK_BLOCK_N)
     grid_main = (grid_mn * spk,)
@@ -2298,7 +2298,7 @@ def _make_sgemm_nn_splitk_runner(
             GROUP_M=_SPLITK_GROUP_M,
             num_warps=_SPLITK_WARPS,
             num_stages=_SPLITK_STAGES,
-            use_in_thread_transpose=False,  # split-k 在 ITT=1 下严重退化 (0.792->0.493)
+            use_in_thread_transpose=False,  # split-k severely regresses with ITT=1 (0.792->0.493)
         )
         _sgemm_nn_splitk_reduce_kernel[grid_reduce](
             scratch,
@@ -2330,8 +2330,8 @@ def _make_sgemm_nn_opt_runner(
     def run():
         kwargs = dict(use_in_thread_transpose=use_itt)
         if not use_buf:
-            # no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项 (cache key 区分);
-            # use_buf=True 时不传, 保持全局默认产物, 与未注入前完全一致
+            # no-buffer variant: explicitly pass use_buffer_ops=False into the compile options (distinguished by cache key);
+            # when use_buf=True do not pass it, keeping the global default artifact, exactly as before injection
             kwargs["use_buffer_ops"] = False
         sgemm_nn_hygon_kernel[grid](
             A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
@@ -2350,10 +2350,10 @@ _SGEMM_NN_DISPATCH = StaticDispatch(
 )
 
 
-# ---- nn opt 内核 config override (v2.25, 2026-09-01) ----
-# 生产走 libtuner DB best_config, 但以下 shape 的 DB config 非最优:
-# 全 config 扫描 (26 config x ITT x buffer) + 官方口径 (warmup=1000/rep=100) 确认
-# 手动 launch 以下 config 更快:
+# ---- nn opt kernel config override (v2.25, 2026-09-01) ----
+# Production uses the libtuner DB best_config, but for the following shapes the DB config is not optimal:
+# full config scan (26 config x ITT x buffer) + official protocol (warmup=1000/rep=100) confirm
+# manually launching the following configs is faster:
 #   (256,256,256):     (32,32,BK64,w4,itt0,buf)   12.64->10.40us r 0.911->1.108
 #   (1024,1024,1024):  (64,128,BK32,w8,itt1,nobuf) 75.20->70.08us r 0.851->0.913
 #   (128,4096,1024):   (64,64,BK16,gm1,w4,itt1,nobuf) 51.04->43.84us r 0.809->0.942
@@ -2390,7 +2390,7 @@ def _make_sgemm_nn_opt_override_runner(
             use_in_thread_transpose=ov.get("use_in_thread_transpose", True),
         )
         if not ov.get("use_buffer_ops", True):
-            # no-buffer 变体: 显式传 use_buffer_ops=False 进编译选项
+            # no-buffer variant: explicitly pass use_buffer_ops=False into the compile options
             kwargs["use_buffer_ops"] = False
         _sgemm_nn_opt_kernel[grid](
             A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
@@ -2400,9 +2400,9 @@ def _make_sgemm_nn_opt_override_runner(
     return run
 
 
-# ---- tn 复合路径: A^T 缓冲缓存 + runner (v2.3, 2026-08-30) ----
-# 与 _get_pad_buffers 同款约定: 按 (m,k,device) 缓存, 避免每次调用分配大 buffer
-# (8191³ 的 Ac 达 268MB)。转置内核全量覆盖缓冲 (无 padding), torch.empty 即可。
+# ---- tn composite path: A^T buffer cache + runner (v2.3, 2026-08-30) ----
+# Same convention as _get_pad_buffers: cached by (m,k,device), avoiding allocating a large buffer on every call
+# (Ac for 8191³ reaches 268MB). The transpose kernel fully overwrites the buffer (no padding), so torch.empty suffices.
 _tn_ac_cache = {}
 
 
@@ -2419,8 +2419,8 @@ def _make_sgemm_tn_composite_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
 ):
     Ac = _get_tn_ac(m, k, A.device)
-    # 纯 int 算术而非 triton.cdiv: cdiv 的 constexpr 包装单次 ~7.8us, runner 每次
-    # 调用都会重建 (sgemm 入口), 对小 shape 是 ~15us 的纯 Python 开销
+    # Plain int arithmetic instead of triton.cdiv: the constexpr wrapper of cdiv costs ~7.8us each time, and the runner
+    # rebuilds it on every call (sgemm entry), which is ~15us of pure Python overhead for small shapes
     grid_tp = (
         (m + _TN_TP_BM - 1) // _TN_TP_BM
     ) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
@@ -2456,8 +2456,8 @@ def _make_sgemm_tn_composite_runner(
     return run
 
 
-# ---- tn 复合路径变体 Y: B^T 缓冲缓存 + tt 内核 runner (v2.3, 2026-08-30) ----
-# 与 _get_tn_ac 同款约定: 按 (n,k,device) 缓存, 转置内核全量覆盖 (无 padding)。
+# ---- tn composite path variant Y: B^T buffer cache + tt kernel runner (v2.3, 2026-08-30) ----
+# Same convention as _get_tn_ac: cached by (n,k,device), the transpose kernel fully overwrites (no padding).
 _tn_bc_cache = {}
 
 
@@ -2473,10 +2473,10 @@ def _get_tn_bc(n, k, device):
 def _make_sgemm_tn_composite_y_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
 ):
-    # 转置 B(k,n) ldb=n -> Bc(n,k) 连续, 再走 tt 内核 (A 保持 (k,m) lda=m,
-    # strided 放 dot RHS, MFMA 不要求 RHS k 连续)。
+    # Transpose B(k,n) ldb=n -> Bc(n,k) contiguous, then run the tt kernel (A keeps (k,m) lda=m,
+    # strided as the dot RHS, MFMA does not require the RHS to be k-contiguous).
     Bc = _get_tn_bc(n, k, B.device)
-    # 同上: cdiv constexpr 包装 ~7.8us/次, runner 每次调用重建, 改纯 int 算术
+    # Same as above: cdiv constexpr wrapper ~7.8us each time, the runner rebuilds on every call, switch to plain int arithmetic
     grid_tp = (
         (n + _TN_TP_BM - 1) // _TN_TP_BM
     ) * ((k + _TN_TP_BK - 1) // _TN_TP_BK)
@@ -2497,19 +2497,19 @@ def _make_sgemm_tn_composite_y_runner(
     return run
 
 
-# ---- nt 复合路径 (At+TT, v2.8, 2026-08-31) ----
-# C = A B^T 的直连内核 a_t 按 (BK,BM) 读 A 列块 (stride-lda 碎片), 是大 shape 的
-# 主要瓶颈 (16384^3 nt 直连 184.2ms vs hipBLAS ref 149.9ms)。方案: 一次转置
-# A(m,k)->At(k,m) (~2ms), 再走 tt 内核 (A 侧变 1KB 连续, B 侧 128B), 与直连同
-# 结构但总时间更低。实测 (生产 tt 入口 + 池内 256x256 G8, warmup=25/rep=25):
-# 16384^3 0.884->0.914、8192^3 0.885->0.907、8192x28672x8192 0.888->0.925、
-# 4096x8192x28672 0.830->0.851; 中/小 shape 转置+双内核开销占比高, 直连更优。
+# ---- nt composite path (At+TT, v2.8, 2026-08-31) ----
+# The direct kernel for C = A B^T reads A column blocks as (BK,BM) (stride-lda fragmentation), which is the main
+# bottleneck for large shapes (16384^3 nt direct 184.2ms vs hipBLAS ref 149.9ms). Solution: one transpose
+# A(m,k)->At(k,m) (~2ms), then run the tt kernel (A side becomes 1KB contiguous, B side 128B), same
+# structure as direct but lower total time. Measured (production tt entry + in-pool 256x256 G8, warmup=25/rep=25):
+# 16384^3 0.884->0.914, 8192^3 0.885->0.907, 8192x28672x8192 0.888->0.925,
+# 4096x8192x28672 0.830->0.851; for medium/small shapes the transpose + two-kernel overhead dominates, direct is better.
 _nt_at_cache = {}
 
 
-# kpack=2 逐 shape 例外表 (v2.12)。官方口径 do_bench(warmup=1000/rep=100/median)
-# 实测: 这些直连 shape 上 kpack=2 比 kpack=1 慢 >=1% (d 列), 回退到 kpack=1
-# 消除回退; 其余直连 shape kpack=2 净正 (2048x4096x11008 -4.3% 等)。
+# kpack=2 per-shape exception table (v2.12). Official-protocol do_bench(warmup=1000/rep=100/median)
+# measured: on these direct shapes kpack=2 is >=1% slower than kpack=1 (d column), falling back to kpack=1
+# eliminates the regression; on other direct shapes kpack=2 is net positive (2048x4096x11008 -4.3% etc.).
 #   (64,512,512)  +1.7% | (512,64,512) +2.5% | (512,512,512) +3.1%
 #   (511,511,511) +1.1% | (4096,128,1024) +1.0% | (2048,2048,16384) +1.4%
 _NT_KPACK1_SHAPES = {
@@ -2536,10 +2536,10 @@ def _get_nt_at(k, m, device):
 
 
 def _sgemm_nt_use_composite(m, n, k, **_kw):
-    # 仅对齐大 shape: 转置内核与 tt 内核均要求 32 对齐; 与 pad 路径互斥
-    # (8191^3 等非对齐 shape 继续走 pre-pad)。阈值 m*n*k>=5e11 且 min(m,n)>=4096
-    # 覆盖 16384^3/8192^3/8192x28672x8192/4096x8192x28672, 排除 4096^3 (直连 0.917
-    # 更优) 与 2048x2048x16384 (min=2048, 转置开销吃掉内核收益)。
+    # Aligned large shapes only: both the transpose kernel and the tt kernel require 32 alignment; mutually exclusive with the pad path
+    # (unaligned shapes like 8191^3 continue to use pre-pad). Threshold m*n*k>=5e11 and min(m,n)>=4096
+    # covers 16384^3/8192^3/8192x28672x8192/4096x8192x28672, excludes 4096^3 (direct 0.917
+    # is better) and 2048x2048x16384 (min=2048, the transpose overhead eats the kernel gain).
     if m % 32 != 0 or n % 32 != 0 or k % 32 != 0:
         return False
     if min(m, n) < 4096:
@@ -2551,8 +2551,8 @@ def _make_sgemm_nt_composite_runner(
     A, lda, B, ldb, C, ldc, m, n, k, alpha, beta, beta_is_zero, grid, **_kw
 ):
     At = _get_nt_at(k, m, A.device)
-    # 转置参数语义: _sgemm_tn_tp_kernel(src, dst, m=dst行数, k=dst列数, lda=src行stride);
-    # A(m,k) lda=k -> At(k,m): (A, At, k, m, lda)。
+    # Transpose parameter semantics: _sgemm_tn_tp_kernel(src, dst, m=dst rows, k=dst cols, lda=src row stride);
+    # A(m,k) lda=k -> At(k,m): (A, At, k, m, lda).
     grid_tp = (
         (k + _TN_TP_BM - 1) // _TN_TP_BM
     ) * ((m + _TN_TP_BK - 1) // _TN_TP_BK)
@@ -2564,10 +2564,10 @@ def _make_sgemm_nt_composite_runner(
         _sgemm_tn_tp_kernel[grid_tp](
             A, At, k, m, lda, _TN_TP_BM, _TN_TP_BK, _TN_TP_GM
         )
-        # kpack=2 (HIPOptions 编译选项, 每指令打包 2 个 k 元素) 实测对全部复合
-        # shape 有效 (v2.11, scan4: 16384^3 0.915->0.925、8192x28672x8192 0.925
-        # ->0.936 等); 该选项经 libentry 透传并纳入 entry_key, 与 TT 路径的
-        # kpack=1 产物互不串用。
+        # kpack=2 (HIPOptions compile option, packing 2 k elements per instruction) measured effective for all composite
+        # shapes (v2.11, scan4: 16384^3 0.915->0.925, 8192x28672x8192 0.925
+        # ->0.936 etc.); this option is passed through by libentry and included in entry_key, not cross-used with the TT path's
+        # kpack=1 artifacts.
         sgemm_tt_hygon_kernel[grid](
             At, B, C, alpha, beta, m, n, k, m, ldb, ldc, beta_is_zero,
             use_in_thread_transpose=itt,
@@ -2578,26 +2578,26 @@ def _make_sgemm_nt_composite_runner(
     return run
 
 
-# ---- sgemm 入口级 runner 缓存 (v2.5, 2026-08-30) ----
-# nn 分发 lookup_and_build 与 composite runner 每次调用都会重建 (~7-17us 纯 Python
-# 开销, cdiv constexpr 包装 ~7.8us/次)。对微秒级 shape (64x512x512 等) 开销占比大,
-# 按 (shape, stride, 标量, 张量 data_ptr) 缓存 runner 闭包, 命中时直接复用。
-# data_ptr 参与 key: 不同张量必然重建; 闭包持引用防地址复用误命中。上限防无限增长。
-# v2.10 (2026-08-31): 闭包持 A/B/C 引用, 无差别缓存会长期钉住大 shape 张量 (全量
-# benchmark 37-shape × 4 变体累积后 16384³ 单 runner 12GB 导致 OOM)。启动开销只对
-# 微秒级 shape 有意义, 按钉住总元素数门控: 大 shape 每次调用重建 (~10-20us, 相对
-# 毫秒级内核可忽略), 张量随调用结束即可释放。
+# ---- sgemm entry-level runner cache (v2.5, 2026-08-30) ----
+# The nn dispatch lookup_and_build and composite runner are rebuilt on every call (~7-17us pure Python
+# overhead, cdiv constexpr wrapper ~7.8us each time). For microsecond-level shapes (64x512x512 etc.) the overhead dominates,
+# so runner closures are cached by (shape, stride, scalars, tensor data_ptr) and reused on hit.
+# data_ptr participates in the key: different tensors necessarily rebuild; the closure holds references to prevent false hits from address reuse. An upper bound prevents unbounded growth.
+# v2.10 (2026-08-31): closures hold A/B/C references, so indiscriminate caching would pin large-shape tensors long-term (the full
+# benchmark 37-shape x 4 variants accumulated to 12GB for a single 16384³ runner, causing OOM). Startup overhead only matters for
+# microsecond-level shapes, so gate by total pinned elements: large shapes rebuild on every call (~10-20us, negligible relative to
+# millisecond kernels), and tensors can be released as soon as the call ends.
 _sgemm_runner_cache = {}
 _sgemm_runner_cache_max = 8192
-# 单 runner 钉住上限 16M 元素 (~64MB fp32): 覆盖 ≤2048³ 的常规小/中 shape。
+# Per-runner pin limit 16M elements (~64MB fp32): covers regular small/medium shapes up to 2048³.
 _SGEMM_RUNNER_CACHE_MAX_PIN = 16 * 2**20
 
 
 def _cache_sgemm_runner(key, runner):
-    # key = (transa, transb, m, n, k, ...); 按钉住总元素数门控
+    # key = (transa, transb, m, n, k, ...); gated by total pinned elements
     m, n, k = key[2], key[3], key[4]
     if m * k + n * k + m * n > _SGEMM_RUNNER_CACHE_MAX_PIN:
-        return runner  # 大 shape 不缓存, 避免闭包钉住数百 MB~GB 张量
+        return runner  # large shapes are not cached, avoiding the closure pinning hundreds of MB~GB of tensors
     if len(_sgemm_runner_cache) < _sgemm_runner_cache_max:
         _sgemm_runner_cache[key] = runner
     return runner
@@ -2639,15 +2639,15 @@ def sgemm(
         return
 
     beta_is_zero = beta == 0.0
-    # 纯 int 算术 (不用 triton.cdiv): 避免 constexpr 包装开销, grid 每次启动都会求值
+    # Plain int arithmetic (not triton.cdiv): avoids constexpr wrapper overhead, grid is evaluated on every launch
     grid = lambda meta: (
         ((m + meta["BLOCK_M"] - 1) // meta["BLOCK_M"])
         * ((n + meta["BLOCK_N"] - 1) // meta["BLOCK_N"]),
     )
 
-    # runner 按 (shape, stride, 标量, 张量指针) 缓存: nn 分发/composite runner 每次
-    # 调用重建 (lookup_and_build ~7us + grid_tp 构造), 对微秒级 shape 是显著开销。
-    # data_ptr 参与 key 保证不同张量必然重建, 闭包持有的旧张量不会被释放复用地址。
+    # The runner is cached by (shape, stride, scalars, tensor pointers): the nn dispatch/composite runner is
+    # rebuilt on every call (lookup_and_build ~7us + grid_tp construction), which is significant overhead for microsecond-level shapes.
+    # data_ptr in the key guarantees different tensors necessarily rebuild; old tensors held by the closure are not released and cannot reuse addresses.
     key = (
         transa,
         transb,
@@ -2669,9 +2669,9 @@ def sgemm(
     with torch_device_fn.device(A.device):
         if transa == CUBLAS_OP_N and transb == CUBLAS_OP_N:
             if (m, n, k) in _NN_OPT_OVERRIDES:
-                # nn opt 内核 config override (v2.25): DB best_config 非最优,
-                # 手动 launch 扫描确认的最优 config (官方口径 256³ 1.108/1024³ 0.913/
-                # 128x4096x1024 0.942)。
+                # nn opt kernel config override (v2.25): DB best_config is not optimal,
+                # the optimal config confirmed by manual launch scan (official protocol 256³ 1.108/1024³ 0.913/
+                # 128x4096x1024 0.942).
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -2721,8 +2721,8 @@ def sgemm(
                 runner()
         elif transa == CUBLAS_OP_T and transb == CUBLAS_OP_N:
             if (m, n, k) in _TN_DIRECT_OVERRIDES:
-                # tn 直连 config override (v2.22): 小 shape 生产 config 非最优,
-                # 缩小 tile 提并行度 (官方口径 A/B 全部 >=1.0)。
+                # tn direct config override (v2.22): production config not optimal for small shapes,
+                # shrink tiles to raise parallelism (official-protocol A/B all >=1.0).
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -2745,8 +2745,8 @@ def sgemm(
                     )
                 runner()
             elif _sgemm_xt_is_pad_shape(m, n, k):
-                # 非对齐大 shape: A(k,m)->A_pad(kp,mp) + B(k,n) 转置->B_pad(np,kp),
-                # 复用 tt even main (v2.8, 4095³ 0.880->~1.0/8191³ 0.918->~0.96/
+                # Unaligned large shapes: A(k,m)->A_pad(kp,mp) + B(k,n) transpose->B_pad(np,kp),
+                # reuse tt even main (v2.8, 4095³ 0.880->~1.0/8191³ 0.918->~0.96/
                 # 4097x8191x4095 0.934->~1.0)
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
@@ -2771,7 +2771,7 @@ def sgemm(
                 runner()
             elif _sgemm_tn_use_composite_y(m, n, k):
                 if (m, n, k) in _TN_COMPY_OVERRIDES:
-                    # compY tt 内核 config override (v2.24): 大 shape 手动 launch
+                    # compY tt kernel config override (v2.24): manually launch for large shapes
                     runner = _sgemm_runner_cache.get(key)
                     if runner is None:
                         runner = _cache_sgemm_runner(
@@ -2795,7 +2795,7 @@ def sgemm(
                         )
                     runner()
                 else:
-                    # 变体 Y: n≪m 时只转置 B^T (成本 n*k) 比方案A (m*k) 便宜, 走 tt 内核
+                    # Variant Y: when n≪m, transposing only B^T (cost n*k) is cheaper than plan A (m*k), use the tt kernel
                     runner = _sgemm_runner_cache.get(key)
                     if runner is None:
                         runner = _cache_sgemm_runner(
@@ -2819,8 +2819,8 @@ def sgemm(
                     runner()
             elif _sgemm_tn_use_composite(m, n, k):
                 if (m, n, k) in _TN_COMP_OVERRIDES:
-                    # comp 路径 nn 内核 config override (v2.23): 4096³ 用扫描最优
-                    # (64,128,w8,itt1,gm1,BK32,s2,nobuf) 替换 tuner config0
+                    # comp path nn kernel config override (v2.23): 4096³ uses the scan-optimal
+                    # (64,128,w8,itt1,gm1,BK32,s2,nobuf) to replace tuner config0
                     runner = _sgemm_runner_cache.get(key)
                     if runner is None:
                         runner = _cache_sgemm_runner(
@@ -2844,7 +2844,7 @@ def sgemm(
                         )
                     runner()
                 else:
-                    # 复合路径: 转置 A^T -> 连续 (m,k) 缓冲 -> nn 分发
+                    # Composite path: transpose A^T -> contiguous (m,k) buffer -> nn dispatch
                     runner = _sgemm_runner_cache.get(key)
                     if runner is None:
                         runner = _cache_sgemm_runner(
@@ -2875,8 +2875,8 @@ def sgemm(
         elif transa == CUBLAS_OP_N and transb == CUBLAS_OP_T:
             _nt_spk = _sgemm_nt_splitk(m, n, k)
             if _nt_spk:
-                # 瘦 shape split-k (v2.13): blocks 仅 8-32 时按 k 分段并行,
-                # (64,512,512) 等 7 shape 官方口径快 6-31%。白名单精确覆盖。
+                # Thin shape split-k (v2.13): when blocks are only 8-32, split k into segments in parallel,
+                # 7 shapes such as (64,512,512) are 6-31% faster under the official protocol. The whitelist covers them exactly.
                 _nt_spk_w = _NT_SPLITK_SHAPES[(m, n, k)][1]
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
@@ -2901,8 +2901,8 @@ def sgemm(
                     )
                 runner()
             elif (m, n, k) in _NT_DIRECT_OVERRIDES:
-                # 直连 config override (v2.13): 511³ 等生产 config 非最优, 固定手动
-                # launch raw 内核 (w16/itt0/kp1, 官方口径 0.745->0.93)。
+                # Direct config override (v2.13): production config not optimal for 511³ etc., always manually
+                # launch the raw kernel (w16/itt0/kp1, official protocol 0.745->0.93).
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -2925,8 +2925,8 @@ def sgemm(
                     )
                 runner()
             elif _sgemm_nt_use_composite(m, n, k):
-                # 对齐大 shape: A^T 转置 + tt 内核 (v2.8), 避开直连 a_t 的 stride-lda
-                # 碎片读 (16384^3 nt 直连 0.884 -> 复合 0.914 等, 见 _make_sgemm_nt_composite_runner)
+                # Aligned large shapes: A^T transpose + tt kernel (v2.8), avoiding the direct a_t stride-lda
+                # fragmented reads (16384^3 nt direct 0.884 -> composite 0.914 etc., see _make_sgemm_nt_composite_runner)
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -2949,8 +2949,8 @@ def sgemm(
                     )
                 runner()
             elif _sgemm_xt_is_pad_shape(m, n, k):
-                # 非对齐大 shape: pre-pad A/B 到对齐缓冲, 主内核全 EVEN load,
-                # 避免 mask/k remainder 开销 (v2.6, 4095³ 0.755->0.840 等)
+                # Unaligned large shapes: pre-pad A/B into aligned buffers, the main kernel loads all EVEN,
+                # avoiding mask/k remainder overhead (v2.6, 4095³ 0.755->0.840 etc.)
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -2973,11 +2973,11 @@ def sgemm(
                     )
                 runner()
             else:
-                # kpack=2 实测对多数直连 shape 有效 (v2.11: 2048x4096x11008 0.918
-                # ->0.949-0.970、16384x512x4096 0.908->0.942、512x16384x4096 0.938
-                # ->0.949 等). 个别 shape 上 kpack=2 反而变慢 (官方口径
-                # do_bench(1000/100/median) 实测慢 >=1%), 走 _NT_KPACK1_SHAPES
-                # 例外表回退到 kpack=1, 消除小 shape 回退 (v2.12).
+                # kpack=2 measured effective for most direct shapes (v2.11: 2048x4096x11008 0.918
+                # ->0.949-0.970, 16384x512x4096 0.908->0.942, 512x16384x4096 0.938
+                # ->0.949 etc.). On a few shapes kpack=2 is instead slower (official protocol
+                # do_bench(1000/100/median) measured >=1% slower), use the _NT_KPACK1_SHAPES
+                # exception table to fall back to kpack=1, eliminating small-shape regressions (v2.12).
                 sgemm_nt_hygon_kernel[grid](
                     A, B, C, alpha, beta, m, n, k, lda, ldb, ldc, beta_is_zero,
                     use_in_thread_transpose=_sgemm_xt_use_itt(m, n, k),
@@ -2986,8 +2986,8 @@ def sgemm(
                 )
         else:
             if (m, n, k) in _TT_DIRECT_OVERRIDES:
-                # tt 直连 config override (v2.21): 小 shape 生产 config 大 tile 下
-                # grid 并行度不足, 缩小 tile 提并行度 (官方口径 A/B 全部 >=1.0)。
+                # tt direct config override (v2.21): for small shapes the production config's large tiles
+                # leave insufficient grid parallelism, shrink tiles to raise parallelism (official-protocol A/B all >=1.0).
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(
@@ -3010,8 +3010,8 @@ def sgemm(
                     )
                 runner()
             elif _sgemm_xt_is_pad_shape(m, n, k):
-                # 非对齐大 shape: pre-pad A(k,m)->A_pad(kp,mp)/B(n,k)->B_pad(np,kp),
-                # 全 EVEN main (v2.7, 8191³ 0.883->1.037、4097x8191x4095 0.826->0.940)
+                # Unaligned large shapes: pre-pad A(k,m)->A_pad(kp,mp)/B(n,k)->B_pad(np,kp),
+                # all-EVEN main (v2.7, 8191³ 0.883->1.037, 4097x8191x4095 0.826->0.940)
                 runner = _sgemm_runner_cache.get(key)
                 if runner is None:
                     runner = _cache_sgemm_runner(

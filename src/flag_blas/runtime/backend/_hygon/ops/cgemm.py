@@ -13,18 +13,18 @@
 # limitations under the License.
 
 """
-Hygon DTK cgemm 专用实现（自研 complex 内核）。
+Hygon DTK cgemm dedicated implementation (self-developed complex kernel).
 
-complex64 GEMM: C = alpha * op(A) @ op(B) + beta * C, op ∈ {N, T, C(共轭转置)}。
-本模块自带一个 complex Triton 内核（在 kernel 内处理 N/T/C 与共轭），并额外提供一条
-hygon 定制的「转置复合」路径：当 transa/transb 含转置且 shape 足够大时，先把物理
-(k,m)/(n,k) 的非共轭/共轭转置物化成 (m,k)/(k,n) 连续缓冲，再以 N/N 调用主内核，
-避免跨步复数读带来的带宽损失（与 _hygon/ops/bfgemm.py / hgemm.py 的转置复合同思路）。
+complex64 GEMM: C = alpha * op(A) @ op(B) + beta * C, op ∈ {N, T, C(conjugate transpose)}.
+This module ships its own complex Triton kernel (handling N/T/C and conjugation inside the kernel), and additionally provides a
+hygon-custom "transpose composite" path: when transa/transb contain a transpose and the shape is large enough, first materialize the physical
+(k,m)/(n,k) non-conjugate/conjugate transpose into contiguous (m,k)/(k,n) buffers, then call the main kernel with N/N,
+avoiding the bandwidth loss of strided complex reads (same idea as the transpose composite in _hygon/ops/bfgemm.py / hgemm.py).
 
-数据布局: 复数以 real/imag 交错存放, 传入内核前用 torch.view_as_real(...).reshape(-1)
-展平成 fp32 视图, 内核按 2*elem / 2*elem+1 取 re/im。
+Data layout: complex values are stored interleaved as real/imag; before passing to the kernel they are flattened with
+torch.view_as_real(...).reshape(-1) into an fp32 view, and the kernel reads re/im at 2*elem / 2*elem+1.
 
-注: 真机精度/性能验证前, hygon 专用 config 表与转置复合阈值为保守取值, 待实测收敛。
+Note: before real-machine accuracy/performance validation, the hygon dedicated config table and transpose composite threshold are conservative values, to be converged by measurement.
 """
 
 import torch
@@ -83,12 +83,12 @@ def _cgemm_kernel(
     for k_start in range(0, k, BLOCK_K):
         cur_k = k_start + offs_k
         mask_k = cur_k < k
-        # A: N -> 物理 (m,k); T/C -> 物理 (k,m)
+        # A: N -> physical (m,k); T/C -> physical (k,m)
         if TRANS_A == 0:
             a_elem = offs_m[:, None] * lda + cur_k[None, :]
         else:
             a_elem = cur_k[None, :] * lda + offs_m[:, None]
-        # B: N -> 物理 (k,n); T/C -> 物理 (n,k)
+        # B: N -> physical (k,n); T/C -> physical (n,k)
         if TRANS_B == 0:
             b_elem = cur_k[:, None] * ldb + offs_n[None, :]
         else:
@@ -96,8 +96,8 @@ def _cgemm_kernel(
 
         a_mask = mask_m[:, None] & mask_k[None, :]
         b_mask = mask_k[:, None] & mask_n[None, :]
-        # 打包成对 (re,im) 加载 (末维连续 2 x fp32 -> 8B 向量化), 再 split 成 re/im,
-        # 避免 stride-2 标量 gather。
+        # pack pairs (re,im) for loading (contiguous last dim 2 x fp32 -> 8B vectorization), then split into re/im,
+        # avoiding stride-2 scalar gather.
         a2 = tl.load(
             a_ptr + (2 * a_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
             mask=a_mask[:, :, None],
@@ -110,15 +110,15 @@ def _cgemm_kernel(
             other=0.0,
         )
         br, bi = tl.split(b2)
-        # 共轭转置: 虚部取反
+        # conjugate transpose: negate the imaginary part
         if TRANS_A == 2:
             ai = -ai
         if TRANS_B == 2:
             bi = -bi
 
         # (ar + ai i)(br + bi i) = (ar*br - ai*bi) + (ar*bi + ai*br) i
-        # gfx936 后端只允许 input_precision="ieee" (无 tf32), 即真 fp32 点积,
-        # 精度优于 tf32x3, 与 hipblasCgemm 参考同口径。
+        # gfx936 backend only allows input_precision="ieee" (no tf32), i.e. true fp32 dot product,
+        # more accurate than tf32x3, same metric as the hipblasCgemm reference.
         acc_r += tl.dot(ar, br, out_dtype=tl.float32, input_precision="ieee")
         acc_r -= tl.dot(ai, bi, out_dtype=tl.float32, input_precision="ieee")
         acc_i += tl.dot(ar, bi, out_dtype=tl.float32, input_precision="ieee")
@@ -143,7 +143,7 @@ def _cgemm_kernel(
         out_r += beta_r * cr - beta_i * ci
         out_i += beta_r * ci + beta_i * cr
 
-    # 打包成对存储 (末维连续 2 x fp32 -> 8B 向量化)
+    # pack pairs for storing (contiguous last dim 2 x fp32 -> 8B vectorization)
     out2 = tl.join(out_r, out_i)
     tl.store(
         c_ptr + (2 * c_elem)[:, :, None] + tl.arange(0, 2)[None, None, :],
@@ -153,9 +153,9 @@ def _cgemm_kernel(
 
 
 def _select_cgemm_config_hygon(m, n, k):
-    # hygon gfx936 分档 (按 shape x 变体实测标定)。复数内核有 2 个 fp32 累加器 +
-    # 4 个操作数 tile, 故 BLOCK_K 取 16/32; tile 随规模放大, 大 shape 用 GROUP_M=4
-    # 提升 L2 复用。
+    # hygon gfx936 tiers (calibrated by measurement over shapes x variants). The complex kernel has 2 fp32 accumulators +
+    # 4 operand tiles, so BLOCK_K is 16/32; tiles scale with size, large shapes use GROUP_M=4
+    # to improve L2 reuse.
     max_dim = max(m, n, k)
     if max_dim <= 128:
         return 16, 16, 32, 4, 1
