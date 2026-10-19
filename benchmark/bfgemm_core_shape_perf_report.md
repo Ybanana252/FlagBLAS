@@ -973,3 +973,48 @@ sp 估计用 v9 官跑同进程 torch 基线（8192³ NN 3.2994 / TN 3.0233 等�
 - **决策**：在 §10.3.0 前置①（FlagTree fork C++ 源码 + DTK(ai)LLVM 构建链可重编）满足前，NN/TN 上述 16 例 **列为已知缺口**，**不再投入非 fork 试验**；§10.5 的 M1–M4 保持为设计态不启动。
 - **重启条件**：fork 源码可在本机重编 → 立即启动 M1（lit/lts 修复），验收口径同 §10.4。
 - **副产品**：本节 10.8.1 的负结果同时**收窄了 §10.3.4「双累加器链」的现成替代路径**——warp specialization（wasp/wdra）本可作为其非 fork 近似，实测零收益，进一步支持该杠杆必须走 fork。
+
+---
+
+### 10.9 分支合并与提交状态（2026-10-16，状态附录）
+
+> 本节记录「把 hygon 六个 gemm 算子的改动集中到一个分支」的落地状态，供 PR 评审与后续重跑对账。
+
+#### 10.9.1 合并内容
+
+- 目标分支：`hygon_gemm`（基线 `flagos-ai/FlagBLAS:master`）。
+- 并入分支：`add_sgemm_hygon`（sgemm / hgemm / bfgemm / cgemm / dgemm / zgemm 全部改动）。
+- **merge commit `f245ed1`**；相对 master：**62 个提交、30 个文件、+8965/−127**。
+  主要文件：`_hygon/ops/{sgemm,dgemm,hgemm,bfgemm,cgemm,zgemm}.py`、
+  `_hygon/tune_configs.yaml`(+260)、`_hygon/_triton_itt.py`、`patches/`、
+  `tests/hipblas_reference.py`、各 `benchmark/test_*gemm*.py`、本报告与 sgemm/hgemm 报告。
+
+#### 10.9.2 冲突解决（7 文件，全部取 union，不丢任一侧）
+
+| 文件 | 处理 |
+|---|---|
+| `_hygon/ops/__init__.py` | 保留 `trsv` 导入 + 增 `zgemm`；`__all__` 同时含 `dtrsv` / `group_*` / `sgemm` |
+| `benchmark/gemm_perf_common.py` | 保留 thead 的 `GEMM_COMPUTE_TYPE/GEMM_ALGO` 条件块 + hygon hipblas ctypes 块；**thead 分支补 `cupy.cublas` 局部导入**（我方已把 cupy 导入收进 hygon 条件，否则 F821） |
+| `src/flag_blas/utils/libentry.py` | `entry_key` 同时纳入 HIPOptions（`use_in_thread_transpose`/`use_buffer_ops`/`kpack`）与 launch params（`num_warps`/`num_stages`/`num_ctas`/`maxnreg`）追加元组 |
+| `_hygon/tune_configs.yaml` | 两侧段全保留（7 段 trmv 系列 + 30 段 gemm 系列，无同名键）；修正一处缩进 |
+| `tests/test_dgemm.py`、`tests/test_zgemm.py`、`benchmark/test_zgemm_perf.py` | 保留 iluvatar `skipif` + hygon 的 hipblas 参考/去 cupy 分支；zgemm 保留追加的 512³ shape |
+
+#### 10.9.3 额外修复
+
+- **`tests/test_bfgemm.py` 去 cupy**（`8caa75a`）：此前仍无条件 `import cupy`，在 hygon 收集期报 `ModuleNotFoundError`。现改为 `IS_HYGON` 守卫；hygon 参考用 **torch bf16 matmul（rocBLAS Tensile、fp32 累加）**，与 benchmark 基线同口径（DTK hipBLAS 的 bf16 `gemmEx/_v2` 全组合 NOT_SUPPORTED、无 legacy `hipblasBgemm`），`beta==0` 不读 C。
+  验证：`pytest tests/test_bfgemm.py` → **106 passed**（含首次 autotune 18:19，热缓存会显著更快）。
+
+#### 10.9.4 合并后校验（hygon，py310 venv）
+
+| 项 | 结果 |
+|---|---|
+| 冲突标记 | 无残留 |
+| `tune_configs.yaml` | 可解析，103 个顶层键，gemm 段齐全 |
+| `py_compile` / `import flag_blas` | 通过；六个算子均可用 |
+| 六算子冒烟（128³，vs 参考） | sgemm/dgemm `rel=0`；hgemm `3.2e-4`、bfgemm `2.8e-3`；cgemm `7.4e-7`、zgemm `1.2e-15` |
+| `flake8`（冲突文件） | 24 条（= 我方基线 24；HEAD 23），均为既有 E501/E203，无新增 |
+
+#### 10.9.5 待办
+
+- **PR**：待 `bin913` 凭据更新后，推送 `hygon_gemm` 并以 bin913 身份向 `flagos-ai/FlagBLAS:master` 开 PR（当前该 remote 内嵌 token 已失效 401；本机 gh 账号 w1120029931-bit 对 bin913/FlagBLAS 无推送权限）。
+- **数值对账**：§10.8.3 的 `ds12→ds10` 回落生效后，§5/§6/§9 中 7 个大 shape 的实测值需按官方协议（`do_bench(warmup=1000, rep=100, median)`）重跑更新；§9.2 的 <0.8 清单以重跑结果为准（预期量级不变）。
