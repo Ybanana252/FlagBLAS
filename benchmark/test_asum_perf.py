@@ -14,72 +14,119 @@
 
 from typing import Generator
 
-import cupy as cp
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
 from benchmark.attri_util import L1_STRIDE_SHAPES, L1_VECTOR_SHAPES
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.utils import shape_utils
 
+IS_HYGON = flag_blas.vendor_name == "hygon"
 
-def cublas_sasum(x, incx=1, n=None, handle=None, result=None):
-    cublas.sasum(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
+if IS_HYGON:
+    import ctypes
 
-
-def cublas_dasum(x, incx=1, n=None, handle=None, result=None):
-    cublas.dasum(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
-def cublas_scasum(x, incx=1, n=None, handle=None, result=None):
-    cublas.scasum(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
-def cublas_dzasum(x, incx=1, n=None, handle=None, result=None):
-    cublas.dzasum(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
 
 
 def blas_sasum_wrapper(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.sasum(n, x, incx, result)
+    flag_blas.sasum(n, x, incx, result)
     return result
 
 
 def blas_dasum_wrapper(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.dasum(n, x, incx, result)
+    flag_blas.dasum(n, x, incx, result)
     return result
 
 
 def blas_scasum_wrapper(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.scasum(n, x, incx, result)
+    flag_blas.scasum(n, x, incx, result)
     return result
 
 
 def blas_dzasum_wrapper(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.dzasum(n, x, incx, result)
+    flag_blas.dzasum(n, x, incx, result)
     return result
 
 
-class AsumBenchmark(Benchmark):
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_VECTOR_SHAPES
+if IS_HYGON:
 
+    def _resolve_hipblas_asum(dtype):
+        symbol = {
+            torch.float32: "hipblasSasum",
+            torch.float64: "hipblasDasum",
+            torch.complex64: "hipblasScasum",
+            torch.complex128: "hipblasDzasum",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_asum_baseline(x, incx=1, n=None, handle=None, result=None, c_func=None):
+        check_hipblas_status(
+            c_func(handle, n, x.data_ptr(), incx, result.data_ptr()), "hipBLAS ASUM"
+        )
+        return result
+
+    def _hygon_asum_wrapper(op):
+        def wrapper(x, incx=1, n=None, handle=None, result=None, c_func=None):
+            return op(x, incx=incx, n=n, handle=handle, result=result)
+
+        return wrapper
+
+    cublas_sasum = hipblas_asum_baseline
+    blas_sasum_wrapper = _hygon_asum_wrapper(blas_sasum_wrapper)
+    cublas_dasum = hipblas_asum_baseline
+    blas_dasum_wrapper = _hygon_asum_wrapper(blas_dasum_wrapper)
+    cublas_scasum = hipblas_asum_baseline
+    blas_scasum_wrapper = _hygon_asum_wrapper(blas_scasum_wrapper)
+    cublas_dzasum = hipblas_asum_baseline
+    blas_dzasum_wrapper = _hygon_asum_wrapper(blas_dzasum_wrapper)
+
+else:
+
+    def cublas_sasum(x, incx=1, n=None, handle=None, result=None):
+        cublas.sasum(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_dasum(x, incx=1, n=None, handle=None, result=None):
+        cublas.dasum(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_scasum(x, incx=1, n=None, handle=None, result=None):
+        cublas.scasum(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_dzasum(x, incx=1, n=None, handle=None, result=None):
+        cublas.dzasum(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+
+class AsumBenchmark(Benchmark):
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_VECTOR_SHAPES
-        return None
+        return L1_VECTOR_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_asum(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
 
         for shape in self.shapes:
             inp = torch.randn(shape, dtype=cur_dtype, device=self.device)
@@ -95,12 +142,25 @@ class AsumBenchmark(Benchmark):
             result = torch.zeros(1, dtype=result_dtype, device=self.device)
 
             if n > 0:
-                yield inp, {"n": n, "handle": handle, "result": result}
+                if IS_HYGON:
+                    _, handle = get_l1_hipblas_context(inp)
+                kwargs = {"n": n, "handle": handle, "result": result}
+                if IS_HYGON:
+                    kwargs["c_func"] = c_func
+                yield inp, kwargs
 
     def get_gbps(self, args, latency):
         inp = args[0]
-        io_amount = shape_utils.size_in_bytes(inp)
+        result_bytes = inp.element_size() // (2 if inp.dtype.is_complex else 1)
+        io_amount = shape_utils.size_in_bytes(inp) + result_bytes
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # Leading-order reduction count; abs is not floating-point arithmetic.
+        return (2 if x.dtype.is_complex else 1) * n
 
     def get_correctness_reduce_dim(self, args, kwargs):
         return kwargs["n"]
@@ -111,20 +171,18 @@ class AsumStrideBenchmark(Benchmark):
         super().__init__(*args, **kwargs)
         self.incx = incx
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_STRIDE_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_STRIDE_SHAPES
-        return None
+        return L1_STRIDE_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_asum(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
 
         for shape in self.shapes:
             n = shape[0]
@@ -140,25 +198,43 @@ class AsumStrideBenchmark(Benchmark):
             result = torch.zeros(1, dtype=result_dtype, device=self.device)
 
             if n > 0:
-                yield inp, {
+                if IS_HYGON:
+                    _, handle = get_l1_hipblas_context(inp)
+                kwargs = {
                     "incx": self.incx,
                     "n": n,
                     "handle": handle,
                     "result": result,
                 }
+                if IS_HYGON:
+                    kwargs["c_func"] = c_func
+                yield inp, kwargs
 
     def get_gbps(self, args, latency):
         inp = args[0]
         n = (inp.numel() + self.incx - 1) // self.incx
         element_size = inp.element_size()
-        io_amount = n * element_size
+        result_bytes = inp.element_size() // (2 if inp.dtype.is_complex else 1)
+        io_amount = n * element_size + result_bytes
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # Leading-order reduction count; abs is not floating-point arithmetic.
+        return (2 if x.dtype.is_complex else 1) * n
 
     def get_correctness_reduce_dim(self, args, kwargs):
         return kwargs["n"]
 
 
-@pytest.mark.asum
+if IS_HYGON:
+    AsumBenchmark.correctness_reference = "hipBLAS"
+    AsumStrideBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.sasum
 def test_perf_sasum():
     bench = AsumBenchmark(
         op_name="sasum",
@@ -169,7 +245,7 @@ def test_perf_sasum():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.dasum
 def test_perf_dasum():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -182,7 +258,7 @@ def test_perf_dasum():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.scasum
 def test_perf_scasum():
     bench = AsumBenchmark(
         op_name="scasum",
@@ -193,7 +269,7 @@ def test_perf_scasum():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.dzasum
 def test_perf_dzasum():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -206,7 +282,7 @@ def test_perf_dzasum():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.sasum
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_sasum_stride(incx):
     bench = AsumStrideBenchmark(
@@ -219,7 +295,7 @@ def test_perf_sasum_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.dasum
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_dasum_stride(incx):
     if not flag_blas.runtime.device.support_fp64:
@@ -234,7 +310,7 @@ def test_perf_dasum_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.scasum
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_scasum_stride(incx):
     bench = AsumStrideBenchmark(
@@ -247,7 +323,7 @@ def test_perf_scasum_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.asum
+@pytest.mark.dzasum
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_dzasum_stride(incx):
     if not flag_blas.runtime.device.support_fp64:

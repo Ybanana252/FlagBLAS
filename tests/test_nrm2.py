@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cupy as cp
+import ctypes
+
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
@@ -29,6 +29,42 @@ from .accuracy_utils import (
     to_reference,
 )
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+
+    from .hipblas_reference import check_hipblas_status
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
+
+def hipblas_nrm2_reference(n, x, incx, result):
+    if n == 0:
+        result.zero_()
+        return
+
+    symbol = {
+        torch.float32: "hipblasSnrm2",
+        torch.float64: "hipblasDnrm2",
+        torch.complex64: "hipblasScnrm2",
+        torch.complex128: "hipblasDznrm2",
+    }[x.dtype]
+    library, handle = get_l1_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(handle, n, x.data_ptr(), incx, result.data_ptr()), symbol
+    )
 
 
 def cublas_nrm2_reference(n, x, incx, result):
@@ -93,12 +129,21 @@ def nrm2_reference(n, x, incx, result):
     ref_x = to_reference(x)
     ref_result = to_reference(result).clone()
 
-    cublas_nrm2_reference(n, ref_x, incx, ref_result)
+    if IS_HYGON:
+        hipblas_nrm2_reference(n, ref_x, incx, ref_result)
+    else:
+        cublas_nrm2_reference(n, ref_x, incx, ref_result)
     return ref_result
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.snrm2),
+        pytest.param(torch.float64, marks=pytest.mark.dnrm2),
+    ],
+)
 @pytest.mark.parametrize("shape", NRM2_SHAPES)
 def test_accuracy_nrm2_real(dtype, shape):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
@@ -122,7 +167,13 @@ def test_accuracy_nrm2_real(dtype, shape):
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.scnrm2),
+        pytest.param(torch.complex128, marks=pytest.mark.dznrm2),
+    ],
+)
 @pytest.mark.parametrize("shape", NRM2_SHAPES)
 def test_accuracy_nrm2_complex(dtype, shape):
     if dtype == torch.complex128 and not flag_blas.runtime.device.support_fp64:
@@ -148,7 +199,13 @@ def test_accuracy_nrm2_complex(dtype, shape):
 
 @pytest.mark.nrm2
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.snrm2),
+        pytest.param(torch.float64, marks=pytest.mark.dnrm2),
+        pytest.param(torch.complex64, marks=pytest.mark.scnrm2),
+        pytest.param(torch.complex128, marks=pytest.mark.dznrm2),
+    ],
 )
 def test_accuracy_nrm2_empty_tensor(dtype):
     if (
@@ -182,7 +239,13 @@ def test_accuracy_nrm2_empty_tensor(dtype):
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.snrm2),
+        pytest.param(torch.float64, marks=pytest.mark.dnrm2),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -206,7 +269,13 @@ def test_accuracy_nrm2_different_n_real(dtype, n, vec_size):
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.scnrm2),
+        pytest.param(torch.complex128, marks=pytest.mark.dznrm2),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -231,7 +300,13 @@ def test_accuracy_nrm2_different_n_complex(dtype, n, vec_size):
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.snrm2),
+        pytest.param(torch.float64, marks=pytest.mark.dnrm2),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
 def test_accuracy_nrm2_different_n_with_stride_real(dtype, shape, incx):
@@ -255,7 +330,13 @@ def test_accuracy_nrm2_different_n_with_stride_real(dtype, shape, incx):
 
 
 @pytest.mark.nrm2
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.scnrm2),
+        pytest.param(torch.complex128, marks=pytest.mark.dznrm2),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
 def test_accuracy_nrm2_different_n_with_stride_complex(dtype, shape, incx):

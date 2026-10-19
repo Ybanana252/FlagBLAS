@@ -16,7 +16,6 @@ import ctypes
 import ctypes.util
 from typing import Generator
 
-import cupy as cp
 import pytest
 import torch
 
@@ -24,6 +23,18 @@ import flag_blas
 from benchmark.attri_util import L1_STRIDE_SHAPES, L1_VECTOR_SHAPES
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.utils import shape_utils
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    from tests.hipblas_reference import (
+        HipComplex,
+        HipDoubleComplex,
+        check_hipblas_status,
+        get_hipblas_context,
+        get_hipblas_library,
+    )
+else:
+    import cupy as cp
 
 
 def load_cublas():
@@ -40,7 +51,7 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
+_cublas = None if IS_HYGON else load_cublas()
 
 
 class cuComplex(ctypes.Structure):
@@ -51,69 +62,217 @@ class cuDoubleComplex(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
 
-def cublas_rot_reference(x, y, c, s, incx=1, incy=1, n=None):
-    if n is None:
-        n = x.numel() // incx
-    if n == 0:
+def _rot_host_scalars(dtype, c, s):
+    c = c.item() if isinstance(c, torch.Tensor) else c
+    s = s.item() if isinstance(s, torch.Tensor) else s
+    if dtype == torch.float32:
+        return ctypes.c_float(c), ctypes.c_float(s)
+    if dtype == torch.float64:
+        return ctypes.c_double(c), ctypes.c_double(s)
+    if dtype == torch.complex64:
+        complex_type = HipComplex if IS_HYGON else cuComplex
+        return ctypes.c_float(c), complex_type(s.real, s.imag)
+    complex_type = HipDoubleComplex if IS_HYGON else cuDoubleComplex
+    return ctypes.c_double(c), complex_type(s.real, s.imag)
+
+
+def _resolve_cublas_rot(dtype):
+    symbol = {
+        torch.float32: "cublasSrot_v2",
+        torch.float64: "cublasDrot_v2",
+        torch.complex64: "cublasCrot_v2",
+        torch.complex128: "cublasZrot_v2",
+    }[dtype]
+    function = getattr(_cublas, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+def blas_srot_wrapper(
+    x,
+    y,
+    c,
+    s,
+    incx=1,
+    incy=1,
+    n=None,
+    handle=None,
+    c_func=None,
+    c_host=None,
+    s_host=None,
+):
+    flag_blas.srot(n, x, incx, y, incy, c, s)
+    return x, y
+
+
+def blas_drot_wrapper(
+    x,
+    y,
+    c,
+    s,
+    incx=1,
+    incy=1,
+    n=None,
+    handle=None,
+    c_func=None,
+    c_host=None,
+    s_host=None,
+):
+    flag_blas.drot(n, x, incx, y, incy, c, s)
+    return x, y
+
+
+def blas_crot_wrapper(
+    x,
+    y,
+    c,
+    s,
+    incx=1,
+    incy=1,
+    n=None,
+    handle=None,
+    c_func=None,
+    c_host=None,
+    s_host=None,
+):
+    flag_blas.crot(n, x, incx, y, incy, c, s)
+    return x, y
+
+
+def blas_zrot_wrapper(
+    x,
+    y,
+    c,
+    s,
+    incx=1,
+    incy=1,
+    n=None,
+    handle=None,
+    c_func=None,
+    c_host=None,
+    s_host=None,
+):
+    flag_blas.zrot(n, x, incx, y, incy, c, s)
+    return x, y
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_rot(dtype):
+        symbol = {
+            torch.float32: "hipblasSrot",
+            torch.float64: "hipblasDrot",
+            torch.complex64: "hipblasCrot_v2",
+            torch.complex128: "hipblasZrot_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_rot_baseline(
+        x,
+        y,
+        c,
+        s,
+        incx=1,
+        incy=1,
+        n=None,
+        handle=None,
+        c_func=None,
+        c_host=None,
+        s_host=None,
+    ):
+        if n <= 0:
+            return x, y
+        check_hipblas_status(
+            c_func(
+                handle,
+                n,
+                x.data_ptr(),
+                incx,
+                y.data_ptr(),
+                incy,
+                ctypes.byref(c_host),
+                ctypes.byref(s_host),
+            ),
+            "hipBLAS ROT",
+        )
         return x, y
 
-    handle = cp.cuda.device.get_cublas_handle()
-    dtype = x.dtype
+    def _hygon_rot_wrapper(op):
+        def wrapper(
+            x,
+            y,
+            c,
+            s,
+            incx=1,
+            incy=1,
+            n=None,
+            handle=None,
+            c_func=None,
+            c_host=None,
+            s_host=None,
+        ):
+            return op(x, y, c, s, incx=incx, incy=incy, n=n)
 
-    if dtype == torch.float32:
-        func = _cublas.cublasSrot_v2
-        c_val = ctypes.c_float(c)
-        s_val = ctypes.c_float(s)
-    elif dtype == torch.float64:
-        func = _cublas.cublasDrot_v2
-        c_val = ctypes.c_double(c)
-        s_val = ctypes.c_double(s)
-    elif dtype == torch.complex64:
-        func = _cublas.cublasCrot_v2
-        c_val = ctypes.c_float(c)
-        s_val = cuComplex(s.real, s.imag)
-    elif dtype == torch.complex128:
-        func = _cublas.cublasZrot_v2
-        c_val = ctypes.c_double(c)
-        s_val = cuDoubleComplex(s.real, s.imag)
-    else:
-        raise ValueError(f"Unsupported dtype {dtype}")
+        return wrapper
 
-    status = func(
-        ctypes.c_void_p(handle),
-        ctypes.c_int(n),
-        ctypes.c_void_p(x.data_ptr()),
-        ctypes.c_int(incx),
-        ctypes.c_void_p(y.data_ptr()),
-        ctypes.c_int(incy),
-        ctypes.byref(c_val),
-        ctypes.byref(s_val),
-    )
+    cublas_rot_reference = hipblas_rot_baseline
+    blas_srot_wrapper = _hygon_rot_wrapper(blas_srot_wrapper)
+    blas_drot_wrapper = _hygon_rot_wrapper(blas_drot_wrapper)
+    blas_crot_wrapper = _hygon_rot_wrapper(blas_crot_wrapper)
+    blas_zrot_wrapper = _hygon_rot_wrapper(blas_zrot_wrapper)
 
-    if status != 0:
-        raise RuntimeError(f"cuBLAS rot execution failed, error code: {status}")
+else:
 
-    return x, y
-
-
-def blas_srot_wrapper(x, y, c, s, incx=1, incy=1, n=None):
-    flag_blas.ops.srot(n, x, incx, y, incy, c, s)
-    return x, y
-
-
-def blas_drot_wrapper(x, y, c, s, incx=1, incy=1, n=None):
-    flag_blas.ops.drot(n, x, incx, y, incy, c, s)
-    return x, y
-
-
-def blas_crot_wrapper(x, y, c, s, incx=1, incy=1, n=None):
-    flag_blas.ops.crot(n, x, incx, y, incy, c, s)
-    return x, y
-
-
-def blas_zrot_wrapper(x, y, c, s, incx=1, incy=1, n=None):
-    flag_blas.ops.zrot(n, x, incx, y, incy, c, s)
-    return x, y
+    def cublas_rot_reference(
+        x,
+        y,
+        c,
+        s,
+        incx=1,
+        incy=1,
+        n=None,
+        handle=None,
+        c_func=None,
+        c_host=None,
+        s_host=None,
+    ):
+        if n <= 0:
+            return x, y
+        status = c_func(
+            handle,
+            n,
+            x.data_ptr(),
+            incx,
+            y.data_ptr(),
+            incy,
+            ctypes.byref(c_host),
+            ctypes.byref(s_host),
+        )
+        if status != 0:
+            raise RuntimeError(f"cuBLAS rot execution failed, error code: {status}")
+        return x, y
 
 
 class RotBenchmark(Benchmark):
@@ -122,24 +281,34 @@ class RotBenchmark(Benchmark):
         self.c = c
         self.s = s
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_VECTOR_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_VECTOR_SHAPES
-        return None
+        return L1_VECTOR_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_HYGON:
+            c_func = _resolve_hipblas_rot(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            c_func = _resolve_cublas_rot(cur_dtype)
+            status = _cublas.cublasSetPointerMode_v2(ctypes.c_void_p(handle), 0)
+            if status != 0:
+                raise RuntimeError(f"cuBLAS pointer mode setup failed: {status}")
+        c_host, s_host = _rot_host_scalars(cur_dtype, self.c, self.s)
         for shape in self.shapes:
             inp1 = torch.randn(shape, dtype=cur_dtype, device=self.device)
             inp2 = torch.randn(shape, dtype=cur_dtype, device=self.device)
             n = inp1.numel()
             if n > 0:
-                yield inp1, inp2, {"c": self.c, "s": self.s, "n": n}
+                kwargs = {"c": self.c, "s": self.s, "n": n}
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp1)
+                kwargs.update(
+                    handle=handle, c_func=c_func, c_host=c_host, s_host=s_host
+                )
+                yield inp1, inp2, kwargs
 
     def get_gbps(self, args, latency):
         inp1, inp2 = args[0], args[1]
@@ -147,6 +316,13 @@ class RotBenchmark(Benchmark):
             inp2
         )
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # CROT/ZROT use real c and complex s: twenty real FLOPs per pair.
+        return (20 if x.dtype.is_complex else 6) * n
 
 
 class RotStrideBenchmark(Benchmark):
@@ -157,30 +333,40 @@ class RotStrideBenchmark(Benchmark):
         self.c = c
         self.s = s
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_STRIDE_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_STRIDE_SHAPES
-        return None
+        return L1_STRIDE_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_HYGON:
+            c_func = _resolve_hipblas_rot(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            c_func = _resolve_cublas_rot(cur_dtype)
+            status = _cublas.cublasSetPointerMode_v2(ctypes.c_void_p(handle), 0)
+            if status != 0:
+                raise RuntimeError(f"cuBLAS pointer mode setup failed: {status}")
+        c_host, s_host = _rot_host_scalars(cur_dtype, self.c, self.s)
         for shape in self.shapes:
             n = shape[0]
             inp1 = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
             inp2 = torch.randn(n * self.incy, dtype=cur_dtype, device=self.device)
             if n > 0:
-                yield inp1, inp2, {
+                kwargs = {
                     "c": self.c,
                     "s": self.s,
                     "incx": self.incx,
                     "incy": self.incy,
                     "n": n,
                 }
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp1)
+                kwargs.update(
+                    handle=handle, c_func=c_func, c_host=c_host, s_host=s_host
+                )
+                yield inp1, inp2, kwargs
 
     def get_gbps(self, args, latency):
         inp1 = args[0]
@@ -189,8 +375,20 @@ class RotStrideBenchmark(Benchmark):
         io_amount = 4 * n * element_size
         return io_amount * 1e-9 / (latency * 1e-3)
 
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # CROT/ZROT use real c and complex s: twenty real FLOPs per pair.
+        return (20 if x.dtype.is_complex else 6) * n
 
-@pytest.mark.rot
+
+if IS_HYGON:
+    RotBenchmark.correctness_reference = "hipBLAS"
+    RotStrideBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.srot
 def test_perf_srot():
     bench = RotBenchmark(
         op_name="srot",
@@ -201,7 +399,7 @@ def test_perf_srot():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.drot
 def test_perf_drot():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -214,7 +412,7 @@ def test_perf_drot():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.crot
 def test_perf_crot():
     bench = RotBenchmark(
         op_name="crot",
@@ -227,7 +425,7 @@ def test_perf_crot():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.zrot
 def test_perf_zrot():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -242,7 +440,7 @@ def test_perf_zrot():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.srot
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_srot_stride(incx, incy):
     bench = RotStrideBenchmark(
@@ -256,7 +454,7 @@ def test_perf_srot_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.drot
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_drot_stride(incx, incy):
     if not flag_blas.runtime.device.support_fp64:
@@ -272,7 +470,7 @@ def test_perf_drot_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.crot
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_crot_stride(incx, incy):
     bench = RotStrideBenchmark(
@@ -288,7 +486,7 @@ def test_perf_crot_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.rot
+@pytest.mark.zrot
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_zrot_stride(incx, incy):
     if not flag_blas.runtime.device.support_fp64:

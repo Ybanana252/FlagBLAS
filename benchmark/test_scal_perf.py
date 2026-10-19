@@ -14,76 +14,138 @@
 
 from typing import Generator
 
-import cupy as cp
 import numpy as np
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
 from benchmark.attri_util import L1_STRIDE_SHAPES, L1_VECTOR_SHAPES
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.utils import shape_utils
 
+IS_HYGON = flag_blas.vendor_name == "hygon"
 
-def cublas_sscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.sscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
+if IS_HYGON:
+    import ctypes
 
-
-def cublas_dscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.dscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
-
-
-def cublas_cscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.cscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
-
-
-def cublas_zscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.zscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
-
-
-def cublas_csscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.csscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
-
-
-def cublas_zdscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    cublas.zdscal(handle, n, alpha_ptr, x.data_ptr(), incx)
-    return x
+    from tests.hipblas_reference import (
+        check_hipblas_status,
+        get_hipblas_context,
+        get_hipblas_library,
+    )
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
 
 
 def blas_sscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.sscal(n, alpha, x, incx)
+    flag_blas.sscal(n, alpha, x, incx)
     return x
 
 
 def blas_dscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.dscal(n, alpha, x, incx)
+    flag_blas.dscal(n, alpha, x, incx)
     return x
 
 
 def blas_cscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.cscal(n, alpha, x, incx)
+    flag_blas.cscal(n, alpha, x, incx)
     return x
 
 
 def blas_zscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.zscal(n, alpha, x, incx)
+    flag_blas.zscal(n, alpha, x, incx)
     return x
 
 
 def blas_csscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.csscal(n, alpha, x, incx)
+    flag_blas.csscal(n, alpha, x, incx)
     return x
 
 
 def blas_zdscal_wrapper(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
-    flag_blas.ops.zdscal(n, alpha, x, incx)
+    flag_blas.zdscal(n, alpha, x, incx)
     return x
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_scal(op_name):
+        symbol = {
+            "sscal": "hipblasSscal",
+            "dscal": "hipblasDscal",
+            "cscal": "hipblasCscal_v2",
+            "zscal": "hipblasZscal_v2",
+            "csscal": "hipblasCsscal_v2",
+            "zdscal": "hipblasZdscal_v2",
+        }[op_name]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_scal_baseline(
+        x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None, c_func=None
+    ):
+        check_hipblas_status(
+            c_func(handle, n, alpha_ptr, x.data_ptr(), incx), "hipBLAS SCAL"
+        )
+        return x
+
+    def _hygon_scal_wrapper(op):
+        def wrapper(
+            x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None, c_func=None
+        ):
+            return op(
+                x, alpha=alpha, incx=incx, n=n, handle=handle, alpha_ptr=alpha_ptr
+            )
+
+        return wrapper
+
+    cublas_sscal = hipblas_scal_baseline
+    blas_sscal_wrapper = _hygon_scal_wrapper(blas_sscal_wrapper)
+    cublas_dscal = hipblas_scal_baseline
+    blas_dscal_wrapper = _hygon_scal_wrapper(blas_dscal_wrapper)
+    cublas_cscal = hipblas_scal_baseline
+    blas_cscal_wrapper = _hygon_scal_wrapper(blas_cscal_wrapper)
+    cublas_zscal = hipblas_scal_baseline
+    blas_zscal_wrapper = _hygon_scal_wrapper(blas_zscal_wrapper)
+    cublas_csscal = hipblas_scal_baseline
+    blas_csscal_wrapper = _hygon_scal_wrapper(blas_csscal_wrapper)
+    cublas_zdscal = hipblas_scal_baseline
+    blas_zdscal_wrapper = _hygon_scal_wrapper(blas_zdscal_wrapper)
+
+else:
+
+    def cublas_sscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.sscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
+
+    def cublas_dscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.dscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
+
+    def cublas_cscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.cscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
+
+    def cublas_zscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.zscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
+
+    def cublas_csscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.csscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
+
+    def cublas_zdscal(x, alpha=1e-5, incx=1, n=None, handle=None, alpha_ptr=None):
+        cublas.zdscal(handle, n, alpha_ptr, x.data_ptr(), incx)
+        return x
 
 
 class ScalBenchmark(Benchmark):
@@ -91,20 +153,18 @@ class ScalBenchmark(Benchmark):
         super().__init__(*args, **kwargs)
         self.alpha = alpha
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_VECTOR_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_VECTOR_SHAPES
-        return None
+        return L1_VECTOR_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_scal(self.op_name.split("_", 1)[0])
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
 
         if cur_dtype == torch.float32:
             alpha_np = np.array(self.alpha, dtype=np.float32)
@@ -123,17 +183,32 @@ class ScalBenchmark(Benchmark):
             inp = torch.randn(shape, dtype=cur_dtype, device=self.device)
             n = inp.numel()
             if n > 0:
-                yield inp, {
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp)
+                kwargs = {
                     "alpha": self.alpha,
                     "n": n,
                     "handle": handle,
                     "alpha_ptr": alpha_ptr,
                 }
+                if IS_HYGON:
+                    kwargs["c_func"] = c_func
+                yield inp, kwargs
 
     def get_gbps(self, args, latency):
         inp = args[0]
         io_amount = 2 * shape_utils.size_in_bytes(inp)
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        if not x.dtype.is_complex:
+            return n
+        # Real-times-complex scaling needs two multiplies, complex-times-complex six.
+        real_alpha = self.op_name.split("_", 1)[0] in ("csscal", "zdscal")
+        return (2 if real_alpha else 6) * n
 
 
 class ScalStrideBenchmark(Benchmark):
@@ -142,20 +217,18 @@ class ScalStrideBenchmark(Benchmark):
         self.incx = incx
         self.alpha = alpha
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_STRIDE_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_STRIDE_SHAPES
-        return None
+        return L1_STRIDE_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_scal(self.op_name.split("_", 1)[0])
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
 
         if cur_dtype == torch.float32:
             alpha_np = np.array(self.alpha, dtype=np.float32)
@@ -174,13 +247,18 @@ class ScalStrideBenchmark(Benchmark):
             n = shape[0]
             inp = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
             if n > 0:
-                yield inp, {
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp)
+                kwargs = {
                     "alpha": self.alpha,
                     "incx": self.incx,
                     "n": n,
                     "handle": handle,
                     "alpha_ptr": alpha_ptr,
                 }
+                if IS_HYGON:
+                    kwargs["c_func"] = c_func
+                yield inp, kwargs
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -189,8 +267,23 @@ class ScalStrideBenchmark(Benchmark):
         io_amount = 2 * n * element_size
         return io_amount * 1e-9 / (latency * 1e-3)
 
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        if not x.dtype.is_complex:
+            return n
+        # Real-times-complex scaling needs two multiplies, complex-times-complex six.
+        real_alpha = self.op_name.split("_", 1)[0] in ("csscal", "zdscal")
+        return (2 if real_alpha else 6) * n
 
-@pytest.mark.scal
+
+if IS_HYGON:
+    ScalBenchmark.correctness_reference = "hipBLAS"
+    ScalStrideBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.sscal
 def test_perf_sscal():
     bench = ScalBenchmark(
         op_name="sscal",
@@ -201,7 +294,7 @@ def test_perf_sscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.dscal
 def test_perf_dscal():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -214,7 +307,7 @@ def test_perf_dscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.cscal
 def test_perf_cscal():
     bench = ScalBenchmark(
         op_name="cscal",
@@ -226,7 +319,7 @@ def test_perf_cscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.zscal
 def test_perf_zscal():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64/complex128")
@@ -240,7 +333,7 @@ def test_perf_zscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.csscal
 def test_perf_csscal():
     bench = ScalBenchmark(
         op_name="csscal",
@@ -252,7 +345,7 @@ def test_perf_csscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.zdscal
 def test_perf_zdscal():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64/complex128")
@@ -266,7 +359,7 @@ def test_perf_zdscal():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.sscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_sscal_stride(incx):
     bench = ScalStrideBenchmark(
@@ -279,7 +372,7 @@ def test_perf_sscal_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.dscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_dscal_stride(incx):
     if not flag_blas.runtime.device.support_fp64:
@@ -294,7 +387,7 @@ def test_perf_dscal_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.cscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_cscal_stride(incx):
     bench = ScalStrideBenchmark(
@@ -308,7 +401,7 @@ def test_perf_cscal_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.zscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_zscal_stride(incx):
     if not flag_blas.runtime.device.support_fp64:
@@ -324,7 +417,7 @@ def test_perf_zscal_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.csscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_csscal_stride(incx):
     bench = ScalStrideBenchmark(
@@ -338,7 +431,7 @@ def test_perf_csscal_stride(incx):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.scal
+@pytest.mark.zdscal
 @pytest.mark.parametrize("incx", [2, 3, 5])
 def test_perf_zdscal_stride(incx):
     if not flag_blas.runtime.device.support_fp64:

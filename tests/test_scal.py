@@ -15,11 +15,9 @@
 import ctypes
 import ctypes.util
 
-import cupy as cp
 import numpy as np
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
@@ -34,6 +32,15 @@ from .accuracy_utils import (
     to_reference,
 )
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from .hipblas_reference import check_hipblas_status, get_hipblas_context
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
 
 COMPLEX_SCALARS = [1.0 + 2.0j, -0.5 + 1.5j]
 
@@ -52,7 +59,38 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
+_cublas = None if IS_HYGON else load_cublas()
+
+
+def hipblas_scal_reference(n, alpha, x, incx, real_alpha=False):
+    if n <= 0:
+        return
+    if real_alpha:
+        symbol, dtype = {
+            torch.complex64: ("hipblasCsscal_v2", np.float32),
+            torch.complex128: ("hipblasZdscal_v2", np.float64),
+        }[x.dtype]
+    else:
+        symbol, dtype = {
+            torch.float32: ("hipblasSscal", np.float32),
+            torch.float64: ("hipblasDscal", np.float64),
+            torch.complex64: ("hipblasCscal_v2", np.complex64),
+            torch.complex128: ("hipblasZscal_v2", np.complex128),
+        }[x.dtype]
+    library, handle = get_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    alpha_value = np.asarray(alpha, dtype=dtype)
+    check_hipblas_status(
+        function(handle, n, alpha_value.ctypes.data, x.data_ptr(), incx), symbol
+    )
 
 
 def cublas_scal_reference(n, alpha, x, incx):
@@ -166,7 +204,10 @@ def scal_reference(n, alpha, x, incx):
     ref_x = to_reference(x)
     ref_x = ref_x.clone()
 
-    cublas_scal_reference(n, alpha, ref_x, incx)
+    if IS_HYGON:
+        hipblas_scal_reference(n, alpha, ref_x, incx)
+    else:
+        cublas_scal_reference(n, alpha, ref_x, incx)
     return ref_x
 
 
@@ -177,7 +218,10 @@ def csscal_reference(n, alpha, x, incx):
     ref_x = to_reference(x)
     ref_x = ref_x.clone()
 
-    cublas_csscal_reference(n, alpha, ref_x, incx)
+    if IS_HYGON:
+        hipblas_scal_reference(n, alpha, ref_x, incx, real_alpha=True)
+    else:
+        cublas_csscal_reference(n, alpha, ref_x, incx)
     return ref_x
 
 
@@ -188,10 +232,14 @@ def zdscal_reference(n, alpha, x, incx):
     ref_x = to_reference(x)
     ref_x = ref_x.clone()
 
-    cublas_zdscal_reference(n, alpha, ref_x, incx)
+    if IS_HYGON:
+        hipblas_scal_reference(n, alpha, ref_x, incx, real_alpha=True)
+    else:
+        cublas_zdscal_reference(n, alpha, ref_x, incx)
     return ref_x
 
 
+@pytest.mark.csscal
 @pytest.mark.scal
 @pytest.mark.parametrize("shape", SCAL_SHAPES)
 @pytest.mark.parametrize("alpha", SCALARS)
@@ -202,10 +250,11 @@ def test_accuracy_csscal(shape, alpha):
 
     ref_x = csscal_reference(n, alpha, x, incx)
 
-    flag_blas.ops.csscal(n, alpha, x, incx)
+    flag_blas.csscal(n, alpha, x, incx)
     blas_assert_close(x, ref_x, torch.complex64)
 
 
+@pytest.mark.zdscal
 @pytest.mark.scal
 @pytest.mark.parametrize("shape", SCAL_SHAPES)
 @pytest.mark.parametrize("alpha", SCALARS)
@@ -219,12 +268,18 @@ def test_accuracy_zdscal(shape, alpha):
 
     ref_x = zdscal_reference(n, alpha, x, incx)
 
-    flag_blas.ops.zdscal(n, alpha, x, incx)
+    flag_blas.zdscal(n, alpha, x, incx)
     blas_assert_close(x, ref_x, torch.complex128)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sscal),
+        pytest.param(torch.float64, marks=pytest.mark.dscal),
+    ],
+)
 @pytest.mark.parametrize("shape", SCAL_SHAPES)
 @pytest.mark.parametrize("alpha", SCALARS)
 def test_accuracy_scal_real(dtype, shape, alpha):
@@ -238,15 +293,21 @@ def test_accuracy_scal_real(dtype, shape, alpha):
     ref_x = scal_reference(n, alpha, x, incx)
 
     if dtype == torch.float32:
-        flag_blas.ops.sscal(n, alpha, x, incx)
+        flag_blas.sscal(n, alpha, x, incx)
     else:
-        flag_blas.ops.dscal(n, alpha, x, incx)
+        flag_blas.dscal(n, alpha, x, incx)
 
     blas_assert_close(x, ref_x, dtype)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cscal),
+        pytest.param(torch.complex128, marks=pytest.mark.zscal),
+    ],
+)
 @pytest.mark.parametrize("shape", SCAL_SHAPES)
 @pytest.mark.parametrize("alpha", COMPLEX_SCALARS + SCALARS)
 def test_accuracy_scal_complex(dtype, shape, alpha):
@@ -260,16 +321,22 @@ def test_accuracy_scal_complex(dtype, shape, alpha):
     ref_x = scal_reference(n, alpha, x, incx)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cscal(n, alpha, x, incx)
+        flag_blas.cscal(n, alpha, x, incx)
     else:
-        flag_blas.ops.zscal(n, alpha, x, incx)
+        flag_blas.zscal(n, alpha, x, incx)
 
     blas_assert_close(x, ref_x, dtype)
 
 
 @pytest.mark.scal
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sscal),
+        pytest.param(torch.float64, marks=pytest.mark.dscal),
+        pytest.param(torch.complex64, marks=pytest.mark.cscal),
+        pytest.param(torch.complex128, marks=pytest.mark.zscal),
+    ],
 )
 def test_accuracy_scal_empty_tensor(dtype):
     if (
@@ -285,17 +352,18 @@ def test_accuracy_scal_empty_tensor(dtype):
     n = 0
 
     if dtype == torch.float32:
-        flag_blas.ops.sscal(n, alpha, x, 1)
+        flag_blas.sscal(n, alpha, x, 1)
     elif dtype == torch.float64:
-        flag_blas.ops.dscal(n, alpha, x, 1)
+        flag_blas.dscal(n, alpha, x, 1)
     elif dtype == torch.complex64:
-        flag_blas.ops.cscal(n, alpha, x, 1)
+        flag_blas.cscal(n, alpha, x, 1)
     else:
-        flag_blas.ops.zscal(n, alpha, x, 1)
+        flag_blas.zscal(n, alpha, x, 1)
 
     blas_assert_close(x, ref_x, dtype)
 
 
+@pytest.mark.csscal
 @pytest.mark.scal
 def test_accuracy_csscal_empty_tensor():
     x = torch.randn(0, dtype=torch.complex64, device=flag_blas.device)
@@ -304,11 +372,12 @@ def test_accuracy_csscal_empty_tensor():
     alpha = 2.0
     n = 0
 
-    flag_blas.ops.csscal(n, alpha, x, 1)
+    flag_blas.csscal(n, alpha, x, 1)
 
     blas_assert_close(x, ref_x, torch.complex64)
 
 
+@pytest.mark.zdscal
 @pytest.mark.scal
 def test_accuracy_zdscal_empty_tensor():
     if not flag_blas.runtime.device.support_fp64:
@@ -320,13 +389,19 @@ def test_accuracy_zdscal_empty_tensor():
     alpha = 2.0
     n = 0
 
-    flag_blas.ops.zdscal(n, alpha, x, 1)
+    flag_blas.zdscal(n, alpha, x, 1)
 
     blas_assert_close(x, ref_x, torch.complex128)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sscal),
+        pytest.param(torch.float64, marks=pytest.mark.dscal),
+    ],
+)
 @pytest.mark.parametrize(
     "n, vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -340,15 +415,21 @@ def test_accuracy_scal_different_n_real(dtype, n, vec_size):
     ref_x = scal_reference(n, alpha, x, 1)
 
     if dtype == torch.float32:
-        flag_blas.ops.sscal(n, alpha, x, 1)
+        flag_blas.sscal(n, alpha, x, 1)
     else:
-        flag_blas.ops.dscal(n, alpha, x, 1)
+        flag_blas.dscal(n, alpha, x, 1)
 
     blas_assert_close(x, ref_x, dtype)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cscal),
+        pytest.param(torch.complex128, marks=pytest.mark.zscal),
+    ],
+)
 @pytest.mark.parametrize(
     "n, vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -362,13 +443,14 @@ def test_accuracy_scal_different_n_complex(dtype, n, vec_size):
     ref_x = scal_reference(n, alpha, x, 1)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cscal(n, alpha, x, 1)
+        flag_blas.cscal(n, alpha, x, 1)
     else:
-        flag_blas.ops.zscal(n, alpha, x, 1)
+        flag_blas.zscal(n, alpha, x, 1)
 
     blas_assert_close(x, ref_x, dtype)
 
 
+@pytest.mark.csscal
 @pytest.mark.scal
 @pytest.mark.parametrize(
     "n, vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
@@ -379,10 +461,11 @@ def test_accuracy_csscal_different_n(n, vec_size):
 
     ref_x = csscal_reference(n, alpha, x, 1)
 
-    flag_blas.ops.csscal(n, alpha, x, 1)
+    flag_blas.csscal(n, alpha, x, 1)
     blas_assert_close(x, ref_x, torch.complex64)
 
 
+@pytest.mark.zdscal
 @pytest.mark.scal
 @pytest.mark.parametrize(
     "n, vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
@@ -396,12 +479,18 @@ def test_accuracy_zdscal_different_n(n, vec_size):
 
     ref_x = zdscal_reference(n, alpha, x, 1)
 
-    flag_blas.ops.zdscal(n, alpha, x, 1)
+    flag_blas.zdscal(n, alpha, x, 1)
     blas_assert_close(x, ref_x, torch.complex128)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sscal),
+        pytest.param(torch.float64, marks=pytest.mark.dscal),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
 def test_accuracy_scal_different_n_with_stride_real(dtype, shape, incx):
@@ -415,15 +504,21 @@ def test_accuracy_scal_different_n_with_stride_real(dtype, shape, incx):
     ref_x = scal_reference(n, alpha, x, incx)
 
     if dtype == torch.float32:
-        flag_blas.ops.sscal(n, alpha, x, incx)
+        flag_blas.sscal(n, alpha, x, incx)
     else:
-        flag_blas.ops.dscal(n, alpha, x, incx)
+        flag_blas.dscal(n, alpha, x, incx)
 
     blas_assert_close(x[::incx][:n], ref_x[::incx][:n], dtype)
 
 
 @pytest.mark.scal
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cscal),
+        pytest.param(torch.complex128, marks=pytest.mark.zscal),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
 def test_accuracy_scal_different_n_with_stride_complex(dtype, shape, incx):
@@ -437,13 +532,14 @@ def test_accuracy_scal_different_n_with_stride_complex(dtype, shape, incx):
     ref_x = scal_reference(n, alpha, x, incx)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cscal(n, alpha, x, incx)
+        flag_blas.cscal(n, alpha, x, incx)
     else:
-        flag_blas.ops.zscal(n, alpha, x, incx)
+        flag_blas.zscal(n, alpha, x, incx)
 
     blas_assert_close(x[::incx][:n], ref_x[::incx][:n], dtype)
 
 
+@pytest.mark.csscal
 @pytest.mark.scal
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
@@ -454,10 +550,11 @@ def test_accuracy_csscal_different_n_with_stride(shape, incx):
 
     ref_x = csscal_reference(n, alpha, x, incx)
 
-    flag_blas.ops.csscal(n, alpha, x, incx)
+    flag_blas.csscal(n, alpha, x, incx)
     blas_assert_close(x[::incx][:n], ref_x[::incx][:n], torch.complex64)
 
 
+@pytest.mark.zdscal
 @pytest.mark.scal
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES)
 @pytest.mark.parametrize("incx", L1_SCALAR_STRIDES)
@@ -471,5 +568,45 @@ def test_accuracy_zdscal_different_n_with_stride(shape, incx):
 
     ref_x = zdscal_reference(n, alpha, x, incx)
 
-    flag_blas.ops.zdscal(n, alpha, x, incx)
+    flag_blas.zdscal(n, alpha, x, incx)
     blas_assert_close(x[::incx][:n], ref_x[::incx][:n], torch.complex128)
+
+
+@pytest.mark.scal
+@pytest.mark.parametrize(
+    "op_name,dtype",
+    [
+        pytest.param("sscal", torch.float32, marks=pytest.mark.sscal),
+        pytest.param("dscal", torch.float64, marks=pytest.mark.dscal),
+        pytest.param("cscal", torch.complex64, marks=pytest.mark.cscal),
+        pytest.param("zscal", torch.complex128, marks=pytest.mark.zscal),
+        pytest.param("csscal", torch.complex64, marks=pytest.mark.csscal),
+        pytest.param("zdscal", torch.complex128, marks=pytest.mark.zdscal),
+    ],
+)
+@pytest.mark.parametrize(
+    "shape,incx",
+    [(shape, 1) for shape in SCAL_SHAPES]
+    + [(shape, ix) for shape in L1_STRIDE_SHAPES for ix in L1_SCALAR_STRIDES],
+)
+def test_accuracy_scal_perf_inputs(op_name, dtype, shape, incx):
+    if (
+        dtype in (torch.float64, torch.complex128)
+        and not flag_blas.runtime.device.support_fp64
+    ):
+        pytest.skip("Device does not support float64")
+    n = shape[0]
+    alpha = (
+        0.01 + 0.01j
+        if op_name in ("cscal", "zscal")
+        else 0.01
+        if op_name in ("csscal", "zdscal")
+        else 1e-5
+    )
+    x = torch.randn(n * incx, dtype=dtype, device=flag_blas.device)
+    reference = {"csscal": csscal_reference, "zdscal": zdscal_reference}.get(
+        op_name, scal_reference
+    )
+    expected = reference(n, alpha, x, incx)
+    getattr(flag_blas, op_name)(n, alpha, x, incx)
+    blas_assert_close(x, expected, dtype)

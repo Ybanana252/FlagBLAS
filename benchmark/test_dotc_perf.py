@@ -12,47 +12,94 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 from typing import Generator
 
-import cupy as cp
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from tests.accuracy_utils import DEFAULT_SHAPES
 
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
+
 PAIR_STRIDES = [(2, 2), (2, 3), (3, 2), (3, 3)]
 
 
-def cublas_dotc(x, y, result, n=None, incx=1, incy=1, handle=None):
-    if n is None:
-        n = min(x.numel() // incx, y.numel() // incy)
-    if n <= 0:
-        result.zero_()
+def gems_dotc_wrapper(x, y, result, n=None, incx=1, incy=1, handle=None, c_func=None):
+    if x.dtype == torch.complex64:
+        flag_blas.cdotc(n, x, incx, y, incy, result)
+    elif x.dtype == torch.complex128:
+        flag_blas.zdotc(n, x, incx, y, incy, result)
+    else:
+        raise TypeError(f"Unsupported dtype for dotc: {x.dtype}")
+    return result
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_dotc(dtype):
+        symbol = {
+            torch.complex64: "hipblasCdotc_v2",
+            torch.complex128: "hipblasZdotc_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_dotc_baseline(
+        x, y, result, n=None, incx=1, incy=1, handle=None, c_func=None
+    ):
+        if n is None:
+            n = min(x.numel() // incx, y.numel() // incy)
+        if n <= 0:
+            result.zero_()
+            return result
+        check_hipblas_status(
+            c_func(
+                handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr()
+            ),
+            "hipBLAS DOTC",
+        )
         return result
-    if x.dtype == torch.complex64:
-        cublas.cdotc(
-            handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr()
-        )
-    elif x.dtype == torch.complex128:
-        cublas.zdotc(
-            handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr()
-        )
-    else:
-        raise TypeError(f"Unsupported dtype for dotc: {x.dtype}")
-    return result
 
+    def _hygon_dotc_wrapper(op):
+        def wrapper(x, y, result, n=None, incx=1, incy=1, handle=None, c_func=None):
+            return op(x, y, result, n=n, incx=incx, incy=incy, handle=handle)
 
-def gems_dotc_wrapper(x, y, result, n=None, incx=1, incy=1, handle=None):
-    if x.dtype == torch.complex64:
-        flag_blas.ops.cdotc(n, x, incx, y, incy, result)
-    elif x.dtype == torch.complex128:
-        flag_blas.ops.zdotc(n, x, incx, y, incy, result)
-    else:
-        raise TypeError(f"Unsupported dtype for dotc: {x.dtype}")
-    return result
+        return wrapper
+
+    cublas_dotc = hipblas_dotc_baseline
+    gems_dotc_wrapper = _hygon_dotc_wrapper(gems_dotc_wrapper)
+
+else:
+
+    def cublas_dotc(x, y, result, n=None, incx=1, incy=1, handle=None, c_func=None):
+        if n is None:
+            n = min(x.numel() // incx, y.numel() // incy)
+        if n <= 0:
+            result.zero_()
+            return result
+        c_func(handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr())
+        return result
 
 
 class DotcBenchmark(Benchmark):
@@ -62,68 +109,59 @@ class DotcBenchmark(Benchmark):
         self.incy = incy
 
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = DEFAULT_SHAPES
-        return None
+        return DEFAULT_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_dotc(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+            c_func = {torch.complex64: cublas.cdotc, torch.complex128: cublas.zdotc}[
+                cur_dtype
+            ]
         for shape in self.shapes:
             n = shape[0]
             x = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
             y = torch.randn(n * self.incy, dtype=cur_dtype, device=self.device)
             result = torch.zeros(1, dtype=cur_dtype, device=self.device)
-            yield x, y, result, {
+            if IS_HYGON:
+                _, handle = get_l1_hipblas_context(x)
+            kwargs = {
                 "n": n,
                 "incx": self.incx,
                 "incy": self.incy,
                 "handle": handle,
             }
+            kwargs["c_func"] = c_func
+            yield x, y, result, kwargs
 
     def get_gbps(self, args, latency):
-        x, y = args[0], args[1]
+        x, y, result = args[0], args[1], args[2]
         n = min(x.numel() // self.incx, y.numel() // self.incy)
-        io_amount = 2 * n * x.element_size()
+        io_amount = n * (x.element_size() + y.element_size())
+        io_amount += result.numel() * result.element_size()
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # Leading-order BLAS count; conjugation does not add FLOPs.
+        return (8 if x.dtype.is_complex else 2) * n
 
     def get_correctness_reduce_dim(self, args, kwargs):
         return kwargs["n"]
 
-    def validate_results(self, reference_result, blas_result, dtype, reduce_dim=1):
-        if dtype == torch.complex64:
-            rtol = 1e-5
-            atol = max(1e-5, 1e-5 * (max(reduce_dim, 1) ** 0.5))
-            tolerance_desc = "rtol=1e-5,atol=max(1e-5,sqrt(n)*1e-5)"
-        else:
-            rtol = 1e-12
-            atol = max(1e-12, 1e-12 * (max(reduce_dim, 1) ** 0.5))
-            tolerance_desc = "rtol=1e-12,atol=max(1e-12,sqrt(n)*1e-12)"
 
-        try:
-            torch.testing.assert_close(
-                blas_result, reference_result, rtol=rtol, atol=atol
-            )
-        except AssertionError as e:
-            ref_cpu = reference_result.cpu()
-            res_cpu = blas_result.cpu()
-            max_abs_diff = torch.max(torch.abs(ref_cpu - res_cpu))
-            max_rel_diff = torch.max(
-                torch.abs((ref_cpu - res_cpu) / (torch.abs(ref_cpu) + 1e-9))
-            )
-            raise AssertionError(
-                f"Results differ beyond rtol={rtol}, atol={atol} "
-                f"for dtype {dtype} reduce_dim={reduce_dim}:\n"
-                f"Max absolute difference: {max_abs_diff}\n"
-                f"Max relative difference: {max_rel_diff}\n"
-                f"Shape: {ref_cpu.shape}"
-            ) from e
-        return {(str(dtype), tolerance_desc)}
+if IS_HYGON:
+    DotcBenchmark.correctness_reference = "hipBLAS"
 
 
-@pytest.mark.dotc
+@pytest.mark.cdotc
 def test_perf_cdotc():
     bench = DotcBenchmark(
         op_name="cdotc",
@@ -134,7 +172,7 @@ def test_perf_cdotc():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.dotc
+@pytest.mark.zdotc
 def test_perf_zdotc():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -147,7 +185,7 @@ def test_perf_zdotc():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.dotc
+@pytest.mark.cdotc
 @pytest.mark.parametrize("incx,incy", PAIR_STRIDES)
 def test_perf_cdotc_stride(incx, incy):
     bench = DotcBenchmark(
@@ -161,7 +199,7 @@ def test_perf_cdotc_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.dotc
+@pytest.mark.zdotc
 @pytest.mark.parametrize("incx,incy", PAIR_STRIDES)
 def test_perf_zdotc_stride(incx, incy):
     if not flag_blas.runtime.device.support_fp64:

@@ -14,56 +14,105 @@
 
 from typing import Generator
 
-import cupy as cp
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 
 import flag_blas
-from benchmark.performance_utils import Benchmark
-from tests.accuracy_utils import DEFAULT_SHAPES
+from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
+from tests.accuracy_utils import AMIN_SHAPES
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    import ctypes
+
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
 
 STRIDES = [2, 3, 5]
 
 
-def cublas_isamin(x, incx=1, n=None, handle=None, result=None):
-    cublas.isamin(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
-def cublas_idamin(x, incx=1, n=None, handle=None, result=None):
-    cublas.idamin(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
-def cublas_icamin(x, incx=1, n=None, handle=None, result=None):
-    cublas.icamin(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
-def cublas_izamin(x, incx=1, n=None, handle=None, result=None):
-    cublas.izamin(handle, n, x.data_ptr(), incx, result.data_ptr())
-    return result
-
-
 def gems_samin(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.samin(n, x, incx, result)
+    flag_blas.samin(n, x, incx, result)
     return result
 
 
 def gems_damin(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.damin(n, x, incx, result)
+    flag_blas.damin(n, x, incx, result)
     return result
 
 
 def gems_camin(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.camin(n, x, incx, result)
+    flag_blas.camin(n, x, incx, result)
     return result
 
 
 def gems_zamin(x, incx=1, n=None, handle=None, result=None):
-    flag_blas.ops.zamin(n, x, incx, result)
+    flag_blas.zamin(n, x, incx, result)
     return result
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_amin(dtype):
+        symbol = {
+            torch.float32: "hipblasIsamin",
+            torch.float64: "hipblasIdamin",
+            torch.complex64: "hipblasIcamin_v2",
+            torch.complex128: "hipblasIzamin_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_amin_baseline(x, incx=1, n=None, handle=None, result=None, c_func=None):
+        check_hipblas_status(
+            c_func(handle, n, x.data_ptr(), incx, result.data_ptr()), "hipBLAS AMIN"
+        )
+        return result
+
+    def _hygon_amin_wrapper(op):
+        def wrapper(x, incx=1, n=None, handle=None, result=None, c_func=None):
+            return op(x, incx=incx, n=n, handle=handle, result=result)
+
+        return wrapper
+
+    cublas_isamin = hipblas_amin_baseline
+    cublas_idamin = hipblas_amin_baseline
+    cublas_icamin = hipblas_amin_baseline
+    cublas_izamin = hipblas_amin_baseline
+    gems_samin = _hygon_amin_wrapper(gems_samin)
+    gems_damin = _hygon_amin_wrapper(gems_damin)
+    gems_camin = _hygon_amin_wrapper(gems_camin)
+    gems_zamin = _hygon_amin_wrapper(gems_zamin)
+
+else:
+
+    def cublas_isamin(x, incx=1, n=None, handle=None, result=None):
+        cublas.isamin(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_idamin(x, incx=1, n=None, handle=None, result=None):
+        cublas.idamin(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_icamin(x, incx=1, n=None, handle=None, result=None):
+        cublas.icamin(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
+
+    def cublas_izamin(x, incx=1, n=None, handle=None, result=None):
+        cublas.izamin(handle, n, x.data_ptr(), incx, result.data_ptr())
+        return result
 
 
 class AminBenchmark(Benchmark):
@@ -75,36 +124,50 @@ class AminBenchmark(Benchmark):
         return ["gbps"]
 
     def set_more_shapes(self):
-        self.shapes = DEFAULT_SHAPES
-        return None
+        return AMIN_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
-        handle = cp.cuda.device.get_cublas_handle()
-        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+        if IS_HYGON:
+            c_func = _resolve_hipblas_amin(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
 
         for shape in self.shapes:
             n = shape[0]
-            try:
-                x = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
-            except torch.OutOfMemoryError as exc:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                pytest.skip(f"Insufficient GPU memory for {self.op_name}: {exc}")
+            x = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
             result = torch.zeros(1, dtype=torch.int32, device=self.device)
-            yield x, {
+            if IS_HYGON:
+                _, handle = get_l1_hipblas_context(x)
+            kwargs = {
                 "n": n,
                 "incx": self.incx,
                 "handle": handle,
                 "result": result,
             }
+            if IS_HYGON:
+                kwargs["c_func"] = c_func
+            yield x, kwargs
 
     def get_gbps(self, args, latency):
         x = args[0]
         n = (x.numel() + self.incx - 1) // self.incx
-        return n * x.element_size() * 1e-9 / (latency * 1e-3)
+        io_amount = n * x.element_size() + 4
+        return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # BLAS complex magnitude is abs(real) + abs(imag); comparisons are not FLOPs.
+        return n if x.dtype.is_complex else 0
 
 
-@pytest.mark.amin
+if IS_HYGON:
+    AminBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.samin
 def test_perf_samin():
     bench = AminBenchmark(
         op_name="samin",
@@ -112,10 +175,10 @@ def test_perf_samin():
         gems_op=gems_samin,
         dtypes=[torch.float32],
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.damin
 def test_perf_damin():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -125,10 +188,10 @@ def test_perf_damin():
         gems_op=gems_damin,
         dtypes=[torch.float64],
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.camin
 def test_perf_camin():
     bench = AminBenchmark(
         op_name="camin",
@@ -136,10 +199,10 @@ def test_perf_camin():
         gems_op=gems_camin,
         dtypes=[torch.complex64],
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.zamin
 def test_perf_zamin():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -149,10 +212,10 @@ def test_perf_zamin():
         gems_op=gems_zamin,
         dtypes=[torch.complex128],
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.samin
 @pytest.mark.parametrize("incx", STRIDES)
 def test_perf_samin_stride(incx):
     bench = AminBenchmark(
@@ -162,10 +225,10 @@ def test_perf_samin_stride(incx):
         dtypes=[torch.float32],
         incx=incx,
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.damin
 @pytest.mark.parametrize("incx", STRIDES)
 def test_perf_damin_stride(incx):
     if not flag_blas.runtime.device.support_fp64:
@@ -177,10 +240,10 @@ def test_perf_damin_stride(incx):
         dtypes=[torch.float64],
         incx=incx,
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.camin
 @pytest.mark.parametrize("incx", STRIDES)
 def test_perf_camin_stride(incx):
     bench = AminBenchmark(
@@ -190,10 +253,10 @@ def test_perf_camin_stride(incx):
         dtypes=[torch.complex64],
         incx=incx,
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.amin
+@pytest.mark.zamin
 @pytest.mark.parametrize("incx", STRIDES)
 def test_perf_zamin_stride(incx):
     if not flag_blas.runtime.device.support_fp64:
@@ -205,4 +268,4 @@ def test_perf_zamin_stride(incx):
         dtypes=[torch.complex128],
         incx=incx,
     )
-    bench.run()
+    run_correctness_then_benchmark(bench)

@@ -12,16 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cupy as cp
+import ctypes
+
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
 
 from .accuracy_utils import DEFAULT_SHAPES, L1_PAIR_STRIDES, blas_assert_close
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+
+    from .hipblas_reference import check_hipblas_status
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
+
+def hipblas_dot_reference(n, x, incx, y, incy, result):
+    if n <= 0:
+        result.zero_()
+        return
+    symbol = {
+        torch.float32: "hipblasSdot",
+        torch.float64: "hipblasDdot",
+    }[x.dtype]
+    library, handle = get_l1_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr()),
+        symbol,
+    )
 
 
 def cublas_dot_reference(n, x, incx, y, incy, result):
@@ -72,12 +108,21 @@ def dot_reference(n, x, incx, y, incy, result):
         cpu_dot_reference(n, x, incx, y, incy, ref_result)
         return ref_result
 
-    cublas_dot_reference(n, x, incx, y, incy, result)
+    if IS_HYGON:
+        hipblas_dot_reference(n, x, incx, y, incy, result)
+    else:
+        cublas_dot_reference(n, x, incx, y, incy, result)
     return result
 
 
 @pytest.mark.dot
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sdot),
+        pytest.param(torch.float64, marks=pytest.mark.ddot),
+    ],
+)
 @pytest.mark.parametrize("shape", DEFAULT_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_PAIR_STRIDES)
 def test_accuracy_dot_real(dtype, shape, incx, incy):
@@ -95,14 +140,20 @@ def test_accuracy_dot_real(dtype, shape, incx, incy):
     ref_result = dot_reference(n, ref_x, incx, ref_y, incy, ref_result)
 
     if dtype == torch.float32:
-        flag_blas.ops.sdot(n, x, incx, y, incy, result)
+        flag_blas.sdot(n, x, incx, y, incy, result)
     else:
-        flag_blas.ops.ddot(n, x, incx, y, incy, result)
+        flag_blas.ddot(n, x, incx, y, incy, result)
     blas_assert_close(result, ref_result, dtype, reduce_dim=n)
 
 
 @pytest.mark.dot
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sdot),
+        pytest.param(torch.float64, marks=pytest.mark.ddot),
+    ],
+)
 def test_accuracy_dot_empty_tensor(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -113,9 +164,9 @@ def test_accuracy_dot_empty_tensor(dtype):
     n = 0
 
     if dtype == torch.float32:
-        flag_blas.ops.sdot(n, x, 1, y, 1, result)
+        flag_blas.sdot(n, x, 1, y, 1, result)
     else:
-        flag_blas.ops.ddot(n, x, 1, y, 1, result)
+        flag_blas.ddot(n, x, 1, y, 1, result)
 
     assert result.item() == 0.0
     assert result.dtype == dtype
@@ -123,7 +174,13 @@ def test_accuracy_dot_empty_tensor(dtype):
 
 
 @pytest.mark.dot
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sdot),
+        pytest.param(torch.float64, marks=pytest.mark.ddot),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -142,14 +199,20 @@ def test_accuracy_dot_different_n_real(dtype, n, vec_size):
     ref_result = dot_reference(n, ref_x, 1, ref_y, 1, ref_result)
 
     if dtype == torch.float32:
-        flag_blas.ops.sdot(n, x, 1, y, 1, result)
+        flag_blas.sdot(n, x, 1, y, 1, result)
     else:
-        flag_blas.ops.ddot(n, x, 1, y, 1, result)
+        flag_blas.ddot(n, x, 1, y, 1, result)
     blas_assert_close(result, ref_result, dtype, reduce_dim=n)
 
 
 @pytest.mark.dot
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sdot),
+        pytest.param(torch.float64, marks=pytest.mark.ddot),
+    ],
+)
 def test_accuracy_dot_negative_n(dtype):
     """Negative n should be treated as no-op, result set to zero."""
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
@@ -160,8 +223,8 @@ def test_accuracy_dot_negative_n(dtype):
     result = torch.ones(1, dtype=dtype, device=flag_blas.device)
 
     if dtype == torch.float32:
-        flag_blas.ops.sdot(-1, x, 1, y, 1, result)
+        flag_blas.sdot(-1, x, 1, y, 1, result)
     else:
-        flag_blas.ops.ddot(-1, x, 1, y, 1, result)
+        flag_blas.ddot(-1, x, 1, y, 1, result)
 
     assert result.item() == 0.0

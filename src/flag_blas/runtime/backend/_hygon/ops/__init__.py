@@ -1,6 +1,12 @@
 from .bfgemm import bfgemm
 from .cgemm import cgemm
 from .dgemm import dgemm
+from .amax import camax, damax, samax, zamax
+from .amin import camin, damin, samin, zamin
+from .asum import dasum, dzasum, sasum, scasum
+from .dot import sdot
+from .dotc import cdotc, zdotc
+from .dotu import cdotu, zdotu
 from .gbmv import cgbmv, dgbmv, zgbmv
 from .gemv import cgemv, zgemv
 from .ger import cgerc, cgeru, zgerc, zgeru
@@ -13,6 +19,7 @@ from .hgemm import hgemm
 from .hpmv import chpmv, zhpmv
 from .hpr import chpr, zhpr
 from .hpr2 import zhpr2
+from .nrm2 import dnrm2, dznrm2, scnrm2, snrm2
 from .sbmv import dsbmv, ssbmv
 from .sgemm import sgemm
 from .spmv import dspmv, sspmv
@@ -30,6 +37,27 @@ __all__ = [
     "dgemm",
     "hgemm",
     "zgemm",
+    "sdot",
+    "cdotu",
+    "zdotu",
+    "cdotc",
+    "zdotc",
+    "sasum",
+    "dasum",
+    "scasum",
+    "dzasum",
+    "snrm2",
+    "dnrm2",
+    "scnrm2",
+    "dznrm2",
+    "samin",
+    "damin",
+    "camin",
+    "zamin",
+    "samax",
+    "damax",
+    "camax",
+    "zamax",
     "cgemv",
     "cgerc",
     "cgeru",

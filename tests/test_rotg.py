@@ -1,7 +1,9 @@
 import ctypes
 import ctypes.util
 import glob
+import math
 import os
+import random
 
 import pytest
 import scipy
@@ -11,6 +13,12 @@ import flag_blas
 
 from .accuracy_utils import blas_assert_close, to_reference
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+
 
 ROTG_REAL_CASES = [
     (3.0, 4.0),
@@ -50,6 +58,44 @@ ROTG_COMPLEX_CASES = [
     (1e8 + 0.0j, 0.0 + 1e8j),
     (1e20 + 1e20j, -1e20 + 1e20j),
 ]
+
+ROTG_REAL_CASES += [
+    (1e-30, 1e-30),
+    (1e30, -1e30),
+    (2.0**-80, 2.0**-79),
+    (2.0**80, -(2.0**79)),
+    (0.0, 1e30),
+    (-1e30, 0.0),
+    (1e30, 1e-30),
+    (1e-30, -1e30),
+]
+ROTG_COMPLEX_CASES += [
+    (1e-30 + 1e-30j, -1e-30 + 1e-30j),
+    (1e30 + 1e30j, -1e30 + 1e30j),
+    (1.0 + 0.0j, -1.0 + 0.0j),
+    (0.0 - 1.0j, 0.0 + 1.0j),
+    (1.0 + 0.0j, 0.0 - 1.0j),
+    (-1.0 + 0.0j, 0.0 + 1.0j),
+    (1e30 + 1e-30j, 1e-30 - 1e30j),
+    (1e-30 + 1e-30j, 1e30 - 1e30j),
+]
+_rotg_rng = random.Random(20261013)
+for _ in range(32):
+    ROTG_REAL_CASES.append(tuple(_rotg_rng.uniform(-10.0, 10.0) for _ in range(2)))
+    _v = [_rotg_rng.uniform(-10.0, 10.0) for _ in range(4)]
+    ROTG_COMPLEX_CASES.append((complex(*_v[:2]), complex(*_v[2:])))
+
+
+# Keep CPU and device references on the same non-divergent complex cases.
+ROTG_COMPLEX_CASES_BY_DTYPE = {
+    dtype: [
+        (a, b)
+        for a, b in ROTG_COMPLEX_CASES
+        if not (a == 0.0j and (b == 0.0j or b.imag != 0.0))
+        and not (dtype == torch.complex64 and (abs(a) > 1e19 or abs(b) > 1e19))
+    ]
+    for dtype in (torch.complex64, torch.complex128)
+}
 
 ROTG_OPS = ["srotg", "drotg", "crotg", "zrotg"]
 CUBLAS_POINTER_MODE_DEVICE = 1
@@ -147,13 +193,13 @@ def _get_cublas_handle():
 
 def _call_rotg(dtype, a, b, c, s):
     if dtype == torch.float32:
-        flag_blas.ops.srotg(a, b, c, s)
+        flag_blas.srotg(a, b, c, s)
     elif dtype == torch.float64:
-        flag_blas.ops.drotg(a, b, c, s)
+        flag_blas.drotg(a, b, c, s)
     elif dtype == torch.complex64:
-        flag_blas.ops.crotg(a, b, c, s)
+        flag_blas.crotg(a, b, c, s)
     else:
-        flag_blas.ops.zrotg(a, b, c, s)
+        flag_blas.zrotg(a, b, c, s)
 
 
 def _rotg_real_dtype(dtype):
@@ -223,37 +269,95 @@ def _scipy_rotg_reference(dtype, a, b):
     )
 
 
-def _cublas_rotg_reference(dtype, a_val, b_val):
-    real_dtype = _rotg_real_dtype(dtype)
-    a = torch.tensor([a_val], dtype=dtype, device=flag_blas.device)
-    b = torch.tensor([b_val], dtype=dtype, device=flag_blas.device)
-    c = torch.zeros(1, dtype=real_dtype, device=flag_blas.device)
-    s = torch.zeros(1, dtype=dtype, device=flag_blas.device)
+if IS_HYGON:
 
-    if dtype == torch.float32:
-        func = _get_cublas().cublasSrotg_v2
-    elif dtype == torch.float64:
-        func = _get_cublas().cublasDrotg_v2
-    elif dtype == torch.complex64:
-        func = _get_cublas().cublasCrotg_v2
-    else:
-        func = _get_cublas().cublasZrotg_v2
+    def _resolve_hipblas_rotg(dtype):
+        symbol = {
+            torch.float32: "hipblasSrotg",
+            torch.float64: "hipblasDrotg",
+            torch.complex64: "hipblasCrotg_v2",
+            torch.complex128: "hipblasZrotg_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [ctypes.c_void_p] * 5
+        function.restype = ctypes.c_int
+        return function
 
-    status = func(
-        _get_cublas_handle(),
-        ctypes.c_void_p(a.data_ptr()),
-        ctypes.c_void_p(b.data_ptr()),
-        ctypes.c_void_p(c.data_ptr()),
-        ctypes.c_void_p(s.data_ptr()),
-    )
-    if status != 0:
-        raise RuntimeError(f"cuBLAS rotg execution failed, error code: {status}")
-    return a.cpu()[0].item(), b.cpu()[0].item(), c.cpu()[0].item(), s.cpu()[0].item()
+    def _hipblas_rotg_reference(dtype, a_val, b_val):
+        a = torch.tensor([a_val], dtype=dtype, device=flag_blas.device)
+        b = torch.tensor([b_val], dtype=dtype, device=flag_blas.device)
+        c = torch.zeros(1, dtype=_rotg_real_dtype(dtype), device=flag_blas.device)
+        s = torch.zeros(1, dtype=dtype, device=flag_blas.device)
+        _, handle = get_l1_hipblas_context(a)
+        function = _resolve_hipblas_rotg(dtype)
+        check_hipblas_status(
+            function(handle, a.data_ptr(), b.data_ptr(), c.data_ptr(), s.data_ptr()),
+            "hipBLAS ROTG",
+        )
+        return (
+            a.cpu()[0].item(),
+            b.cpu()[0].item(),
+            c.cpu()[0].item(),
+            s.cpu()[0].item(),
+        )
+
+    _cublas_rotg_reference = _hipblas_rotg_reference
+
+else:
+
+    def _cublas_rotg_reference(dtype, a_val, b_val):
+        real_dtype = _rotg_real_dtype(dtype)
+        a = torch.tensor([a_val], dtype=dtype, device=flag_blas.device)
+        b = torch.tensor([b_val], dtype=dtype, device=flag_blas.device)
+        c = torch.zeros(1, dtype=real_dtype, device=flag_blas.device)
+        s = torch.zeros(1, dtype=dtype, device=flag_blas.device)
+
+        if dtype == torch.float32:
+            func = _get_cublas().cublasSrotg_v2
+        elif dtype == torch.float64:
+            func = _get_cublas().cublasDrotg_v2
+        elif dtype == torch.complex64:
+            func = _get_cublas().cublasCrotg_v2
+        else:
+            func = _get_cublas().cublasZrotg_v2
+
+        status = func(
+            _get_cublas_handle(),
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(b.data_ptr()),
+            ctypes.c_void_p(c.data_ptr()),
+            ctypes.c_void_p(s.data_ptr()),
+        )
+        if status != 0:
+            raise RuntimeError(f"cuBLAS rotg execution failed, error code: {status}")
+        return (
+            a.cpu()[0].item(),
+            b.cpu()[0].item(),
+            c.cpu()[0].item(),
+            s.cpu()[0].item(),
+        )
 
 
 def _rotg_reference(dtype, a, b):
     if TO_CPU:
-        return _scipy_rotg_reference(dtype, a, b)
+        if dtype.is_complex:
+            # CPU math uses the cuBLAS/hipBLAS ROTG output convention. Newer
+            # OpenBLAS chooses a different phase when a == 0, and its CROTG can
+            # overflow for finite large inputs. No device reference is used here.
+            a = complex(torch.tensor(a, dtype=dtype).item())
+            b = complex(torch.tensor(b, dtype=dtype).item())
+            abs_a = math.hypot(a.real, a.imag)
+            if abs_a == 0.0:
+                return b, b, 0.0, 1.0 + 0.0j
+            norm = math.hypot(abs_a, math.hypot(b.real, b.imag))
+            phase = a / abs_a
+            return phase * norm, b, abs_a / norm, phase * b.conjugate() / norm
+        r, z, c, s = _scipy_rotg_reference(dtype, a, b)
+        # cuBLAS/hipBLAS encode z as 1 when c rounds to zero. OpenBLAS
+        # may return infinity from 1/c; r, c and s are still checked normally.
+        if c == 0.0 and r != 0.0:
+            z = 1.0
+        return r, z, c, s
     return _cublas_rotg_reference(dtype, a, b)
 
 
@@ -261,24 +365,22 @@ def _reference_tensor(values, dtype):
     return to_reference(torch.tensor(values, dtype=dtype, device=flag_blas.device))
 
 
-def _known_scipy_cublas_complex_divergence(dtype, a, b):
-    if not TO_CPU or dtype not in (torch.complex64, torch.complex128):
-        return False
-    if a == 0.0j and (b == 0.0j or b.imag != 0.0):
-        return True
-    return dtype == torch.complex64 and (abs(a) > 1e19 or abs(b) > 1e19)
-
-
 @pytest.mark.rotg
-@pytest.mark.parametrize("op_name", ROTG_OPS)
+@pytest.mark.parametrize(
+    "op_name", [pytest.param(op, marks=getattr(pytest.mark, op)) for op in ROTG_OPS]
+)
 def test_accuracy_rotg_flag_blas_api_symbols(op_name):
-    assert callable(getattr(flag_blas.ops, op_name))
     assert callable(getattr(flag_blas, op_name))
-    assert getattr(flag_blas.ops, op_name) is getattr(flag_blas, op_name)
 
 
 @pytest.mark.rotg
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotg),
+        pytest.param(torch.float64, marks=pytest.mark.drotg),
+    ],
+)
 @pytest.mark.parametrize("a_val,b_val", ROTG_REAL_CASES)
 def test_accuracy_rotg_real(dtype, a_val, b_val):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
@@ -291,15 +393,16 @@ def test_accuracy_rotg_real(dtype, a_val, b_val):
 
     ref_a, ref_b, ref_c, ref_s = _rotg_reference(dtype, a_val, b_val)
     if dtype == torch.float32:
-        flag_blas.ops.srotg(a, b, c, s)
+        flag_blas.srotg(a, b, c, s)
     else:
-        flag_blas.ops.drotg(a, b, c, s)
+        flag_blas.drotg(a, b, c, s)
 
     expected = _reference_tensor([ref_a, ref_b, ref_c, ref_s], dtype)
     actual = torch.stack((a[0], b[0], c[0], s[0]))
     blas_assert_close(actual, expected, dtype)
 
 
+@pytest.mark.srotg
 @pytest.mark.rotg
 def test_accuracy_rotg_flag_blas_api():
     a = torch.tensor([3.0], dtype=torch.float32, device=flag_blas.device)
@@ -316,13 +419,17 @@ def test_accuracy_rotg_flag_blas_api():
 
 
 @pytest.mark.rotg
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-@pytest.mark.parametrize("a_val,b_val", ROTG_COMPLEX_CASES)
+@pytest.mark.parametrize(
+    "dtype,a_val,b_val",
+    [
+        pytest.param(dtype, a, b, marks=getattr(pytest.mark, op))
+        for dtype, op in ((torch.complex64, "crotg"), (torch.complex128, "zrotg"))
+        for a, b in ROTG_COMPLEX_CASES_BY_DTYPE[dtype]
+    ],
+)
 def test_accuracy_rotg_complex(dtype, a_val, b_val):
     if dtype == torch.complex128 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
-    if _known_scipy_cublas_complex_divergence(dtype, a_val, b_val):
-        pytest.xfail("SciPy OpenBLAS complex rotg diverges from cuBLAS semantics")
 
     real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
     a = torch.tensor([a_val], dtype=dtype, device=flag_blas.device)
@@ -332,9 +439,9 @@ def test_accuracy_rotg_complex(dtype, a_val, b_val):
 
     ref_a, ref_b, ref_c, ref_s = _rotg_reference(dtype, a_val, b_val)
     if dtype == torch.complex64:
-        flag_blas.ops.crotg(a, b, c, s)
+        flag_blas.crotg(a, b, c, s)
     else:
-        flag_blas.ops.zrotg(a, b, c, s)
+        flag_blas.zrotg(a, b, c, s)
 
     blas_assert_close(a, _reference_tensor([ref_a], dtype), dtype)
     blas_assert_close(b, _reference_tensor([ref_b], dtype), dtype)
@@ -344,7 +451,13 @@ def test_accuracy_rotg_complex(dtype, a_val, b_val):
 
 @pytest.mark.rotg
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotg),
+        pytest.param(torch.float64, marks=pytest.mark.drotg),
+        pytest.param(torch.complex64, marks=pytest.mark.crotg),
+        pytest.param(torch.complex128, marks=pytest.mark.zrotg),
+    ],
 )
 def test_rotg_rejects_non_scalar_inputs(dtype):
     if (
@@ -363,6 +476,7 @@ def test_rotg_rejects_non_scalar_inputs(dtype):
         _call_rotg(dtype, a, b, c, s)
 
 
+@pytest.mark.srotg
 @pytest.mark.rotg
 def test_srotg_rejects_mismatched_input_dtype():
     a = torch.ones(1, dtype=torch.float32, device=flag_blas.device)
@@ -371,9 +485,10 @@ def test_srotg_rejects_mismatched_input_dtype():
     s = torch.zeros(1, dtype=torch.float32, device=flag_blas.device)
 
     with pytest.raises(AssertionError, match="b must be float32"):
-        flag_blas.ops.srotg(a, b, c, s)
+        flag_blas.srotg(a, b, c, s)
 
 
+@pytest.mark.crotg
 @pytest.mark.rotg
 def test_crotg_rejects_mismatched_c_dtype():
     a = torch.ones(1, dtype=torch.complex64, device=flag_blas.device)
@@ -382,4 +497,4 @@ def test_crotg_rejects_mismatched_c_dtype():
     s = torch.zeros(1, dtype=torch.complex64, device=flag_blas.device)
 
     with pytest.raises(AssertionError, match="c must be float32"):
-        flag_blas.ops.crotg(a, b, c, s)
+        flag_blas.crotg(a, b, c, s)
