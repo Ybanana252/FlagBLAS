@@ -1,3 +1,9 @@
+from .amax import camax, damax, samax, zamax
+from .amin import camin, damin, samin, zamin
+from .asum import dasum, dzasum, sasum, scasum
+from .dot import sdot
+from .dotc import cdotc, zdotc
+from .dotu import cdotu, zdotu
 from .gbmv import cgbmv, dgbmv, zgbmv
 from .gemv import cgemv, zgemv
 from .ger import cgerc, cgeru, zgerc, zgeru
@@ -9,6 +15,7 @@ from .her2 import cher2, zher2
 from .hpmv import chpmv, zhpmv
 from .hpr import chpr, zhpr
 from .hpr2 import zhpr2
+from .nrm2 import dnrm2, dznrm2, scnrm2, snrm2
 from .sbmv import dsbmv, ssbmv
 from .spmv import dspmv, sspmv
 from .symv import csymv, zsymv
@@ -19,6 +26,27 @@ from .trmv import ctrmv, dtrmv, strmv, ztrmv
 from .trsv import ctrsv, dtrsv, strsv, ztrsv
 
 __all__ = [
+    "sdot",
+    "cdotu",
+    "zdotu",
+    "cdotc",
+    "zdotc",
+    "sasum",
+    "dasum",
+    "scasum",
+    "dzasum",
+    "snrm2",
+    "dnrm2",
+    "scnrm2",
+    "dznrm2",
+    "samin",
+    "damin",
+    "camin",
+    "zamin",
+    "samax",
+    "damax",
+    "camax",
+    "zamax",
     "cgemv",
     "cgerc",
     "cgeru",

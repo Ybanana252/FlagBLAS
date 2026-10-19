@@ -7,13 +7,21 @@ from scipy.linalg import blas as cpu_blas
 
 import flag_blas
 
-from .accuracy_utils import (
-    L1_PAIR_STRIDES,
-    L1_STRIDE_SHAPES,
-    blas_assert_close,
-    to_reference,
-)
+from .accuracy_utils import L1_PAIR_STRIDES
+from .accuracy_utils import L1_STRIDE_SHAPES
+from .accuracy_utils import L1_STRIDE_SHAPES as PERF_STRIDE_SHAPES
+from .accuracy_utils import L1_VECTOR_SHAPES as PERF_VECTOR_SHAPES
+from .accuracy_utils import blas_assert_close, to_reference
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    from tests.hipblas_reference import (
+        check_hipblas_status,
+        get_hipblas_context,
+        get_hipblas_library,
+    )
+
 
 ROTM_FLAGS = [-2.0, -1.0, 0.0, 1.0]
 ROTM_OPS = ["srotm", "drotm"]
@@ -83,32 +91,6 @@ def _rotm_host_param(dtype, param):
     return (ctypes.c_double * 5)(*values)
 
 
-def _cublas_rotm_reference(n, x, incx, y, incy, param):
-    ref_x = x.clone()
-    ref_y = y.clone()
-    if n <= 0:
-        return ref_x, ref_y
-
-    func = (
-        _get_cublas().cublasSrotm_v2
-        if x.dtype == torch.float32
-        else _get_cublas().cublasDrotm_v2
-    )
-    param_host = _rotm_host_param(x.dtype, param)
-    status = func(
-        _get_cublas_handle(),
-        ctypes.c_int(n),
-        ctypes.c_void_p(ref_x.data_ptr()),
-        ctypes.c_int(incx),
-        ctypes.c_void_p(ref_y.data_ptr()),
-        ctypes.c_int(incy),
-        ctypes.cast(param_host, ctypes.c_void_p),
-    )
-    if status != 0:
-        raise RuntimeError(f"cuBLAS rotm execution failed, error code: {status}")
-    return ref_x, ref_y
-
-
 def _scipy_rotm_reference(n, x, incx, y, incy, param):
     ref_x = x.detach().cpu().clone().contiguous()
     ref_y = y.detach().cpu().clone().contiguous()
@@ -132,6 +114,77 @@ def _scipy_rotm_reference(n, x, incx, y, incy, param):
     return ref_x, ref_y
 
 
+if IS_HYGON:
+
+    def _resolve_hipblas_rotm(dtype):
+        symbol = {
+            torch.float32: "hipblasSrotm",
+            torch.float64: "hipblasDrotm",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def _hipblas_rotm_reference(n, x, incx, y, incy, param):
+        ref_x, ref_y = x.clone(), y.clone()
+        if n <= 0:
+            return ref_x, ref_y
+        _, handle = get_hipblas_context(ref_x)
+        function = _resolve_hipblas_rotm(x.dtype)
+        param_host = _rotm_host_param(x.dtype, param)
+        check_hipblas_status(
+            function(
+                handle,
+                n,
+                ref_x.data_ptr(),
+                incx,
+                ref_y.data_ptr(),
+                incy,
+                ctypes.cast(param_host, ctypes.c_void_p),
+            ),
+            "hipBLAS ROTM",
+        )
+        return ref_x, ref_y
+
+    _cublas_rotm_reference = _hipblas_rotm_reference
+
+else:
+
+    def _cublas_rotm_reference(n, x, incx, y, incy, param):
+        ref_x = x.clone()
+        ref_y = y.clone()
+        if n <= 0:
+            return ref_x, ref_y
+
+        func = (
+            _get_cublas().cublasSrotm_v2
+            if x.dtype == torch.float32
+            else _get_cublas().cublasDrotm_v2
+        )
+        param_host = _rotm_host_param(x.dtype, param)
+        status = func(
+            _get_cublas_handle(),
+            ctypes.c_int(n),
+            ctypes.c_void_p(ref_x.data_ptr()),
+            ctypes.c_int(incx),
+            ctypes.c_void_p(ref_y.data_ptr()),
+            ctypes.c_int(incy),
+            ctypes.cast(param_host, ctypes.c_void_p),
+        )
+        if status != 0:
+            raise RuntimeError(f"cuBLAS rotm execution failed, error code: {status}")
+        return ref_x, ref_y
+
+
 def _rotm_reference(n, x, incx, y, incy, param):
     if TO_CPU:
         return _scipy_rotm_reference(n, x, incx, y, incy, param)
@@ -140,21 +193,27 @@ def _rotm_reference(n, x, incx, y, incy, param):
 
 def _call_rotm(dtype, n, x, incx, y, incy, param):
     if dtype == torch.float32:
-        flag_blas.ops.srotm(n, x, incx, y, incy, param)
+        flag_blas.srotm(n, x, incx, y, incy, param)
     else:
-        flag_blas.ops.drotm(n, x, incx, y, incy, param)
+        flag_blas.drotm(n, x, incx, y, incy, param)
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("op_name", ROTM_OPS)
+@pytest.mark.parametrize(
+    "op_name", [pytest.param(op, marks=getattr(pytest.mark, op)) for op in ROTM_OPS]
+)
 def test_accuracy_rotm_flag_blas_api_symbols(op_name):
-    assert callable(getattr(flag_blas.ops, op_name))
     assert callable(getattr(flag_blas, op_name))
-    assert getattr(flag_blas.ops, op_name) is getattr(flag_blas, op_name)
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 @pytest.mark.parametrize("shape", L1_STRIDE_SHAPES[:4])
 @pytest.mark.parametrize("incx,incy", L1_PAIR_STRIDES)
 @pytest.mark.parametrize("flag", ROTM_FLAGS)
@@ -175,7 +234,13 @@ def test_accuracy_rotm_real(dtype, shape, incx, incy, flag):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 def test_accuracy_rotm_empty_tensor(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -189,7 +254,13 @@ def test_accuracy_rotm_empty_tensor(dtype):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 @pytest.mark.parametrize("n,vec_size", [(1, 10), (5, 10), (10, 20), (100, 1000)])
 @pytest.mark.parametrize("flag", ROTM_FLAGS)
 def test_accuracy_rotm_different_n_real(dtype, n, vec_size, flag):
@@ -208,7 +279,13 @@ def test_accuracy_rotm_different_n_real(dtype, n, vec_size, flag):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 def test_accuracy_rotm_flag_blas_api(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -237,7 +314,13 @@ def test_accuracy_rotm_flag_blas_api(dtype):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 @pytest.mark.parametrize("incx,incy", [(0, 1), (1, 0), (-1, 1), (1, -1)])
 def test_rotm_rejects_nonpositive_strides(dtype, incx, incy):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
@@ -252,7 +335,13 @@ def test_rotm_rejects_nonpositive_strides(dtype, incx, incy):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 def test_rotm_rejects_short_vectors(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -269,7 +358,13 @@ def test_rotm_rejects_short_vectors(dtype):
 
 
 @pytest.mark.rotm
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
 def test_rotm_rejects_bad_param_shape(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -282,6 +377,7 @@ def test_rotm_rejects_bad_param_shape(dtype):
         _call_rotm(dtype, 4, x, 1, y, 1, param)
 
 
+@pytest.mark.srotm
 @pytest.mark.rotm
 def test_srotm_rejects_mismatched_param_dtype():
     x = torch.randn(4, dtype=torch.float32, device=flag_blas.device)
@@ -289,4 +385,41 @@ def test_srotm_rejects_mismatched_param_dtype():
     param = _build_param(torch.float64, flag_blas.device, -1.0)
 
     with pytest.raises(AssertionError, match="param must be float32"):
-        flag_blas.ops.srotm(4, x, 1, y, 1, param)
+        flag_blas.srotm(4, x, 1, y, 1, param)
+
+
+ROTM_PERF_CASES = [
+    (shape, 1, 1, flag) for shape in PERF_VECTOR_SHAPES for flag in ROTM_FLAGS
+] + [
+    (shape, ix, iy, -1.0)
+    for shape in PERF_STRIDE_SHAPES
+    for ix, iy in L1_PAIR_STRIDES
+    if (ix, iy) != (1, 1)
+]
+
+
+@pytest.mark.rotm
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotm),
+        pytest.param(torch.float64, marks=pytest.mark.drotm),
+    ],
+)
+@pytest.mark.parametrize("shape,incx,incy,flag", ROTM_PERF_CASES)
+def test_accuracy_rotm_perf_inputs(dtype, shape, incx, incy, flag):
+    if (
+        dtype in (torch.float64, torch.complex128)
+        and not flag_blas.runtime.device.support_fp64
+    ):
+        pytest.skip("Device does not support float64")
+    n = shape[0]
+    param = torch.tensor(
+        [flag, 0.8, 0.2, -0.3, 0.7], dtype=dtype, device=flag_blas.device
+    )
+    x = torch.randn(n * incx, dtype=dtype, device=flag_blas.device)
+    y = torch.randn(n * incy, dtype=dtype, device=flag_blas.device)
+    expected_x, expected_y = _rotm_reference(n, x, incx, y, incy, param)
+    _call_rotm(dtype, n, x, incx, y, incy, param)
+    blas_assert_close(x, expected_x, dtype)
+    blas_assert_close(y, expected_y, dtype)

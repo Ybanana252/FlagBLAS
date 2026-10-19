@@ -43,38 +43,33 @@ def torch_zabs(x, n=None, out=None):
 
 
 def blas_sabs_wrapper(x, n=None, out=None):
-    flag_blas.ops.sabs(n, x, out)
+    flag_blas.sabs(n, x, out)
     return out
 
 
 def blas_dabs_wrapper(x, n=None, out=None):
-    flag_blas.ops.dabs(n, x, out)
+    flag_blas.dabs(n, x, out)
     return out
 
 
 def blas_cabs_wrapper(x, n=None, out=None):
-    flag_blas.ops.cabs(n, x, out)
+    flag_blas.cabs(n, x, out)
     return out
 
 
 def blas_zabs_wrapper(x, n=None, out=None):
-    flag_blas.ops.zabs(n, x, out)
+    flag_blas.zabs(n, x, out)
     return out
 
 
 class AbsBenchmark(Benchmark):
     correctness_reference = "torch"
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_VECTOR_SHAPES
-
     def set_more_metrics(self):
-        return ["gbps"]
+        return ["tflops", "gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_VECTOR_SHAPES
-        return None
+        return L1_VECTOR_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
         for shape in self.shapes:
@@ -106,8 +101,15 @@ class AbsBenchmark(Benchmark):
         io_amount = inp.numel() * (inp.element_size() + out_element_size)
         return io_amount * 1e-9 / (latency * 1e-3)
 
+    def get_tflops(self, op, *args, **kwargs):
+        x = args[0]
+        incx = kwargs.get("incx", getattr(self, "incx", 1))
+        n = kwargs.get("n", x.numel() // incx)
+        # Complex magnitude: two multiplies, one add and one sqrt.
+        return 4 * n if x.dtype.is_complex else 0
 
-@pytest.mark.abs
+
+@pytest.mark.sabs
 def test_perf_sabs():
     bench = AbsBenchmark(
         op_name="sabs",
@@ -118,7 +120,7 @@ def test_perf_sabs():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.abs
+@pytest.mark.dabs
 def test_perf_dabs():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -131,7 +133,7 @@ def test_perf_dabs():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.abs
+@pytest.mark.cabs
 def test_perf_cabs():
     bench = AbsBenchmark(
         op_name="cabs",
@@ -142,7 +144,7 @@ def test_perf_cabs():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.abs
+@pytest.mark.zabs
 def test_perf_zabs():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")

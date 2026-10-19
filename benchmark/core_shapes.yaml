@@ -133,6 +133,54 @@ RotStrideBenchmark:
 ScalStrideBenchmark:
   <<: *l1_stride_shapes
 
+# Remaining L1 families use the same public core shape groups.
+AminBenchmark:
+  shapes: [[64], [1024], [2048], [4096]]
+  shape_desc: "N"
+DotBenchmark:
+  <<: *l1_vector_shapes
+DotcBenchmark:
+  <<: *l1_vector_shapes
+DotuBenchmark:
+  <<: *l1_vector_shapes
+RotmBenchmark:
+  <<: *l1_vector_shapes
+SwapBenchmark:
+  <<: *l1_vector_shapes
+RotmStrideBenchmark:
+  <<: *l1_stride_shapes
+
+# Scalar operators use their input values as case parameters; tensor sizes are one.
+RotgBenchmark:
+  shapes:
+    - [3.0, 4.0]
+    - [4.0, 3.0]
+    - [0.0, 1.0]
+    - [1.0, 0.0]
+    - [-3.0, 4.0]
+    - [1.0, -1.0]
+  shape_desc: "a, b"
+crotg: &l1_complex_rotg_cases
+  shapes:
+    - [1.0, 2.0, 3.0, 4.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [1.0, 0.0, 0.0, 0.0]
+    - [-2.0, 3.0, 4.0, -5.0]
+    - [3.0, 0.0, 0.0, 4.0]
+    - [1.0, -1.0, -1.0, 1.0]
+  shape_desc: "a.real, a.imag, b.real, b.imag"
+zrotg:
+  <<: *l1_complex_rotg_cases
+RotmgBenchmark:
+  shapes:
+    - [-1.0, 2.0, 3.0, 4.0]
+    - [1.0, 0.0, 2.0, 3.0]
+    - [1.0, 2.0, 3.0, 0.0]
+    - [2.0, 1.0, 3.0, 1.0]
+    - [1.0, -2.0, 3.0, 4.0]
+    - [1.0, 2.0, 1.0, 1.0]
+  shape_desc: "d1, d2, x1, y1"
+
 # GEMM operations base shapes (M, N, K)
 # These shapes are used for GEMM-family benchmarks
 DgemmBenchmark:

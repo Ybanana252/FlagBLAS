@@ -16,7 +16,6 @@ import ctypes
 import ctypes.util
 from typing import Generator
 
-import cupy as cp
 import pytest
 import torch
 
@@ -24,6 +23,17 @@ import flag_blas
 from benchmark.attri_util import L1_STRIDE_SHAPES, L1_VECTOR_SHAPES
 from benchmark.performance_utils import Benchmark, run_correctness_then_benchmark
 from flag_blas.utils import shape_utils
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from tests.hipblas_reference import (
+        check_hipblas_status,
+        get_hipblas_context,
+        get_hipblas_library,
+    )
+else:
+    import cupy as cp
 
 
 def load_cublas():
@@ -40,88 +50,133 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
+_cublas = None if IS_HYGON else load_cublas()
 
 
-def cublas_copy_reference(x, y, incx=1, incy=1, n=None):
-    if n is None:
-        n = x.numel() // incx
-    if n == 0:
+def _resolve_cublas_copy(dtype):
+    symbol = {
+        torch.float32: "cublasScopy_v2",
+        torch.float64: "cublasDcopy_v2",
+        torch.complex64: "cublasCcopy_v2",
+        torch.complex128: "cublasZcopy_v2",
+    }[dtype]
+    function = getattr(_cublas, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+def blas_scopy_wrapper(x, y, incx=1, incy=1, n=None, handle=None, c_func=None):
+    flag_blas.scopy(n, x, incx, y, incy)
+    return x, y
+
+
+def blas_dcopy_wrapper(x, y, incx=1, incy=1, n=None, handle=None, c_func=None):
+    flag_blas.dcopy(n, x, incx, y, incy)
+    return x, y
+
+
+def blas_ccopy_wrapper(x, y, incx=1, incy=1, n=None, handle=None, c_func=None):
+    flag_blas.ccopy(n, x, incx, y, incy)
+    return x, y
+
+
+def blas_zcopy_wrapper(x, y, incx=1, incy=1, n=None, handle=None, c_func=None):
+    flag_blas.zcopy(n, x, incx, y, incy)
+    return x, y
+
+
+if IS_HYGON:
+
+    def _resolve_hipblas_copy(dtype):
+        symbol = {
+            torch.float32: "hipblasScopy",
+            torch.float64: "hipblasDcopy",
+            torch.complex64: "hipblasCcopy_v2",
+            torch.complex128: "hipblasZcopy_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_copy_baseline(x, y, n=None, incx=1, incy=1, handle=None, c_func=None):
+        if n is None:
+            n = min(x.numel() // incx, y.numel() // incy)
+        if n <= 0:
+            return x, y
+        check_hipblas_status(
+            c_func(handle, n, x.data_ptr(), incx, y.data_ptr(), incy), "hipBLAS COPY"
+        )
         return x, y
 
-    handle = cp.cuda.device.get_cublas_handle()
-    dtype = x.dtype
+    def _hygon_copy_wrapper(op):
+        def wrapper(x, y, n=None, incx=1, incy=1, handle=None, c_func=None):
+            return op(x, y, n=n, incx=incx, incy=incy)
 
-    if dtype == torch.float32:
-        func = _cublas.cublasScopy_v2
-    elif dtype == torch.float64:
-        func = _cublas.cublasDcopy_v2
-    elif dtype == torch.complex64:
-        func = _cublas.cublasCcopy_v2
-    elif dtype == torch.complex128:
-        func = _cublas.cublasZcopy_v2
-    else:
-        raise ValueError(f"Unsupported dtype {dtype}")
+        return wrapper
 
-    status = func(
-        ctypes.c_void_p(handle),
-        ctypes.c_int(n),
-        ctypes.c_void_p(x.data_ptr()),
-        ctypes.c_int(incx),
-        ctypes.c_void_p(y.data_ptr()),
-        ctypes.c_int(incy),
-    )
+    cublas_copy_reference = hipblas_copy_baseline
+    blas_scopy_wrapper = _hygon_copy_wrapper(blas_scopy_wrapper)
+    blas_dcopy_wrapper = _hygon_copy_wrapper(blas_dcopy_wrapper)
+    blas_ccopy_wrapper = _hygon_copy_wrapper(blas_ccopy_wrapper)
+    blas_zcopy_wrapper = _hygon_copy_wrapper(blas_zcopy_wrapper)
 
-    if status != 0:
-        raise RuntimeError(f"cuBLAS copy execution failed, error code: {status}")
+else:
 
-    return x, y
-
-
-def blas_scopy_wrapper(x, y, incx=1, incy=1, n=None):
-    flag_blas.ops.scopy(n, x, incx, y, incy)
-    return x, y
-
-
-def blas_dcopy_wrapper(x, y, incx=1, incy=1, n=None):
-    flag_blas.ops.dcopy(n, x, incx, y, incy)
-    return x, y
-
-
-def blas_ccopy_wrapper(x, y, incx=1, incy=1, n=None):
-    flag_blas.ops.ccopy(n, x, incx, y, incy)
-    return x, y
-
-
-def blas_zcopy_wrapper(x, y, incx=1, incy=1, n=None):
-    flag_blas.ops.zcopy(n, x, incx, y, incy)
-    return x, y
+    def cublas_copy_reference(x, y, incx=1, incy=1, n=None, handle=None, c_func=None):
+        if n <= 0:
+            return x, y
+        status = c_func(handle, n, x.data_ptr(), incx, y.data_ptr(), incy)
+        if status != 0:
+            raise RuntimeError(f"cuBLAS copy execution failed, error code: {status}")
+        return x, y
 
 
 class CopyBenchmark(Benchmark):
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_VECTOR_SHAPES
-
     def set_more_metrics(self):
         return ["gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_VECTOR_SHAPES
-        return None
+        return L1_VECTOR_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_HYGON:
+            c_func = _resolve_hipblas_copy(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            c_func = _resolve_cublas_copy(cur_dtype)
         for shape in self.shapes:
             inp1 = torch.randn(shape, dtype=cur_dtype, device=self.device)
-            inp2 = torch.empty(shape, dtype=cur_dtype, device=self.device)
+            inp2 = torch.zeros(shape, dtype=cur_dtype, device=self.device)
             n = inp1.numel()
             if n > 0:
-                yield inp1, inp2, {"n": n}
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp1)
+                yield inp1, inp2, {"n": n, "handle": handle, "c_func": c_func}
 
     def get_gbps(self, args, latency):
         inp1, inp2 = args[0], args[1]
         io_amount = shape_utils.size_in_bytes(inp1) + shape_utils.size_in_bytes(inp2)
         return io_amount * 1e-9 / (latency * 1e-3)
+
+    def get_tflops(self, op, *args, **kwargs):
+        # Data movement has no floating-point arithmetic.
+        return 0
 
 
 class CopyStrideBenchmark(Benchmark):
@@ -130,28 +185,28 @@ class CopyStrideBenchmark(Benchmark):
         self.incx = incx
         self.incy = incy
 
-    def init_user_config(self):
-        super().init_user_config()
-        self.shapes = L1_STRIDE_SHAPES
-
     def set_more_metrics(self):
         return ["gbps"]
 
     def set_more_shapes(self):
-        self.shapes = L1_STRIDE_SHAPES
-        return None
+        return L1_STRIDE_SHAPES
 
     def get_input_iter(self, cur_dtype) -> Generator:
+        if IS_HYGON:
+            c_func = _resolve_hipblas_copy(cur_dtype)
+        else:
+            handle = cp.cuda.device.get_cublas_handle()
+            c_func = _resolve_cublas_copy(cur_dtype)
         for shape in self.shapes:
             n = shape[0]
             inp1 = torch.randn(n * self.incx, dtype=cur_dtype, device=self.device)
-            inp2 = torch.empty(n * self.incy, dtype=cur_dtype, device=self.device)
+            inp2 = torch.zeros(n * self.incy, dtype=cur_dtype, device=self.device)
             if n > 0:
-                yield inp1, inp2, {
-                    "incx": self.incx,
-                    "incy": self.incy,
-                    "n": n,
-                }
+                kwargs = {"incx": self.incx, "incy": self.incy, "n": n}
+                if IS_HYGON:
+                    _, handle = get_hipblas_context(inp1)
+                kwargs.update(handle=handle, c_func=c_func)
+                yield inp1, inp2, kwargs
 
     def get_gbps(self, args, latency):
         inp1 = args[0]
@@ -160,8 +215,17 @@ class CopyStrideBenchmark(Benchmark):
         io_amount = 2 * n * element_size
         return io_amount * 1e-9 / (latency * 1e-3)
 
+    def get_tflops(self, op, *args, **kwargs):
+        # Data movement has no floating-point arithmetic.
+        return 0
 
-@pytest.mark.copy
+
+if IS_HYGON:
+    CopyBenchmark.correctness_reference = "hipBLAS"
+    CopyStrideBenchmark.correctness_reference = "hipBLAS"
+
+
+@pytest.mark.scopy
 def test_perf_scopy():
     bench = CopyBenchmark(
         op_name="scopy",
@@ -172,7 +236,7 @@ def test_perf_scopy():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.dcopy
 def test_perf_dcopy():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -185,7 +249,7 @@ def test_perf_dcopy():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.ccopy
 def test_perf_ccopy():
     bench = CopyBenchmark(
         op_name="ccopy",
@@ -196,7 +260,7 @@ def test_perf_ccopy():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.zcopy
 def test_perf_zcopy():
     if not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -209,7 +273,7 @@ def test_perf_zcopy():
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.scopy
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_scopy_stride(incx, incy):
     bench = CopyStrideBenchmark(
@@ -223,7 +287,7 @@ def test_perf_scopy_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.dcopy
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_dcopy_stride(incx, incy):
     if not flag_blas.runtime.device.support_fp64:
@@ -239,7 +303,7 @@ def test_perf_dcopy_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.ccopy
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_ccopy_stride(incx, incy):
     bench = CopyStrideBenchmark(
@@ -253,7 +317,7 @@ def test_perf_ccopy_stride(incx, incy):
     run_correctness_then_benchmark(bench)
 
 
-@pytest.mark.copy
+@pytest.mark.zcopy
 @pytest.mark.parametrize("incx,incy", [(2, 2), (2, 3), (3, 2), (3, 3)])
 def test_perf_zcopy_stride(incx, incy):
     if not flag_blas.runtime.device.support_fp64:

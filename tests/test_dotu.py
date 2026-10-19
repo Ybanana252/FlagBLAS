@@ -12,16 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cupy as cp
+import ctypes
+
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
 
 from .accuracy_utils import DOTU_SHAPES, L1_PAIR_STRIDES, blas_assert_close
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+
+    from .hipblas_reference import check_hipblas_status
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
+
+
+def hipblas_dotu_reference(n, x, incx, y, incy, result):
+    if n <= 0:
+        result.zero_()
+        return
+    symbol = {
+        torch.complex64: "hipblasCdotu_v2",
+        torch.complex128: "hipblasZdotu_v2",
+    }[x.dtype]
+    library, handle = get_l1_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(handle, n, x.data_ptr(), incx, y.data_ptr(), incy, result.data_ptr()),
+        symbol,
+    )
 
 
 def cublas_dotu_reference(n, x, incx, y, incy, result):
@@ -71,12 +107,21 @@ def dotu_reference(n, x, incx, y, incy, result):
         cpu_dotu_reference(n, x, incx, y, incy, ref_result)
         return ref_result
 
-    cublas_dotu_reference(n, x, incx, y, incy, result)
+    if IS_HYGON:
+        hipblas_dotu_reference(n, x, incx, y, incy, result)
+    else:
+        cublas_dotu_reference(n, x, incx, y, incy, result)
     return result
 
 
 @pytest.mark.dotu
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cdotu),
+        pytest.param(torch.complex128, marks=pytest.mark.zdotu),
+    ],
+)
 @pytest.mark.parametrize("shape", DOTU_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_PAIR_STRIDES)
 def test_accuracy_dotu_complex(dtype, shape, incx, incy):
@@ -94,15 +139,21 @@ def test_accuracy_dotu_complex(dtype, shape, incx, incy):
     ref_result = dotu_reference(n, x.clone(), incx, y.clone(), incy, ref_result)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cdotu(n, x, incx, y, incy, result)
+        flag_blas.cdotu(n, x, incx, y, incy, result)
     else:
-        flag_blas.ops.zdotu(n, x, incx, y, incy, result)
+        flag_blas.zdotu(n, x, incx, y, incy, result)
 
     blas_assert_close(result, ref_result, dtype, reduce_dim=n)
 
 
 @pytest.mark.dotu
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cdotu),
+        pytest.param(torch.complex128, marks=pytest.mark.zdotu),
+    ],
+)
 def test_accuracy_dotu_empty_tensor(dtype):
     """n <= 0 must be a no-op and write zero to result."""
     if dtype == torch.complex128 and not flag_blas.runtime.device.support_fp64:
@@ -114,9 +165,9 @@ def test_accuracy_dotu_empty_tensor(dtype):
     n = 0
 
     if dtype == torch.complex64:
-        flag_blas.ops.cdotu(n, x, 1, y, 1, result)
+        flag_blas.cdotu(n, x, 1, y, 1, result)
     else:
-        flag_blas.ops.zdotu(n, x, 1, y, 1, result)
+        flag_blas.zdotu(n, x, 1, y, 1, result)
 
     assert result.item() == 0j
     assert result.dtype == dtype
@@ -124,7 +175,13 @@ def test_accuracy_dotu_empty_tensor(dtype):
 
 
 @pytest.mark.dotu
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cdotu),
+        pytest.param(torch.complex128, marks=pytest.mark.zdotu),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -143,8 +200,8 @@ def test_accuracy_dotu_different_n(dtype, n, vec_size):
     ref_result = dotu_reference(n, x[:n].clone(), 1, y[:n].clone(), 1, ref_result)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cdotu(n, x, 1, y, 1, result)
+        flag_blas.cdotu(n, x, 1, y, 1, result)
     else:
-        flag_blas.ops.zdotu(n, x, 1, y, 1, result)
+        flag_blas.zdotu(n, x, 1, y, 1, result)
 
     blas_assert_close(result, ref_result, dtype, reduce_dim=n)
