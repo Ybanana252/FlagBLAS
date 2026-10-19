@@ -128,8 +128,6 @@ l1_amax_stride_shapes: &l1_amax_stride_shapes
     - [4194304]
   shape_desc: "N"
 
-AbsBenchmark:
-  <<: *l1_vector_shapes
 AmaxBenchmark:
   <<: *l1_vector_shapes
 AsumBenchmark:
