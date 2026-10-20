@@ -28,7 +28,10 @@ from .conftest import TO_CPU
 
 # cuPy/cuBLAS are only available on CUDA-capable vendors; on other backends the
 # reference uses the vendor's native BLAS through ctypes (muBLAS/mublasLt on
-# MThreads) or falls back to a torch.matmul-based implementation.
+# MThreads) or falls back to a torch.matmul-based implementation.  Hygon uses a
+# device-side fp32 matmul oracle (see cublas_bfgemm_reference).
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
 try:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
@@ -38,10 +41,20 @@ except ImportError:
     cp = None
     cublas = None
     HAS_CUBLAS = False
-
 CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUDA_R_16BF = 14
+
+# T-Head (Zhenwu) cuBLAS rejects a legacy cudaDataType passed where
+# cublasGemmEx expects a cublasComputeType_t (CUBLAS_STATUS_NOT_SUPPORTED).
+# Use the proper cublasComputeType_t / cublasGemmAlgo_t enums there; other
+# vendors keep the original arguments.
+if flag_blas.vendor_name == "thead":
+    GEMM_COMPUTE_TYPE = cublas.CUBLAS_COMPUTE_32F
+    GEMM_ALGO = cublas.CUBLAS_GEMM_DEFAULT
+else:
+    GEMM_COMPUTE_TYPE = CUDA_R_32F
+    GEMM_ALGO = 0
 
 
 def _load_lib(names, search_dir=None):
@@ -187,6 +200,20 @@ def cublas_bfgemm_reference(
     if m == 0 or n == 0:
         return
 
+    if IS_HYGON:
+        # No usable bf16 gemm entry point in DTK hipBLAS (all combinations of
+        # hipblasGemmEx/_v2 return NOT_SUPPORTED / INVALID_ENUM, and no legacy
+        # hipblasBgemm); torch bf16 matmul uses rocBLAS bf16 Tensile (fp32
+        # accumulation), same as the benchmark baseline.
+        Aop = A.t() if transa == CUBLAS_OP_T else A
+        Bop = B.t() if transb == CUBLAS_OP_T else B
+        acc = Aop.to(torch.float32) @ Bop.to(torch.float32)
+        out = alpha * acc
+        if beta != 0.0:
+            out = out + beta * C.to(torch.float32)
+        C.copy_(out.to(torch.bfloat16))
+        return
+
     if HAS_CUBLAS:
         handle = cp.cuda.device.get_cublas_handle()
         cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
@@ -217,8 +244,8 @@ def cublas_bfgemm_reference(
             C_fp32.data_ptr(),
             CUDA_R_32F,
             ldc,
-            CUDA_R_32F,
-            0,
+            GEMM_COMPUTE_TYPE,
+            GEMM_ALGO,
         )
         C.copy_(C_fp32.to(torch.bfloat16))
         return

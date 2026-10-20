@@ -137,7 +137,7 @@ class Benchmark:
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
         self.dtypes = dtypes if dtypes is not None else self.DEFAULT_DTYPES
-        self.metrics = self.DEFAULT_METRICS
+        self.metrics = list(self.DEFAULT_METRICS)
         self.shapes = self.DEFAULT_SHAPES
         self.shape_desc = self.DEFAULT_SHAPE_DESC
         self.shape_file = self.DEFAULT_SHAPE_FILES
@@ -169,7 +169,7 @@ class Benchmark:
                     f"Unsatisfied metric dependencies: {', '.join(unsatisfied_metrics)}"
                 )
 
-        self.to_bench_metrics = user_desired_metrics or self.metrics
+        self.to_bench_metrics = list(user_desired_metrics or self.metrics)
         if (
             hasattr(self, "set_more_metrics")
             and callable(getattr(self, "set_more_metrics"))
@@ -237,9 +237,13 @@ class Benchmark:
                 and Config.bench_level == BenchLevel.CORE
                 and not Config.query
                 and os.path.realpath(shape_file_path)
-                == os.path.realpath(os.path.join(os.path.dirname(__file__), "core_shapes.yaml"))
+                == os.path.realpath(
+                    os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
+                )
             ):
-                overlay_path = os.path.join(os.path.dirname(__file__), "core_shapes_ascend_l2.yaml")
+                overlay_path = os.path.join(
+                    os.path.dirname(__file__), "core_shapes_ascend_l2.yaml"
+                )
                 with open(overlay_path, "r") as overlay_file:
                     overlay = yaml.safe_load(overlay_file) or {}
                 keys = [self.op_name]
@@ -374,7 +378,10 @@ class Benchmark:
                 **bench_kwargs,
             )
             if vendor_name == "ascend" and self.op_name.split("_", 1)[0] in {
-                "sgemv", "cgemv", "hgemv", "bfgemv"
+                "sgemv",
+                "cgemv",
+                "hgemv",
+                "bfgemv",
             }:
                 # Triton estimates the repeat count before warming the device.
                 # Cold startup can leave a GEMV shape with only 1-3 samples.

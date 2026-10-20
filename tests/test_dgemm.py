@@ -33,16 +33,23 @@ pytestmark = pytest.mark.skipif(
 
 # cuPy/cuBLAS are only available on CUDA-capable vendors; on other backends the
 # reference falls back to muBLAS (mthreads), a ctypes-loaded cuBLAS-compatible
-# library (iluvatar), or a torch.matmul-based implementation.
-try:
-    import cupy as cp
-    from cupy_backends.cuda.libs import cublas
+# library (iluvatar), or a torch.matmul-based implementation.  Hygon goes
+# through hipBLAS (tests/hipblas_reference.py).
+IS_HYGON = flag_blas.vendor_name == "hygon"
 
-    HAS_CUBLAS = True
-except ImportError:
-    cp = None
-    cublas = None
-    HAS_CUBLAS = False
+cp = None
+cublas = None
+HAS_CUBLAS = False
+if IS_HYGON:
+    from .hipblas_reference import get_hipblas_context, hipblas_dgemm
+else:
+    try:
+        import cupy as cp
+        from cupy_backends.cuda.libs import cublas
+
+        HAS_CUBLAS = True
+    except ImportError:
+        pass
 
 _CUBLAS_VENDORS = ("nvidia", "iluvatar")
 
@@ -141,6 +148,13 @@ def cublas_dgemm_reference(
     transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
 ):
     if m == 0 or n == 0:
+        return
+
+    if IS_HYGON:
+        _, handle = get_hipblas_context(C)
+        hipblas_dgemm(
+            handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+        )
         return
 
     alpha_np = np.asarray(alpha, dtype=np.float64)

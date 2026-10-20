@@ -21,12 +21,17 @@ import torch
 import flag_blas
 from benchmark.conftest import Config
 from benchmark.gemm_perf_common import (
+    IS_HYGON,
     GemmBenchmark,
+    _HIPBLAS_OP_MAP,
     native_blas_available,
     native_gemm,
     torch_gemm_reference,
 )
 from flag_blas.ops import CUBLAS_OP_N, CUBLAS_OP_T
+
+if IS_HYGON:
+    from benchmark.gemm_perf_common import _load_hipblas
 
 
 def cgemm_reference(
@@ -55,6 +60,29 @@ def cgemm_reference(
 ):
     """fp32-complex GEMM reference: official BLAS of the running vendor when
     available (cuBLAS / muBLAS), otherwise a torch.matmul-based fallback."""
+    if IS_HYGON:
+        # No cupy on the DTK side; use ctypes hipblasCgemm (alpha/beta are
+        # hipblasComplex host scalars, packed into alpha_ptr/beta_ptr by
+        # gemm_perf_common.get_input_iter).
+        library = _load_hipblas()
+        library.hipblasCgemm(
+            handle,
+            _HIPBLAS_OP_MAP[transa],
+            _HIPBLAS_OP_MAP[transb],
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col.data_ptr(),
+            lda_cublas,
+            B_col.data_ptr(),
+            ldb_cublas,
+            beta_ptr,
+            C_col.data_ptr(),
+            ldc_cublas,
+        )
+        return C_col
+
     if native_blas_available():
         native_gemm(
             handle,
@@ -155,20 +183,36 @@ def _run_cgemm_benchmark(op_name, transa, transb):
 
 
 @pytest.mark.cgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasCgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_cgemm_nn():
     _run_cgemm_benchmark("cgemm", CUBLAS_OP_N, CUBLAS_OP_N)
 
 
 @pytest.mark.cgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasCgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_cgemm_tn():
     _run_cgemm_benchmark("cgemm_tn", CUBLAS_OP_T, CUBLAS_OP_N)
 
 
 @pytest.mark.cgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasCgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_cgemm_nt():
     _run_cgemm_benchmark("cgemm_nt", CUBLAS_OP_N, CUBLAS_OP_T)
 
 
 @pytest.mark.cgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasCgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_cgemm_tt():
     _run_cgemm_benchmark("cgemm_tt", CUBLAS_OP_T, CUBLAS_OP_T)

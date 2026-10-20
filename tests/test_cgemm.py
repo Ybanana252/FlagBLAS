@@ -28,20 +28,29 @@ from .conftest import TO_CPU
 
 # cuPy/cuBLAS are only available on CUDA-capable vendors; on other backends the
 # reference falls back to muBLAS (mthreads), a ctypes-loaded cuBLAS-compatible
-# library (iluvatar), or a torch.matmul-based implementation.
-try:
-    import cupy as cp
-    from cupy_backends.cuda.libs import cublas
+# library (iluvatar), or a torch.matmul-based implementation.  Hygon goes
+# through hipBLAS (tests/hipblas_reference.py).
+IS_HYGON = flag_blas.vendor_name == "hygon"
 
-    HAS_CUBLAS = True
-except ImportError:
-    cp = None
-    cublas = None
-    HAS_CUBLAS = False
+cp = None
+cublas = None
+HAS_CUBLAS = False
+if IS_HYGON:
+    from .hipblas_reference import get_hipblas_context, hipblas_cgemm
+else:
+    try:
+        import cupy as cp
+        from cupy_backends.cuda.libs import cublas
+
+        HAS_CUBLAS = True
+    except ImportError:
+        pass
 
 _CUBLAS_VENDORS = ("nvidia", "iluvatar")
 
-CGEMM_SHAPES = [(32, 32, 32), (64, 64, 64), (127, 65, 33)]
+# Append 512^3: brings the "transpose composite" path of the hygon-specific
+# implementation (2*m*n*k >= 4<<24 and min(m,n) >= 64) into accuracy test coverage.
+CGEMM_SHAPES = [(32, 32, 32), (64, 64, 64), (127, 65, 33), (512, 512, 512)]
 
 
 def _load_lib(names, search_dir=None):
@@ -143,6 +152,15 @@ def cgemm_reference(
 
     alpha_np = np.asarray([alpha], dtype=np.complex64)
     beta_np = np.asarray([beta], dtype=np.complex64)
+
+    if IS_HYGON:
+        # No cupy on the DTK side; use ctypes hipblasCgemm (complex fp32, the
+        # same convention as FlagBLAS's fp32 accumulation).
+        _, handle = get_hipblas_context(C)
+        hipblas_cgemm(
+            handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+        )
+        return
 
     if HAS_CUBLAS:
         handle = cp.cuda.device.get_cublas_handle()

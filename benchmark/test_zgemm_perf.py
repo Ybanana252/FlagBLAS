@@ -21,7 +21,9 @@ import torch
 import flag_blas
 from benchmark.conftest import Config
 from benchmark.gemm_perf_common import (
+    IS_HYGON,
     GemmBenchmark,
+    _HIPBLAS_OP_MAP,
     native_blas_available,
     native_gemm,
     torch_gemm_reference,
@@ -32,6 +34,9 @@ pytestmark = pytest.mark.skipif(
     flag_blas.vendor_name == "iluvatar",
     reason="zgemm is not supported on Iluvatar",
 )
+
+if IS_HYGON:
+    from benchmark.gemm_perf_common import _load_hipblas
 
 
 def zgemm_reference(
@@ -60,6 +65,29 @@ def zgemm_reference(
 ):
     """fp64-complex GEMM reference: official BLAS of the running vendor when
     available (cuBLAS / muBLAS), otherwise a torch.matmul-based fallback."""
+    if IS_HYGON:
+        # No cupy on the DTK side; use ctypes hipblasZgemm (alpha/beta are
+        # hipblasDoubleComplex host scalars, packed into alpha_ptr/beta_ptr by
+        # gemm_perf_common.get_input_iter).
+        library = _load_hipblas()
+        library.hipblasZgemm(
+            handle,
+            _HIPBLAS_OP_MAP[transa],
+            _HIPBLAS_OP_MAP[transb],
+            m,
+            n,
+            k,
+            alpha_ptr,
+            A_col.data_ptr(),
+            lda_cublas,
+            B_col.data_ptr(),
+            ldb_cublas,
+            beta_ptr,
+            C_col.data_ptr(),
+            ldc_cublas,
+        )
+        return C_col
+
     if native_blas_available():
         native_gemm(
             handle,
@@ -160,20 +188,36 @@ def _run_zgemm_benchmark(op_name, transa, transb):
 
 
 @pytest.mark.zgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasZgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_zgemm_nn():
     _run_zgemm_benchmark("zgemm", CUBLAS_OP_N, CUBLAS_OP_N)
 
 
 @pytest.mark.zgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasZgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_zgemm_tn():
     _run_zgemm_benchmark("zgemm_tn", CUBLAS_OP_T, CUBLAS_OP_N)
 
 
 @pytest.mark.zgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasZgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_zgemm_nt():
     _run_zgemm_benchmark("zgemm_nt", CUBLAS_OP_N, CUBLAS_OP_T)
 
 
 @pytest.mark.zgemm
+@pytest.mark.skipif(
+    flag_blas.vendor_name == "thead",
+    reason="cublasZgemm not supported on T-Head (Zhenwu) platform",
+)
 def test_perf_zgemm_tt():
     _run_zgemm_benchmark("zgemm_tt", CUBLAS_OP_T, CUBLAS_OP_T)

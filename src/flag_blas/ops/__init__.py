@@ -16,7 +16,6 @@
 BLAS Level 1, Level 2, and Level 3 operations
 """
 
-from flag_blas.ops.level1.abs import cabs, dabs, sabs, zabs
 from flag_blas.ops.level1.amax import camax, damax, samax, zamax
 from flag_blas.ops.level1.amin import camin, damin, samin, zamin
 from flag_blas.ops.level1.asum import dasum, dzasum, sasum, scasum
@@ -247,11 +246,6 @@ __all__ = [
     "dtrmm",
     "ctrmm",
     "ztrmm",
-    # abs
-    "sabs",
-    "dabs",
-    "cabs",
-    "zabs",
     # copy
     "scopy",
     "dcopy",

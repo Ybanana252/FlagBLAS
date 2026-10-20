@@ -28,7 +28,10 @@ from .conftest import TO_CPU
 
 # cuPy/cuBLAS are only available on CUDA-capable vendors; on other backends the
 # reference uses the vendor's native BLAS through ctypes (muBLAS on MThreads)
-# or falls back to a torch.matmul-based implementation.
+# or falls back to a torch.matmul-based implementation.  Hygon uses a
+# device-side fp32 matmul oracle (see cublas_hgemm_reference).
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
 try:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
@@ -38,12 +41,22 @@ except ImportError:
     cp = None
     cublas = None
     HAS_CUBLAS = False
-
 CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUDA_R_16BF = 14
 
 _CUBLAS_VENDORS = ("nvidia", "iluvatar")
+
+# T-Head (Zhenwu) cuBLAS rejects a legacy cudaDataType passed where
+# cublasGemmEx expects a cublasComputeType_t (CUBLAS_STATUS_NOT_SUPPORTED).
+# Use the proper cublasComputeType_t / cublasGemmAlgo_t enums there; other
+# vendors keep the original arguments.
+if flag_blas.vendor_name == "thead":
+    GEMM_COMPUTE_TYPE = cublas.CUBLAS_COMPUTE_32F
+    GEMM_ALGO = cublas.CUBLAS_GEMM_DEFAULT
+else:
+    GEMM_COMPUTE_TYPE = CUDA_R_32F
+    GEMM_ALGO = 0
 
 
 def _load_lib(names, search_dir=None):
@@ -154,10 +167,24 @@ def _clear_musa_sticky_error():
         _musart_last_error_fn.musaGetLastError()
 
 
+
 def cublas_hgemm_reference(
     transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
 ):
     if m == 0 or n == 0:
+        return
+
+    if IS_HYGON:
+        # No usable fp16 gemmEx on the DTK side: hipblasGemmEx/Ex_v2 return
+        # NOT_SUPPORTED/INVALID for fp16, and the only entry point, legacy
+        # hipblasHgemm, uses low-precision accumulation, so it cannot serve as
+        # a reference for the fp32 accumulation contract. Use device-side fp32
+        # matmul (fp32 accumulation) as the oracle instead, consistent with
+        # cublas.gemmEx(compute=CUDA_R_32F) on non-hygon.
+        op_a = A if transa == CUBLAS_OP_N else A.t()
+        op_b = B if transb == CUBLAS_OP_N else B.t()
+        acc = torch.matmul(op_a.to(torch.float32), op_b.to(torch.float32))
+        C.copy_(alpha * acc + beta * C.to(torch.float32))
         return
 
     if HAS_CUBLAS:
@@ -185,8 +212,8 @@ def cublas_hgemm_reference(
             C.data_ptr(),
             CUDA_R_16F,
             ldc,
-            CUDA_R_32F,
-            0,
+            GEMM_COMPUTE_TYPE,
+            GEMM_ALGO,
         )
         return
 

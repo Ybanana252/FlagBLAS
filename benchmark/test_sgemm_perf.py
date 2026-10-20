@@ -15,8 +15,14 @@
 import pytest
 import torch
 
+import flag_blas
 from benchmark.gemm_perf_common import GemmBenchmark, cublas_sgemm, gems_sgemm_wrapper
 from flag_blas.ops import CUBLAS_OP_N, CUBLAS_OP_T
+
+# T-Head (Zhenwu) fp32 GEMM accumulates in a different order than cuBLAS
+# and routinely differs by ~1e-3 relative; other vendors keep the tighter
+# default tolerance.
+SGEMM_TOLERANCE = 1e-4 if flag_blas.vendor_name == "thead" else 1.3e-6
 
 
 @pytest.mark.sgemm
@@ -35,7 +41,9 @@ def test_perf_sgemm_nn():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=1.3e-6)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -55,7 +63,9 @@ def test_perf_sgemm_tn():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=1.3e-6)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -75,7 +85,9 @@ def test_perf_sgemm_nt():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=1.3e-6)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()
 
 
@@ -95,5 +107,7 @@ def test_perf_sgemm_tt():
             torch_result = cublas_sgemm(A, B, C.clone(), **kwargs)
             gems_result = gems_sgemm_wrapper(A, B, C.clone(), **kwargs)
             k = kwargs.get("k", 0)
-            bench.validate_results(torch_result, gems_result, k, tolerance=1.3e-6)
+            bench.validate_results(
+                torch_result, gems_result, k, tolerance=SGEMM_TOLERANCE
+            )
     bench.run()

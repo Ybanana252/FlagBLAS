@@ -15,7 +15,6 @@
 import ctypes
 import ctypes.util
 
-import cupy as cp
 import pytest
 import torch
 from scipy.linalg import blas as cpu_blas
@@ -24,6 +23,13 @@ import flag_blas
 
 from .accuracy_utils import L1_PAIR_STRIDES, SWAP_SHAPES, blas_assert_close
 from .conftest import TO_CPU
+
+IS_HYGON = flag_blas.vendor_name == "hygon"
+
+if IS_HYGON:
+    from .hipblas_reference import check_hipblas_status, get_hipblas_context
+else:
+    import cupy as cp
 
 
 def load_cublas():
@@ -40,7 +46,7 @@ def load_cublas():
     raise RuntimeError("Cannot find libcublas.so in the system")
 
 
-_cublas = load_cublas()
+_cublas = None if IS_HYGON else load_cublas()
 
 
 def _get_cublas_func(*names):
@@ -48,6 +54,31 @@ def _get_cublas_func(*names):
         if hasattr(_cublas, name):
             return getattr(_cublas, name)
     raise RuntimeError(f"Cannot find any cuBLAS symbol from: {', '.join(names)}")
+
+
+def hipblas_swap_reference(n, x, incx, y, incy):
+    if n <= 0:
+        return
+    symbol = {
+        torch.float32: "hipblasSswap",
+        torch.float64: "hipblasDswap",
+        torch.complex64: "hipblasCswap_v2",
+        torch.complex128: "hipblasZswap_v2",
+    }[x.dtype]
+    library, handle = get_hipblas_context(x)
+    function = getattr(library, symbol)
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(handle, n, x.data_ptr(), incx, y.data_ptr(), incy), symbol
+    )
 
 
 def cublas_swap_reference(n, x, incx, y, incy):
@@ -106,7 +137,10 @@ def swap_reference(n, x, incx, y, incy):
         cpu_swap_reference(n, ref_x, incx, ref_y, incy)
         return ref_x, ref_y
 
-    cublas_swap_reference(n, x, incx, y, incy)
+    if IS_HYGON:
+        hipblas_swap_reference(n, x, incx, y, incy)
+    else:
+        cublas_swap_reference(n, x, incx, y, incy)
     return x, y
 
 
@@ -116,7 +150,13 @@ def swap_reference(n, x, incx, y, incy):
 
 
 @pytest.mark.swap
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sswap),
+        pytest.param(torch.float64, marks=pytest.mark.dswap),
+    ],
+)
 @pytest.mark.parametrize("shape", SWAP_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_PAIR_STRIDES)
 def test_accuracy_swap_real(dtype, shape, incx, incy):
@@ -132,9 +172,9 @@ def test_accuracy_swap_real(dtype, shape, incx, incy):
     ref_x, ref_y = swap_reference(n, ref_x, incx, ref_y, incy)
 
     if dtype == torch.float32:
-        flag_blas.ops.sswap(n, x, incx, y, incy)
+        flag_blas.sswap(n, x, incx, y, incy)
     else:
-        flag_blas.ops.dswap(n, x, incx, y, incy)
+        flag_blas.dswap(n, x, incx, y, incy)
 
     blas_assert_close(x, ref_x, dtype)
     blas_assert_close(y, ref_y, dtype)
@@ -146,7 +186,13 @@ def test_accuracy_swap_real(dtype, shape, incx, incy):
 
 
 @pytest.mark.swap
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cswap),
+        pytest.param(torch.complex128, marks=pytest.mark.zswap),
+    ],
+)
 @pytest.mark.parametrize("shape", SWAP_SHAPES)
 @pytest.mark.parametrize("incx,incy", L1_PAIR_STRIDES)
 def test_accuracy_swap_complex(dtype, shape, incx, incy):
@@ -162,9 +208,9 @@ def test_accuracy_swap_complex(dtype, shape, incx, incy):
     ref_x, ref_y = swap_reference(n, ref_x, incx, ref_y, incy)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cswap(n, x, incx, y, incy)
+        flag_blas.cswap(n, x, incx, y, incy)
     else:
-        flag_blas.ops.zswap(n, x, incx, y, incy)
+        flag_blas.zswap(n, x, incx, y, incy)
 
     blas_assert_close(x, ref_x, dtype)
     blas_assert_close(y, ref_y, dtype)
@@ -177,7 +223,13 @@ def test_accuracy_swap_complex(dtype, shape, incx, incy):
 
 @pytest.mark.swap
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sswap),
+        pytest.param(torch.float64, marks=pytest.mark.dswap),
+        pytest.param(torch.complex64, marks=pytest.mark.cswap),
+        pytest.param(torch.complex128, marks=pytest.mark.zswap),
+    ],
 )
 def test_accuracy_swap_empty_tensor(dtype):
     if (
@@ -191,13 +243,13 @@ def test_accuracy_swap_empty_tensor(dtype):
     n = 0
 
     if dtype == torch.float32:
-        flag_blas.ops.sswap(n, x, 1, y, 1)
+        flag_blas.sswap(n, x, 1, y, 1)
     elif dtype == torch.float64:
-        flag_blas.ops.dswap(n, x, 1, y, 1)
+        flag_blas.dswap(n, x, 1, y, 1)
     elif dtype == torch.complex64:
-        flag_blas.ops.cswap(n, x, 1, y, 1)
+        flag_blas.cswap(n, x, 1, y, 1)
     else:
-        flag_blas.ops.zswap(n, x, 1, y, 1)
+        flag_blas.zswap(n, x, 1, y, 1)
 
     assert x.shape == (0,)
     assert y.shape == (0,)
@@ -211,7 +263,13 @@ def test_accuracy_swap_empty_tensor(dtype):
 
 
 @pytest.mark.swap
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.sswap),
+        pytest.param(torch.float64, marks=pytest.mark.dswap),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -227,9 +285,9 @@ def test_accuracy_swap_different_n_real(dtype, n, vec_size):
     ref_x, ref_y = swap_reference(n, ref_x, 1, ref_y, 1)
 
     if dtype == torch.float32:
-        flag_blas.ops.sswap(n, x, 1, y, 1)
+        flag_blas.sswap(n, x, 1, y, 1)
     else:
-        flag_blas.ops.dswap(n, x, 1, y, 1)
+        flag_blas.dswap(n, x, 1, y, 1)
 
     blas_assert_close(x, ref_x, dtype)
     blas_assert_close(y, ref_y, dtype)
@@ -241,7 +299,13 @@ def test_accuracy_swap_different_n_real(dtype, n, vec_size):
 
 
 @pytest.mark.swap
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.cswap),
+        pytest.param(torch.complex128, marks=pytest.mark.zswap),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -257,9 +321,9 @@ def test_accuracy_swap_different_n_complex(dtype, n, vec_size):
     ref_x, ref_y = swap_reference(n, ref_x, 1, ref_y, 1)
 
     if dtype == torch.complex64:
-        flag_blas.ops.cswap(n, x, 1, y, 1)
+        flag_blas.cswap(n, x, 1, y, 1)
     else:
-        flag_blas.ops.zswap(n, x, 1, y, 1)
+        flag_blas.zswap(n, x, 1, y, 1)
 
     blas_assert_close(x, ref_x, dtype)
     blas_assert_close(y, ref_y, dtype)

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
+import ctypes
 import importlib
 import itertools
 import logging
 import random
+from threading import RLock
 
 import numpy as np
 import torch
@@ -23,6 +26,57 @@ import torch
 import flag_blas
 
 from .conftest import QUICK_MODE, TO_CPU, L1_n_end, L1_n_start, L1_n_step
+
+# L1 scalar references keep GPU results on a device-mode handle.
+# L2 continues to use the host-mode handle in hipblas_reference.
+_L1_HIPBLAS_HANDLES = {}
+_L1_HIPBLAS_LOCK = RLock()
+
+
+def _destroy_l1_hipblas_handles():
+    for library, handle in tuple(_L1_HIPBLAS_HANDLES.values()):
+        try:
+            library.hipblasDestroy(handle)
+        except Exception:
+            pass
+    _L1_HIPBLAS_HANDLES.clear()
+
+
+def get_l1_hipblas_context(tensor):
+    """Prepare a device-mode L1 reference handle outside performance timing."""
+    from .hipblas_reference import check_hipblas_status, get_hipblas_library
+
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    library = get_hipblas_library()
+    with _L1_HIPBLAS_LOCK:
+        context = _L1_HIPBLAS_HANDLES.get(device_index)
+        if context is None:
+            with torch.cuda.device(device_index):
+                handle = ctypes.c_void_p()
+                check_hipblas_status(
+                    library.hipblasCreate(ctypes.byref(handle)), "hipblasCreate"
+                )
+                try:
+                    check_hipblas_status(
+                        library.hipblasSetPointerMode(handle, 1),
+                        "hipblasSetPointerMode",
+                    )
+                except Exception:
+                    library.hipblasDestroy(handle)
+                    raise
+            if not _L1_HIPBLAS_HANDLES:
+                atexit.register(_destroy_l1_hipblas_handles)
+            context = library, handle
+            _L1_HIPBLAS_HANDLES[device_index] = context
+    library, handle = context
+    stream = torch.cuda.current_stream(tensor.device).cuda_stream
+    check_hipblas_status(
+        library.hipblasSetStream(handle, ctypes.c_void_p(stream)), "hipblasSetStream"
+    )
+    return library, handle
+
 
 GEN_SHAPE = False
 
@@ -50,7 +104,10 @@ def gen_shape_N(n_start, n_end, n_inc):
 
 
 L1_BASE_SHAPES = [
+    (64,),
     (1024,),
+    (2048,),
+    (4096,),
     (5333,),
     (65536,),
     (100000,),
@@ -119,7 +176,8 @@ NRM2_SHAPES = L1_VECTOR_SHAPES
 ROT_SHAPES = L1_VECTOR_SHAPES
 SCAL_SHAPES = L1_VECTOR_SHAPES
 
-AMIN_SHAPES = L1_VECTOR_SHAPES
+# The portable SciPy AMIN reference evaluates candidates individually.
+AMIN_SHAPES = [shape for shape in L1_VECTOR_SHAPES if shape[0] <= 8192]
 DOTC_SHAPES = L1_VECTOR_SHAPES
 DOTU_SHAPES = L1_VECTOR_SHAPES
 SWAP_SHAPES = L1_VECTOR_SHAPES

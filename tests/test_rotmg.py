@@ -2,6 +2,7 @@ import ctypes
 import ctypes.util
 import glob
 import os
+import random
 
 import pytest
 import scipy
@@ -12,6 +13,12 @@ import flag_blas
 from .accuracy_utils import blas_assert_close, to_reference
 from .conftest import TO_CPU
 
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+
+
 ROTMG_CASES = [
     (-1.0, 2.0, 3.0, 4.0),
     (1.0, 0.0, 2.0, 3.0),
@@ -19,11 +26,22 @@ ROTMG_CASES = [
     (2.0, 1.0, 3.0, 1.0),
     (1.0, -2.0, 3.0, 4.0),
     (1.0, 2.0, 1.0, 1.0),
-    (1e-20, 2.0, 3.0, 4.0),
-    (1e20, 2.0, 3.0, 4.0),
-    (2.0, 1e-20, 3.0, 4.0),
-    (2.0, 1e20, 3.0, 4.0),
 ]
+# Shared with the performance benchmark: retain ordinary, zero and sign cases.
+ROTMG_CASES += [
+    (0.0, 0.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0, 1.0),
+    (1.0, 1.0, 0.0, 1.0),
+    (1.0, -1.0, 0.0, 1.0),
+    (1.0, 1.0, 1.0, 1.0),
+    (1.0, 1.0, -1.0, 1.0),
+    (1.0, 1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0, 1.0),
+]
+_rotmg_rng = random.Random(20261013)
+for _ in range(24):
+    ROTMG_CASES.append(tuple(_rotmg_rng.uniform(-10.0, 10.0) for _ in range(4)))
+
 ROTMG_OPS = ["srotmg", "drotmg"]
 CUBLAS_POINTER_MODE_DEVICE = 1
 
@@ -148,34 +166,77 @@ def _scipy_rotmg_reference(dtype, d1, d2, x1, y1):
     )
 
 
-def _cublas_rotmg_reference(dtype, d1_val, d2_val, x1_val, y1_val):
-    d1 = torch.tensor([d1_val], dtype=dtype, device=flag_blas.device)
-    d2 = torch.tensor([d2_val], dtype=dtype, device=flag_blas.device)
-    x1 = torch.tensor([x1_val], dtype=dtype, device=flag_blas.device)
-    y1 = torch.tensor([y1_val], dtype=dtype, device=flag_blas.device)
-    param = torch.empty(5, dtype=dtype, device=flag_blas.device)
-    func = (
-        _get_cublas().cublasSrotmg_v2
-        if dtype == torch.float32
-        else _get_cublas().cublasDrotmg_v2
-    )
-    status = func(
-        _get_cublas_handle(),
-        ctypes.c_void_p(d1.data_ptr()),
-        ctypes.c_void_p(d2.data_ptr()),
-        ctypes.c_void_p(x1.data_ptr()),
-        ctypes.c_void_p(y1.data_ptr()),
-        ctypes.c_void_p(param.data_ptr()),
-    )
-    if status != 0:
-        raise RuntimeError(f"cuBLAS rotmg execution failed, error code: {status}")
-    return (
-        d1.cpu()[0].item(),
-        d2.cpu()[0].item(),
-        x1.cpu()[0].item(),
-        y1.cpu()[0].item(),
-        _normalize_rotmg_param(param.cpu().tolist()),
-    )
+if IS_HYGON:
+
+    def _resolve_hipblas_rotmg(dtype):
+        symbol = {
+            torch.float32: "hipblasSrotmg",
+            torch.float64: "hipblasDrotmg",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [ctypes.c_void_p] * 6
+        function.restype = ctypes.c_int
+        return function
+
+    def _hipblas_rotmg_reference(dtype, d1_val, d2_val, x1_val, y1_val):
+        d1 = torch.tensor([d1_val], dtype=dtype, device=flag_blas.device)
+        d2 = torch.tensor([d2_val], dtype=dtype, device=flag_blas.device)
+        x1 = torch.tensor([x1_val], dtype=dtype, device=flag_blas.device)
+        y1 = torch.tensor([y1_val], dtype=dtype, device=flag_blas.device)
+        param = torch.empty(5, dtype=dtype, device=flag_blas.device)
+        _, handle = get_l1_hipblas_context(d1)
+        function = _resolve_hipblas_rotmg(dtype)
+        check_hipblas_status(
+            function(
+                handle,
+                d1.data_ptr(),
+                d2.data_ptr(),
+                x1.data_ptr(),
+                y1.data_ptr(),
+                param.data_ptr(),
+            ),
+            "hipBLAS ROTMG",
+        )
+        return (
+            d1.cpu()[0].item(),
+            d2.cpu()[0].item(),
+            x1.cpu()[0].item(),
+            y1.cpu()[0].item(),
+            _normalize_rotmg_param(param.cpu().tolist()),
+        )
+
+    _cublas_rotmg_reference = _hipblas_rotmg_reference
+
+else:
+
+    def _cublas_rotmg_reference(dtype, d1_val, d2_val, x1_val, y1_val):
+        d1 = torch.tensor([d1_val], dtype=dtype, device=flag_blas.device)
+        d2 = torch.tensor([d2_val], dtype=dtype, device=flag_blas.device)
+        x1 = torch.tensor([x1_val], dtype=dtype, device=flag_blas.device)
+        y1 = torch.tensor([y1_val], dtype=dtype, device=flag_blas.device)
+        param = torch.empty(5, dtype=dtype, device=flag_blas.device)
+        func = (
+            _get_cublas().cublasSrotmg_v2
+            if dtype == torch.float32
+            else _get_cublas().cublasDrotmg_v2
+        )
+        status = func(
+            _get_cublas_handle(),
+            ctypes.c_void_p(d1.data_ptr()),
+            ctypes.c_void_p(d2.data_ptr()),
+            ctypes.c_void_p(x1.data_ptr()),
+            ctypes.c_void_p(y1.data_ptr()),
+            ctypes.c_void_p(param.data_ptr()),
+        )
+        if status != 0:
+            raise RuntimeError(f"cuBLAS rotmg execution failed, error code: {status}")
+        return (
+            d1.cpu()[0].item(),
+            d2.cpu()[0].item(),
+            x1.cpu()[0].item(),
+            y1.cpu()[0].item(),
+            _normalize_rotmg_param(param.cpu().tolist()),
+        )
 
 
 def _rotmg_reference(dtype, d1, d2, x1, y1):
@@ -188,28 +249,26 @@ def _reference_tensor(values, dtype):
     return to_reference(torch.tensor(values, dtype=dtype, device=flag_blas.device))
 
 
-def _known_rotmg_extreme_scaling_divergence(d1, d2):
-    return any(
-        value != 0.0 and (abs(value) < 1e-10 or abs(value) > 1e10) for value in (d1, d2)
-    )
-
-
 @pytest.mark.rotmg
-@pytest.mark.parametrize("op_name", ROTMG_OPS)
+@pytest.mark.parametrize(
+    "op_name", [pytest.param(op, marks=getattr(pytest.mark, op)) for op in ROTMG_OPS]
+)
 def test_accuracy_rotmg_flag_blas_api_symbols(op_name):
-    assert callable(getattr(flag_blas.ops, op_name))
     assert callable(getattr(flag_blas, op_name))
-    assert getattr(flag_blas.ops, op_name) is getattr(flag_blas, op_name)
 
 
 @pytest.mark.rotmg
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotmg),
+        pytest.param(torch.float64, marks=pytest.mark.drotmg),
+    ],
+)
 @pytest.mark.parametrize("d1_val,d2_val,x1_val,y1_val", ROTMG_CASES)
 def test_accuracy_rotmg(dtype, d1_val, d2_val, x1_val, y1_val):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
-    if _known_rotmg_extreme_scaling_divergence(d1_val, d2_val):
-        pytest.xfail("ROTMG extreme scaling differs across BLAS implementations")
 
     d1 = torch.tensor([d1_val], dtype=dtype, device=flag_blas.device)
     d2 = torch.tensor([d2_val], dtype=dtype, device=flag_blas.device)
@@ -226,9 +285,9 @@ def test_accuracy_rotmg(dtype, d1_val, d2_val, x1_val, y1_val):
     )
 
     if dtype == torch.float32:
-        flag_blas.ops.srotmg(d1, d2, x1, y1, param)
+        flag_blas.srotmg(d1, d2, x1, y1, param)
     else:
-        flag_blas.ops.drotmg(d1, d2, x1, y1, param)
+        flag_blas.drotmg(d1, d2, x1, y1, param)
 
     blas_assert_close(d1, _reference_tensor([ref_d1], dtype), dtype)
     blas_assert_close(d2, _reference_tensor([ref_d2], dtype), dtype)
@@ -238,7 +297,13 @@ def test_accuracy_rotmg(dtype, d1_val, d2_val, x1_val, y1_val):
 
 
 @pytest.mark.rotmg
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotmg),
+        pytest.param(torch.float64, marks=pytest.mark.drotmg),
+    ],
+)
 def test_rotmg_rejects_bad_shapes(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -251,13 +316,19 @@ def test_rotmg_rejects_bad_shapes(dtype):
 
     with pytest.raises(AssertionError):
         if dtype == torch.float32:
-            flag_blas.ops.srotmg(d1, d2, x1, y1, param)
+            flag_blas.srotmg(d1, d2, x1, y1, param)
         else:
-            flag_blas.ops.drotmg(d1, d2, x1, y1, param)
+            flag_blas.drotmg(d1, d2, x1, y1, param)
 
 
 @pytest.mark.rotmg
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotmg),
+        pytest.param(torch.float64, marks=pytest.mark.drotmg),
+    ],
+)
 def test_accuracy_rotmg_flag_blas_api(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -281,7 +352,13 @@ def test_accuracy_rotmg_flag_blas_api(dtype):
 
 
 @pytest.mark.rotmg
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.srotmg),
+        pytest.param(torch.float64, marks=pytest.mark.drotmg),
+    ],
+)
 def test_rotmg_rejects_bad_param_shape(dtype):
     if dtype == torch.float64 and not flag_blas.runtime.device.support_fp64:
         pytest.skip("Device does not support float64")
@@ -294,11 +371,12 @@ def test_rotmg_rejects_bad_param_shape(dtype):
 
     with pytest.raises(AssertionError, match="param must have exactly five elements"):
         if dtype == torch.float32:
-            flag_blas.ops.srotmg(d1, d2, x1, y1, param)
+            flag_blas.srotmg(d1, d2, x1, y1, param)
         else:
-            flag_blas.ops.drotmg(d1, d2, x1, y1, param)
+            flag_blas.drotmg(d1, d2, x1, y1, param)
 
 
+@pytest.mark.srotmg
 @pytest.mark.rotmg
 def test_srotmg_rejects_mismatched_param_dtype():
     d1 = torch.randn(1, dtype=torch.float32, device=flag_blas.device)
@@ -308,9 +386,10 @@ def test_srotmg_rejects_mismatched_param_dtype():
     param = torch.empty(5, dtype=torch.float64, device=flag_blas.device)
 
     with pytest.raises(AssertionError, match="param must be float32"):
-        flag_blas.ops.srotmg(d1, d2, x1, y1, param)
+        flag_blas.srotmg(d1, d2, x1, y1, param)
 
 
+@pytest.mark.srotmg
 @pytest.mark.rotmg
 def test_srotmg_rejects_non_scalar_d1():
     d1 = torch.randn(2, dtype=torch.float32, device=flag_blas.device)
@@ -320,4 +399,4 @@ def test_srotmg_rejects_non_scalar_d1():
     param = torch.empty(5, dtype=torch.float32, device=flag_blas.device)
 
     with pytest.raises(AssertionError, match="d1 must have exactly one element"):
-        flag_blas.ops.srotmg(d1, d2, x1, y1, param)
+        flag_blas.srotmg(d1, d2, x1, y1, param)

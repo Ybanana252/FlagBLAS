@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cupy as cp
 import pytest
 import torch
-from cupy_backends.cuda.libs import cublas
 from scipy.linalg import blas as cpu_blas
 
 import flag_blas
@@ -29,34 +27,15 @@ from .accuracy_utils import (
 )
 from .conftest import TO_CPU
 
-CPU_SCIPY_AMIN_MAX_N = 8192
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    import ctypes
 
-
-def cublas_amin_reference(n, x, incx, result):
-    assert x.dim() == 1, "x must be 1-dimensional"
-    assert result.numel() == 1, "result must be a single-element tensor"
-    assert result.dtype == torch.int32, "result must be torch.int32"
-
-    if n == 0:
-        result.zero_()
-        return
-
-    dtype = x.dtype
-    if dtype == torch.float32:
-        func = cublas.isamin
-    elif dtype == torch.float64:
-        func = cublas.idamin
-    elif dtype == torch.complex64:
-        func = cublas.icamin
-    elif dtype == torch.complex128:
-        func = cublas.izamin
-    else:
-        raise ValueError(f"Unsupported dtype for cuBLAS: {dtype}")
-
-    handle = cp.cuda.device.get_cublas_handle()
-    cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
-
-    func(handle, n, x.data_ptr(), incx, result.data_ptr())
+    from tests.accuracy_utils import get_l1_hipblas_context
+    from tests.hipblas_reference import check_hipblas_status, get_hipblas_library
+else:
+    import cupy as cp
+    from cupy_backends.cuda.libs import cublas
 
 
 def cpu_amin_reference(n, x, incx, result):
@@ -102,33 +81,106 @@ def amin_reference(n, x, incx, result):
 
 def call_amin(op_name, n, x, incx, result):
     if op_name == "samin":
-        flag_blas.ops.samin(n, x, incx, result)
+        flag_blas.samin(n, x, incx, result)
     elif op_name == "damin":
-        flag_blas.ops.damin(n, x, incx, result)
+        flag_blas.damin(n, x, incx, result)
     elif op_name == "camin":
-        flag_blas.ops.camin(n, x, incx, result)
+        flag_blas.camin(n, x, incx, result)
     elif op_name == "zamin":
-        flag_blas.ops.zamin(n, x, incx, result)
+        flag_blas.zamin(n, x, incx, result)
     else:
         raise ValueError(f"Unsupported amin op: {op_name}")
 
 
-def skip_large_cpu_scipy_amin(n):
-    if TO_CPU and n > CPU_SCIPY_AMIN_MAX_N:
-        pytest.skip(
-            "SciPy does not expose iamin; CPU reference calls SciPy BLAS per "
-            f"candidate and is limited to n <= {CPU_SCIPY_AMIN_MAX_N}"
+if IS_HYGON:
+
+    def _resolve_hipblas_amin(dtype):
+        symbol = {
+            torch.float32: "hipblasIsamin",
+            torch.float64: "hipblasIdamin",
+            torch.complex64: "hipblasIcamin_v2",
+            torch.complex128: "hipblasIzamin_v2",
+        }[dtype]
+        function = getattr(get_hipblas_library(), symbol)
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    def hipblas_amin_reference(n, x, incx, result):
+        assert x.dim() == 1, "x must be 1-dimensional"
+        assert result.numel() == 1, "result must be a single-element tensor"
+        assert result.dtype == torch.int32, "result must be torch.int32"
+        if n <= 0:
+            result.zero_()
+            return
+        _, handle = get_l1_hipblas_context(x)
+        function = _resolve_hipblas_amin(x.dtype)
+        check_hipblas_status(
+            function(handle, n, x.data_ptr(), incx, result.data_ptr()), "hipBLAS AMIN"
         )
+
+    cublas_amin_reference = hipblas_amin_reference
+
+
+else:
+
+    def cublas_amin_reference(n, x, incx, result):
+        assert x.dim() == 1, "x must be 1-dimensional"
+        assert result.numel() == 1, "result must be a single-element tensor"
+        assert result.dtype == torch.int32, "result must be torch.int32"
+
+        if n == 0:
+            result.zero_()
+            return
+
+        dtype = x.dtype
+        if dtype == torch.float32:
+            func = cublas.isamin
+        elif dtype == torch.float64:
+            func = cublas.idamin
+        elif dtype == torch.complex64:
+            func = cublas.icamin
+        elif dtype == torch.complex128:
+            func = cublas.izamin
+        else:
+            raise ValueError(f"Unsupported dtype for cuBLAS: {dtype}")
+
+        handle = cp.cuda.device.get_cublas_handle()
+        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_DEVICE)
+
+        func(handle, n, x.data_ptr(), incx, result.data_ptr())
 
 
 @pytest.mark.amin
 @pytest.mark.parametrize(
     "dtype,values,expected,func_name",
     [
-        (torch.float32, [3.0, -1.0, 2.0], 2, "dasum"),
-        (torch.float64, [3.0, -1.0, 2.0], 2, "dasum"),
-        (torch.complex64, [3.0 + 4.0j, 1.0 - 1.0j, 2.0 + 0.0j], 2, "dzasum"),
-        (torch.complex128, [3.0 + 4.0j, 1.0 - 1.0j, 2.0 + 0.0j], 2, "dzasum"),
+        pytest.param(
+            torch.float32, [3.0, -1.0, 2.0], 2, "dasum", marks=pytest.mark.samin
+        ),
+        pytest.param(
+            torch.float64, [3.0, -1.0, 2.0], 2, "dasum", marks=pytest.mark.damin
+        ),
+        pytest.param(
+            torch.complex64,
+            [3.0 + 4.0j, 1.0 - 1.0j, 2.0 + 0.0j],
+            2,
+            "dzasum",
+            marks=pytest.mark.camin,
+        ),
+        pytest.param(
+            torch.complex128,
+            [3.0 + 4.0j, 1.0 - 1.0j, 2.0 + 0.0j],
+            2,
+            "dzasum",
+            marks=pytest.mark.zamin,
+        ),
     ],
 )
 def test_cpu_amin_reference_uses_scipy_blas(
@@ -157,7 +209,13 @@ def test_cpu_amin_reference_uses_scipy_blas(
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.samin),
+        pytest.param(torch.float64, marks=pytest.mark.damin),
+    ],
+)
 @pytest.mark.parametrize("shape", AMIN_SHAPES)
 @pytest.mark.parametrize("incx", L1_STRIDES)
 def test_accuracy_amin_real(dtype, shape, incx):
@@ -165,7 +223,6 @@ def test_accuracy_amin_real(dtype, shape, incx):
         pytest.skip("Device does not support float64")
 
     n = shape[0]
-    skip_large_cpu_scipy_amin(n)
     x = torch.randn(n * incx, dtype=dtype, device=flag_blas.device)
 
     ref_result = torch.zeros(1, dtype=torch.int32, device=flag_blas.device)
@@ -174,15 +231,21 @@ def test_accuracy_amin_real(dtype, shape, incx):
     ref_result = amin_reference(n, x, incx, ref_result)
 
     if dtype == torch.float32:
-        flag_blas.ops.samin(n, x, incx, result)
+        flag_blas.samin(n, x, incx, result)
     else:
-        flag_blas.ops.damin(n, x, incx, result)
+        flag_blas.damin(n, x, incx, result)
 
     blas_assert_equal(result, ref_result)
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.camin),
+        pytest.param(torch.complex128, marks=pytest.mark.zamin),
+    ],
+)
 @pytest.mark.parametrize("shape", AMIN_SHAPES)
 @pytest.mark.parametrize("incx", L1_STRIDES)
 def test_accuracy_amin_complex(dtype, shape, incx):
@@ -190,7 +253,6 @@ def test_accuracy_amin_complex(dtype, shape, incx):
         pytest.skip("Device does not support float64")
 
     n = shape[0]
-    skip_large_cpu_scipy_amin(n)
     x = torch.randn(n * incx, dtype=dtype, device=flag_blas.device)
 
     ref_result = torch.zeros(1, dtype=torch.int32, device=flag_blas.device)
@@ -199,16 +261,22 @@ def test_accuracy_amin_complex(dtype, shape, incx):
     ref_result = amin_reference(n, x, incx, ref_result)
 
     if dtype == torch.complex64:
-        flag_blas.ops.camin(n, x, incx, result)
+        flag_blas.camin(n, x, incx, result)
     else:
-        flag_blas.ops.zamin(n, x, incx, result)
+        flag_blas.zamin(n, x, incx, result)
 
     blas_assert_equal(result, ref_result)
 
 
 @pytest.mark.amin
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float64, torch.complex64, torch.complex128]
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.samin),
+        pytest.param(torch.float64, marks=pytest.mark.damin),
+        pytest.param(torch.complex64, marks=pytest.mark.camin),
+        pytest.param(torch.complex128, marks=pytest.mark.zamin),
+    ],
 )
 def test_accuracy_amin_empty_tensor(dtype):
     if (
@@ -222,13 +290,13 @@ def test_accuracy_amin_empty_tensor(dtype):
     n = 0
 
     if dtype == torch.float32:
-        flag_blas.ops.samin(n, x, 1, result)
+        flag_blas.samin(n, x, 1, result)
     elif dtype == torch.float64:
-        flag_blas.ops.damin(n, x, 1, result)
+        flag_blas.damin(n, x, 1, result)
     elif dtype == torch.complex64:
-        flag_blas.ops.camin(n, x, 1, result)
+        flag_blas.camin(n, x, 1, result)
     else:
-        flag_blas.ops.zamin(n, x, 1, result)
+        flag_blas.zamin(n, x, 1, result)
 
     assert result.item() == 0
     assert result.dtype == torch.int32
@@ -236,7 +304,13 @@ def test_accuracy_amin_empty_tensor(dtype):
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.samin),
+        pytest.param(torch.float64, marks=pytest.mark.damin),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -252,9 +326,9 @@ def test_accuracy_amin_different_n_real(dtype, n, vec_size):
     ref_result = amin_reference(n, x, 1, ref_result)
 
     if dtype == torch.float32:
-        flag_blas.ops.samin(n, x, 1, result)
+        flag_blas.samin(n, x, 1, result)
     else:
-        flag_blas.ops.damin(n, x, 1, result)
+        flag_blas.damin(n, x, 1, result)
 
     blas_assert_equal(result, ref_result)
     if n > 0:
@@ -262,7 +336,13 @@ def test_accuracy_amin_different_n_real(dtype, n, vec_size):
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.camin),
+        pytest.param(torch.complex128, marks=pytest.mark.zamin),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size", [(1, 10), (5, 10), (10, 10), (10, 20), (100, 1000)]
 )
@@ -278,9 +358,9 @@ def test_accuracy_amin_different_n_complex(dtype, n, vec_size):
     ref_result = amin_reference(n, x, 1, ref_result)
 
     if dtype == torch.complex64:
-        flag_blas.ops.camin(n, x, 1, result)
+        flag_blas.camin(n, x, 1, result)
     else:
-        flag_blas.ops.zamin(n, x, 1, result)
+        flag_blas.zamin(n, x, 1, result)
 
     blas_assert_equal(result, ref_result)
     if n > 0:
@@ -288,7 +368,13 @@ def test_accuracy_amin_different_n_complex(dtype, n, vec_size):
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.samin),
+        pytest.param(torch.float64, marks=pytest.mark.damin),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size,incx",
     [
@@ -309,9 +395,9 @@ def test_accuracy_amin_different_n_with_stride_real(dtype, n, vec_size, incx):
     ref_result = amin_reference(n, x, incx, ref_result)
 
     if dtype == torch.float32:
-        flag_blas.ops.samin(n, x, incx, result)
+        flag_blas.samin(n, x, incx, result)
     else:
-        flag_blas.ops.damin(n, x, incx, result)
+        flag_blas.damin(n, x, incx, result)
 
     blas_assert_equal(result, ref_result)
     if n > 0:
@@ -319,7 +405,13 @@ def test_accuracy_amin_different_n_with_stride_real(dtype, n, vec_size, incx):
 
 
 @pytest.mark.amin
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.complex64, marks=pytest.mark.camin),
+        pytest.param(torch.complex128, marks=pytest.mark.zamin),
+    ],
+)
 @pytest.mark.parametrize(
     "n,vec_size,incx",
     [
@@ -340,9 +432,9 @@ def test_accuracy_amin_different_n_with_stride_complex(dtype, n, vec_size, incx)
     ref_result = amin_reference(n, x, incx, ref_result)
 
     if dtype == torch.complex64:
-        flag_blas.ops.camin(n, x, incx, result)
+        flag_blas.camin(n, x, incx, result)
     else:
-        flag_blas.ops.zamin(n, x, incx, result)
+        flag_blas.zamin(n, x, incx, result)
 
     blas_assert_equal(result, ref_result)
     if n > 0:

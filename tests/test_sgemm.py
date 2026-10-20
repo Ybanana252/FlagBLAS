@@ -28,7 +28,16 @@ from .conftest import TO_CPU
 
 # cuPy/cuBLAS are only available on CUDA-capable vendors; on other backends the
 # reference falls back to muBLAS (mthreads), a ctypes-loaded cuBLAS-compatible
-# library (iluvatar), or a torch.matmul-based implementation.
+# library (iluvatar), or a torch.matmul-based implementation.  Hygon goes
+# through hipBLAS (tests/hipblas_reference.py).
+IS_HYGON = flag_blas.vendor_name == "hygon"
+if IS_HYGON:
+    from .hipblas_reference import (
+        check_hipblas_status,
+        get_hipblas_context,
+        to_hipblas_op,
+    )
+
 try:
     import cupy as cp
     from cupy_backends.cuda.libs import cublas
@@ -195,6 +204,68 @@ def cublas_sgemm_reference(
     C_row.copy_(alpha * torch.matmul(A_row, B_row) + beta * C_row)
 
 
+def hipblas_sgemm_reference(
+    transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+):
+    if m == 0 or n == 0:
+        return
+
+    alpha_value = ctypes.c_float(float(alpha))
+    beta_value = ctypes.c_float(float(beta))
+
+    library, handle = get_hipblas_context(A)
+    function = getattr(library, "hipblasSgemm")
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    check_hipblas_status(
+        function(
+            handle,
+            to_hipblas_op(transa),
+            to_hipblas_op(transb),
+            m,
+            n,
+            k,
+            ctypes.byref(alpha_value),
+            ctypes.c_void_p(A.data_ptr()),
+            lda,
+            ctypes.c_void_p(B.data_ptr()),
+            ldb,
+            ctypes.byref(beta_value),
+            ctypes.c_void_p(C.data_ptr()),
+            ldc,
+        ),
+        "hipblasSgemm",
+    )
+
+
+def sgemm_reference(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc):
+    if TO_CPU:
+        return
+    if flag_blas.vendor_name == "hygon":
+        hipblas_sgemm_reference(
+            transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+        )
+    else:
+        cublas_sgemm_reference(
+            transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+        )
+
+
 CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUDA_R_16BF = 14
@@ -275,7 +346,7 @@ def test_accuracy_sgemm(m, n, k, transa, transb):
             trans_a=transa,
         )
     else:
-        cublas_sgemm_reference(
+        sgemm_reference(
             transa,
             transb,
             m,
@@ -396,16 +467,27 @@ def test_sgemm_alpha_beta(alpha, beta):
     C_col = (torch.randn(n, m, dtype=dtype, device=device)).t()
     C_row = C_col.contiguous()
 
-    cublas_sgemm_reference(
-        CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, alpha, A_col, m, B_col, k, beta, C_col, m
-    )
+    if TO_CPU:
+        A_ref = A_row.to("cpu").to(torch.float64)
+        B_ref = B_row.to("cpu").to(torch.float64)
+        C_ref = C_row.to("cpu").to(torch.float64)
+        C_ref = blas.dgemm(
+            alpha,
+            A_ref.numpy(),
+            B_ref.numpy(),
+            beta,
+            c=C_ref.numpy(),
+            trans_b=CUBLAS_OP_N,
+            trans_a=CUBLAS_OP_N,
+        )
+    else:
+        sgemm_reference(
+            CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, alpha, A_col, m, B_col, k, beta, C_col, m
+        )
     flag_blas.sgemm(
         CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, alpha, A_row, k, B_row, n, beta, C_row, n
     )
     if TO_CPU:
-        utils.blas_assert_close(
-            C_row, C_col.contiguous().to("cpu"), torch.float32, reduce_dim=k
-        )
-
+        utils.blas_assert_close(C_row, torch.tensor(C_ref), torch.float32, reduce_dim=k)
     else:
         utils.blas_assert_close(C_row, C_col.contiguous(), torch.float32, reduce_dim=k)
