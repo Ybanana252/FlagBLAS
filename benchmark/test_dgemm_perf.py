@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+import flag_blas
 from benchmark.conftest import Config
 from benchmark.gemm_perf_common import (
     GemmBenchmark,
