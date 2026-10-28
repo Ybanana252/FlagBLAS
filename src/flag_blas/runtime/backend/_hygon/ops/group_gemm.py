@@ -31,7 +31,7 @@ __all__ = [
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("group_bfgemm"),
-    key=["M", "N", "K", "group_size"],
+    key=["M", "N", "K", "group_size", "stride_bk"],
 )
 @triton.jit
 def grouped_bfgemm_kernel(
@@ -294,8 +294,10 @@ def group_bfgemm(group_A, group_B, group_list, group_out):
     assert BK == K
     assert group_list.numel() == group_size
     assert group_out.shape == (M, N)
-    assert group_A.stride(1) == 1 and group_B.stride(2) == 1
-    assert group_out.stride(1) == 1
+    assert group_A.stride(1) == 1 and group_out.stride(1) == 1
+    assert (group_B.stride(1) == N and group_B.stride(2) == 1) or (
+        group_B.stride(1) == 1 and group_B.stride(2) == K
+    )
     if group_size == 0 or M == 0 or N == 0:
         return group_out
     grid = lambda meta: (

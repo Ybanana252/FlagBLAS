@@ -588,6 +588,11 @@ class HygonGroupGemmBenchmark(GroupGemmBenchmark):
                 "out_torch": out_torch,
                 "group_list": group_list,
                 "out_flag": out_flag,
+                "m_list": m_list,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
                 "alpha": self.alpha,
                 "beta": self.beta,
             }
@@ -1015,7 +1020,9 @@ def test_perf_group_gemm_fp16():
                     A, B, C.clone(), offs, **kwargs
                 )
                 bench.validate_results(torch_result, gems_result, 1, tolerance=1e-2)
-        bench.run()
+        from benchmark.hygon_group_gemm_reference import run_hygon_group_gemm
+
+        run_hygon_group_gemm(bench, "fp16")
     else:
         bench = GroupGemmBenchmark(
             op_name="group_gemm",

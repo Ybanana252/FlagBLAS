@@ -618,6 +618,11 @@ class HygonGroupGemmBenchmark(GroupGemmBenchmark):
                 "group_B_T": group_B_T,
                 "group_list": group_list,
                 "out_flag": out_flag,
+                "m_list": m_list,
+                "group_size": e,
+                "M": total_M,
+                "N": n,
+                "K": k,
                 "alpha": self.alpha,
                 "beta": self.beta,
             }
@@ -1070,7 +1075,9 @@ def test_perf_group_gemm_tf32():
                 )
                 k = A.shape[1]
                 bench.validate_results(torch_result, gems_result, k, tolerance=1e-3)
-        bench.run()
+        from benchmark.hygon_group_gemm_reference import run_hygon_group_gemm
+
+        run_hygon_group_gemm(bench, "tf32")
     else:
         bench = GroupGemmBenchmark(
             op_name="group_gemm",
