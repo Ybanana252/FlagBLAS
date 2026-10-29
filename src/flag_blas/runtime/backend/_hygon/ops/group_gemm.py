@@ -55,12 +55,24 @@ def grouped_bfgemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_BP: tl.constexpr = 0,
+    GROUP_N: tl.constexpr = 0,
+    SPLIT_STORE: tl.constexpr = 0,
     PIPE_STAGES: tl.constexpr = 2,
     UNROLL: tl.constexpr = 1,
 ):
     tile_n = tl.program_id(0)
     window = tl.program_id(1)
     expert = tl.program_id(2)
+    if GROUP_N != 0:
+        GROUP_N_EFFECTIVE: tl.constexpr = min(GROUP_N, (N + BLOCK_N - 1) // BLOCK_N)
+        num_n_tiles = tl.cdiv(N, BLOCK_N)
+        pe = window * num_n_tiles + tile_n
+        sb = pe // (GROUP_N_EFFECTIVE * NUM_WM)
+        r = pe % (GROUP_N_EFFECTIVE * NUM_WM)
+        tile_n = sb * GROUP_N_EFFECTIVE + r % GROUP_N_EFFECTIVE
+        window = r // GROUP_N_EFFECTIVE
+        if tile_n >= num_n_tiles:
+            return
     if USE_BP:
         end = tl.load(group_list + expert).to(tl.int32)
         start = tl.load(group_list + expert - 1, mask=expert > 0, other=0).to(tl.int32)
@@ -224,17 +236,45 @@ def grouped_bfgemm_kernel(
                 a_ptrs += BLOCK_K * stride_ak
                 b_ptrs += BLOCK_K * stride_bk
         out_rows = (offs + tl.arange(0, BLOCK_M)).to(tl.int64)
-        out_ptrs = (
-            group_out + out_rows[:, None] * stride_om + offs_n[None, :] * stride_on
-        )
-        if N % BLOCK_N == 0:
-            tl.store(out_ptrs, accumulator.to(group_out.dtype.element_ty))
-        else:
-            tl.store(
-                out_ptrs,
-                accumulator.to(group_out.dtype.element_ty),
-                mask=offs_n[None, :] < N,
+        if SPLIT_STORE:
+            output = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
+            output = tl.permute(output, (0, 2, 1))
+            output0, output1 = tl.split(output)
+            offs_n_half = tile_n * BLOCK_N + tl.arange(0, BLOCK_N // 2)
+            out_ptrs = (
+                group_out
+                + out_rows[:, None] * stride_om
+                + offs_n_half[None, :] * stride_on
             )
+            if N % BLOCK_N == 0:
+                tl.store(out_ptrs, output0.to(group_out.dtype.element_ty))
+                tl.store(
+                    out_ptrs + BLOCK_N // 2 * stride_on,
+                    output1.to(group_out.dtype.element_ty),
+                )
+            else:
+                tl.store(
+                    out_ptrs,
+                    output0.to(group_out.dtype.element_ty),
+                    mask=offs_n_half[None, :] < N,
+                )
+                tl.store(
+                    out_ptrs + BLOCK_N // 2 * stride_on,
+                    output1.to(group_out.dtype.element_ty),
+                    mask=offs_n_half[None, :] + BLOCK_N // 2 < N,
+                )
+        else:
+            out_ptrs = (
+                group_out + out_rows[:, None] * stride_om + offs_n[None, :] * stride_on
+            )
+            if N % BLOCK_N == 0:
+                tl.store(out_ptrs, accumulator.to(group_out.dtype.element_ty))
+            else:
+                tl.store(
+                    out_ptrs,
+                    accumulator.to(group_out.dtype.element_ty),
+                    mask=offs_n[None, :] < N,
+                )
     rem = end - start - num_full * BLOCK_M
     if rem > 0 and window == num_full % NUM_WM:
         BLOCK_H: tl.constexpr = BLOCK_M // 2
@@ -275,16 +315,38 @@ def grouped_bfgemm_kernel(
                     a_ptrs += BLOCK_K * stride_ak
                     b_ptrs += BLOCK_K * stride_bk
                 out_rows = offs_m.to(tl.int64)
-                out_ptrs = (
-                    group_out
-                    + out_rows[:, None] * stride_om
-                    + offs_n[None, :] * stride_on
-                )
-                tl.store(
-                    out_ptrs,
-                    accumulator.to(group_out.dtype.element_ty),
-                    mask=(offs_m[:, None] < end) & (offs_n[None, :] < N),
-                )
+                if SPLIT_STORE:
+                    output = tl.reshape(accumulator, (BLOCK_H, 2, BLOCK_N // 2))
+                    output = tl.permute(output, (0, 2, 1))
+                    output0, output1 = tl.split(output)
+                    offs_n_half = tile_n * BLOCK_N + tl.arange(0, BLOCK_N // 2)
+                    out_ptrs = (
+                        group_out
+                        + out_rows[:, None] * stride_om
+                        + offs_n_half[None, :] * stride_on
+                    )
+                    tl.store(
+                        out_ptrs,
+                        output0.to(group_out.dtype.element_ty),
+                        mask=(offs_m[:, None] < end) & (offs_n_half[None, :] < N),
+                    )
+                    tl.store(
+                        out_ptrs + BLOCK_N // 2 * stride_on,
+                        output1.to(group_out.dtype.element_ty),
+                        mask=(offs_m[:, None] < end)
+                        & (offs_n_half[None, :] + BLOCK_N // 2 < N),
+                    )
+                else:
+                    out_ptrs = (
+                        group_out
+                        + out_rows[:, None] * stride_om
+                        + offs_n[None, :] * stride_on
+                    )
+                    tl.store(
+                        out_ptrs,
+                        accumulator.to(group_out.dtype.element_ty),
+                        mask=(offs_m[:, None] < end) & (offs_n[None, :] < N),
+                    )
 
 
 def group_bfgemm(group_A, group_B, group_list, group_out):
