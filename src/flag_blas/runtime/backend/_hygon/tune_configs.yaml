@@ -2166,6 +2166,24 @@ group_bfgemm:
   - META: {NUM_WM: 10, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, kpack: 2, sched_latency: mmac5-ds10}
     num_warps: 16
     num_stages: 2
+  - META: {NUM_WM: 15, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, kpack: 2, sched_latency: mmac5-ds10}
+    num_warps: 16
+    num_stages: 2
+  - META: {NUM_WM: 14, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, kpack: 2, sched_latency: mmac5-ds10}
+    num_warps: 16
+    num_stages: 2
+  - META: {NUM_WM: 16, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, kpack: 2, sched_latency: mmac5-ds10}
+    num_warps: 16
+    num_stages: 2
+  - META: {NUM_WM: 13, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 6, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, kpack: 2, sched_latency: mmac5-ds10}
+    num_warps: 16
+    num_stages: 2
+  - META: {NUM_WM: 27, BLOCK_M: 256, BLOCK_N: 128, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {NUM_WM: 10, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, sched_latency: mmac5-ds6}
+    num_warps: 16
+    num_stages: 2
   - META: {NUM_WM: 10, BLOCK_M: 256, BLOCK_N: 256, BLOCK_K: 64, USE_BP: 0, GROUP_N: 0, SPLIT_STORE: 1, PIPE_STAGES: 2, UNROLL: 1, use_in_thread_transpose: true, sched_latency: mmac5-ds10}
     num_warps: 16
     num_stages: 2
