@@ -1039,7 +1039,7 @@ def test_perf_group_gemm_tf32():
                 # atol sized for tf32-vs-fp32 noise; see
                 # PpuGroupGemmBenchmark.validate_results.
                 bench.validate_results(torch_result, gems_result, 1, tolerance=0.5)
-        from benchmark.thead_groupgemm_reference import run_thead_group_tf32gemm
+        from benchmark.thead_l3_reference import run_thead_group_tf32gemm
 
         run_thead_group_tf32gemm(bench)
     elif IS_ASCEND:

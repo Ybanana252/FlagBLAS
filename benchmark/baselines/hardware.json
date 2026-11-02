@@ -69,16 +69,16 @@
       "validation_card1_measured_gemm": 135.537032,
       "h100_dense_derived_from_sparse_spec": true
     },
-    "tensor_method": "torch.mm 8192x8192 via HGGC, 2*N^3 FLOPs; Triton timer median warmup=40 ms rep=100 ms; output finite; supplementary only",
-    "score_basis": "Memory GEMV uses both nominal bandwidth values; vector diagnostic uses measured PPU rates because no reliable vendor nominal vector FLOPS source was found.",
-    "h100_official_source": "https://www.nvidia.com/en-eu/data-center/h100/",
     "tensor_tf32": {
       "h100_theoretical_dense": 494.5,
       "thead_measured_gemm": 67.648184,
       "unit": "TFLOPS",
-      "scoring": "used for PPU group TF32 GEMM equivalent-performance conversion",
+      "scoring": "used for PPU TF32 GroupGEMM",
       "thead_nominal": null,
       "h100_dense_derived_from_sparse_spec": true
-    }
+    },
+    "tensor_method": "torch.mm 8192x8192 via HGGC, 2*N^3 FLOPs; Triton timer median warmup=40 ms rep=100 ms; output finite; supplementary only",
+    "score_basis": "Memory GEMV uses both nominal bandwidth values; vector diagnostic uses measured PPU rates because no reliable vendor nominal vector FLOPS source was found.",
+    "h100_official_source": "https://www.nvidia.com/en-eu/data-center/h100/"
   }
 }
