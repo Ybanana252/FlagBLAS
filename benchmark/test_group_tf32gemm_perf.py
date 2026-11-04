@@ -656,9 +656,7 @@ def hygon_gems_group_gemm_wrapper(
     beta,
     **kwargs,
 ):
-    return flag_blas.group_tf32gemm(
-        group_A, group_B_T, group_C, group_list, out_flag, alpha, beta
-    )
+    return flag_blas.group_tf32gemm(group_A, group_B_T, group_C, group_list, out_flag)
 
 
 class AscendGroupGemmBenchmark(GroupGemmBenchmark):

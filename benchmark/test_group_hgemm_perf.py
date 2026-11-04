@@ -617,9 +617,7 @@ def hygon_group_gemm(group_A, group_B, group_C, offs, out_torch, alpha, beta, **
 def hygon_gems_group_gemm_wrapper(
     group_A, group_B, group_C, offs, group_list, out_flag, alpha, beta, **kwargs
 ):
-    return flag_blas.group_hgemm(
-        group_A, group_B, group_C, group_list, out_flag, alpha, beta
-    )
+    return flag_blas.group_hgemm(group_A, group_B, group_C, group_list, out_flag)
 
 
 class AscendGroupGemmBenchmark(GroupGemmBenchmark):
